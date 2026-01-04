@@ -23,6 +23,13 @@ type LLMClient interface {
 	QueryBatched(ctx context.Context, prompts []string) ([]string, error)
 }
 
+// LLMCall represents a sub-LLM call made from within the REPL.
+type LLMCall struct {
+	Prompt   string  `json:"prompt"`
+	Response string  `json:"response"`
+	Duration float64 `json:"duration"`
+}
+
 // REPL represents a Yaegi-based Go interpreter with RLM capabilities.
 type REPL struct {
 	interp    *interp.Interpreter
@@ -31,6 +38,7 @@ type REPL struct {
 	llmClient LLMClient
 	ctx       context.Context
 	mu        sync.Mutex
+	llmCalls  []LLMCall // Track LLM calls made during execution
 }
 
 // New creates a new REPL instance.
@@ -90,22 +98,54 @@ import . "rlm/rlm"
 
 // llmQuery makes a single LLM query. This is called from interpreted code.
 func (r *REPL) llmQuery(prompt string) string {
+	start := time.Now()
 	result, err := r.llmClient.Query(r.ctx, prompt)
+	duration := time.Since(start).Seconds()
+
+	response := result
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		response = fmt.Sprintf("Error: %v", err)
 	}
-	return result
+
+	// Record the call
+	r.llmCalls = append(r.llmCalls, LLMCall{
+		Prompt:   prompt,
+		Response: response,
+		Duration: duration,
+	})
+
+	return response
 }
 
 // llmQueryBatched makes concurrent LLM queries. This is called from interpreted code.
 func (r *REPL) llmQueryBatched(prompts []string) []string {
+	start := time.Now()
 	results, err := r.llmClient.QueryBatched(r.ctx, prompts)
+	duration := time.Since(start).Seconds()
+
 	if err != nil {
 		errResults := make([]string, len(prompts))
 		for i := range errResults {
 			errResults[i] = fmt.Sprintf("Error: %v", err)
 		}
+		// Record each as a failed call
+		for i, p := range prompts {
+			r.llmCalls = append(r.llmCalls, LLMCall{
+				Prompt:   p,
+				Response: errResults[i],
+				Duration: duration / float64(len(prompts)),
+			})
+		}
 		return errResults
+	}
+
+	// Record each successful call
+	for i, p := range prompts {
+		r.llmCalls = append(r.llmCalls, LLMCall{
+			Prompt:   p,
+			Response: results[i],
+			Duration: duration / float64(len(prompts)),
+		})
 	}
 	return results
 }
@@ -168,25 +208,26 @@ func (r *REPL) SetContext(ctx context.Context) {
 // Execute runs Go code in the interpreter and returns the result.
 func (r *REPL) Execute(ctx context.Context, code string) (*core.ExecutionResult, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Set context for LLM calls
 	r.ctx = ctx
 
 	// Reset buffers
 	r.stdout.Reset()
 	r.stderr.Reset()
+	r.mu.Unlock() // Release lock before executing code (allows LLM calls to proceed)
 
 	start := time.Now()
 
-	// Execute the code
+	// Execute the code (may call llmQuery which doesn't need lock)
 	_, err := r.interp.Eval(code)
 
+	r.mu.Lock()
 	result := &core.ExecutionResult{
 		Stdout:   r.stdout.String(),
 		Stderr:   r.stderr.String(),
 		Duration: time.Since(start),
 	}
+	r.mu.Unlock()
 
 	if err != nil {
 		// Append error to stderr
@@ -224,6 +265,7 @@ func (r *REPL) Reset() error {
 
 	r.stdout.Reset()
 	r.stderr.Reset()
+	r.llmCalls = nil
 
 	// Create a fresh interpreter
 	i := interp.New(interp.Options{
@@ -238,6 +280,22 @@ func (r *REPL) Reset() error {
 	r.interp = i
 
 	return r.injectBuiltins()
+}
+
+// GetLLMCalls returns and clears the recorded LLM calls.
+func (r *REPL) GetLLMCalls() []LLMCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	calls := r.llmCalls
+	r.llmCalls = nil
+	return calls
+}
+
+// ClearLLMCalls clears the recorded LLM calls.
+func (r *REPL) ClearLLMCalls() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.llmCalls = nil
 }
 
 // ContextInfo returns metadata about the loaded context.

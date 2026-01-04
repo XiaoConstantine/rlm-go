@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
+	"github.com/XiaoConstantine/rlm-go/pkg/logger"
 	"github.com/XiaoConstantine/rlm-go/pkg/parsing"
 	"github.com/XiaoConstantine/rlm-go/pkg/repl"
 )
@@ -26,6 +27,9 @@ type Config struct {
 
 	// Verbose enables verbose logging.
 	Verbose bool
+
+	// Logger is the optional JSONL logger.
+	Logger *logger.Logger
 }
 
 // DefaultConfig returns the default RLM configuration.
@@ -83,6 +87,13 @@ func WithVerbose(v bool) Option {
 	}
 }
 
+// WithLogger sets the JSONL logger.
+func WithLogger(l *logger.Logger) Option {
+	return func(c *Config) {
+		c.Logger = l
+	}
+}
+
 // Complete runs an RLM completion.
 // contextPayload is the context data (string, map, or slice).
 // query is the user's question.
@@ -102,6 +113,8 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 
 	// Iteration loop
 	for i := 0; i < r.config.MaxIterations; i++ {
+		iterStart := time.Now()
+
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -148,7 +161,18 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 			}
 		}
 
+		// Get RLM calls made during code execution
+		var rlmCalls []logger.RLMCallEntry
+		for _, call := range replEnv.GetLLMCalls() {
+			rlmCalls = append(rlmCalls, logger.RLMCallEntry{
+				Prompt:   call.Prompt,
+				Response: call.Response,
+				Duration: call.Duration,
+			})
+		}
+
 		// Check for final answer
+		var finalAnswerStr *string
 		if final := parsing.FindFinalAnswer(response); final != nil {
 			answer := final.Content
 
@@ -165,11 +189,23 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 				}
 			}
 
+			finalAnswerStr = &answer
+
+			// Log iteration before returning
+			if r.config.Logger != nil {
+				_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, finalAnswerStr, time.Since(iterStart))
+			}
+
 			return &core.CompletionResult{
 				Response:   answer,
 				Iterations: i + 1,
 				Duration:   time.Since(start),
 			}, nil
+		}
+
+		// Log iteration
+		if r.config.Logger != nil {
+			_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, finalAnswerStr, time.Since(iterStart))
 		}
 
 		// Append iteration results to history
@@ -183,7 +219,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 // buildInitialMessages creates the initial message history.
 func (r *RLM) buildInitialMessages(replEnv *repl.REPL, query string) []core.Message {
 	contextInfo := replEnv.ContextInfo()
-	userPrompt := fmt.Sprintf(UserPromptTemplate, contextInfo, query)
+	userPrompt := fmt.Sprintf(UserPromptTemplate, contextInfo, query) + FirstIterationSuffix
 
 	return []core.Message{
 		{Role: "system", Content: r.config.SystemPrompt},

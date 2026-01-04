@@ -2,60 +2,45 @@
 package rlm
 
 // SystemPrompt is the default system prompt for RLM.
-const SystemPrompt = `You answer queries using context available in a Go REPL environment.
+const SystemPrompt = `You answer queries using context in a Go REPL. Write Go code in markdown code blocks.
 
-ENVIRONMENT:
-- context: string variable containing the full context
-- Query(prompt string) string: query a sub-LLM (handles ~500K chars)
-- QueryBatched(prompts []string) []string: concurrent queries
-- fmt.Println(): view output
+AVAILABLE:
+- context (string): the data to analyze
+- Query(prompt string) string: ask a sub-LLM (can handle 500K chars)
+- QueryBatched(prompts []string) []string: concurrent queries (faster)
+- fmt.Println(): print output
 
-WORKFLOW:
-1. Examine context using the REPL
-2. Use Query/QueryBatched to analyze chunks semantically
-3. Build up answer in variables
-4. Return with FINAL(answer) or FINAL_VAR(varName)
-
-Write Go code in triple backticks with 'go' or 'repl':
+WRITE CODE LIKE THIS:
 ` + "```go" + `
-chunk := context[:50000]
-answer := Query(fmt.Sprintf("Summarize: %s", chunk))
+fmt.Println(len(context))
+answer := Query(fmt.Sprintf("Summarize: %s", context))
 fmt.Println(answer)
 ` + "```" + `
 
-For concurrent processing:
-` + "```go" + `
-var prompts []string
-chunkSize := len(context) / 3
-for i := 0; i < 3; i++ {
-    start, end := i*chunkSize, (i+1)*chunkSize
-    if i == 2 { end = len(context) }
-    prompts = append(prompts, fmt.Sprintf("Analyze: %s", context[start:end]))
-}
-answers := QueryBatched(prompts)
-for i, ans := range answers {
-    fmt.Printf("Chunk %d: %s\n", i, ans)
-}
-` + "```" + `
-Then: FINAL_VAR(final) or FINAL(your answer text)
+WHEN DONE - pick ONE:
+- FINAL_VAR(answer) - if your answer is stored in a variable (PREFERRED)
+- FINAL(40% positive, 40% negative) - write the actual answer text
 
-IMPORTANT:
-- Explore context in REPL before answering
-- Use sub-LLMs (Query) for semantic analysis - you cannot determine meaning with code alone
-- Return FINAL(text) or FINAL_VAR(variable) only when done`
+WRONG: FINAL(The analysis shows...) - this is too vague!
+RIGHT: FINAL_VAR(answer) or FINAL(40% positive, 40% negative)
+
+RULES:
+- Use Query() with full context - it handles 500K chars
+- Use QueryBatched() for multiple concurrent queries
+- Store Query results in variables, then use FINAL_VAR(varName)`
 
 // UserPromptTemplate is the template for user prompts in each iteration.
 const UserPromptTemplate = `Context info: %s
 
-Query: %s
+Query: %s`
 
-Explore the context in the REPL and answer the query. Think step by step.`
+// FirstIterationSuffix is appended to the first iteration prompt.
+const FirstIterationSuffix = `
+
+First, explore the context with code. Then use Query() to analyze it. Write your code now:`
 
 // IterationPromptTemplate is the template for subsequent iteration prompts.
-const IterationPromptTemplate = `Continue working on the query. Your previous interaction with the REPL is shown above.
-
-If you have enough information, provide your final answer using FINAL(answer) or FINAL_VAR(variable).
-Otherwise, continue exploring the context and using Query() for semantic analysis.`
+const IterationPromptTemplate = `Continue. If you have the answer in a variable, write FINAL_VAR(varName). Otherwise write more code:`
 
 // DefaultAnswerPrompt is used when max iterations are exhausted.
 const DefaultAnswerPrompt = `You have reached the maximum number of iterations. Based on all your exploration and analysis so far, provide your best answer now.

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
+	"github.com/XiaoConstantine/rlm-go/pkg/logger"
 	"github.com/XiaoConstantine/rlm-go/pkg/rlm"
 )
 
@@ -25,7 +26,7 @@ type AnthropicClient struct {
 	httpClient *http.Client
 }
 
-// NewAnthropicClient creates a new Anthropic client.
+// NewAnthropicClient creates a new Anthropic client with connection pooling.
 func NewAnthropicClient(apiKey, model string) *AnthropicClient {
 	return &AnthropicClient{
 		apiKey:    apiKey,
@@ -33,6 +34,12 @@ func NewAnthropicClient(apiKey, model string) *AnthropicClient {
 		maxTokens: 4096,
 		httpClient: &http.Client{
 			Timeout: 120 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				MaxConnsPerHost:     10,
+				IdleConnTimeout:     90 * time.Second,
+			},
 		},
 	}
 }
@@ -102,23 +109,21 @@ func (c *AnthropicClient) Query(ctx context.Context, prompt string) (string, err
 }
 
 // QueryBatched implements repl.LLMClient for concurrent sub-LLM calls.
+// Each goroutine writes to its own unique slice index, so no mutex is needed.
 func (c *AnthropicClient) QueryBatched(ctx context.Context, prompts []string) ([]string, error) {
 	results := make([]string, len(prompts))
 	var wg sync.WaitGroup
-	var mu sync.Mutex
 
 	for i, prompt := range prompts {
 		wg.Add(1)
 		go func(idx int, p string) {
 			defer wg.Done()
 			result, err := c.Query(ctx, p)
-			mu.Lock()
 			if err != nil {
 				results[idx] = fmt.Sprintf("Error: %v", err)
 			} else {
 				results[idx] = result
 			}
-			mu.Unlock()
 		}(i, prompt)
 	}
 
@@ -128,10 +133,13 @@ func (c *AnthropicClient) QueryBatched(ctx context.Context, prompts []string) ([
 
 // doRequest makes the actual HTTP request to Anthropic API.
 func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicRequest) (string, error) {
+	start := time.Now()
+
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", fmt.Errorf("marshal request: %w", err)
 	}
+	marshalTime := time.Since(start)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(jsonBody))
 	if err != nil {
@@ -142,25 +150,34 @@ func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicReques
 	req.Header.Set("x-api-key", c.apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 
+	httpStart := time.Now()
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("http request: %w", err)
 	}
 	defer resp.Body.Close()
+	httpTime := time.Since(httpStart)
 
+	readStart := time.Now()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("read response: %w", err)
 	}
+	readTime := time.Since(readStart)
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(body))
 	}
 
+	unmarshalStart := time.Now()
 	var apiResp anthropicResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
 		return "", fmt.Errorf("unmarshal response: %w", err)
 	}
+	unmarshalTime := time.Since(unmarshalStart)
+
+	fmt.Printf("  [HTTP] marshal=%v, http=%v, read=%v, unmarshal=%v, total=%v\n",
+		marshalTime, httpTime, readTime, unmarshalTime, time.Since(start))
 
 	if apiResp.Error != nil {
 		return "", fmt.Errorf("api error: %s", apiResp.Error.Message)
@@ -184,14 +201,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create Anthropic client
-	client := NewAnthropicClient(apiKey, "claude-haiku-4-5")
+	model := "claude-haiku-4-5"
 
-	// Create RLM instance
-	r := rlm.New(client, client,
-		rlm.WithMaxIterations(10),
-		rlm.WithVerbose(true),
-	)
+	// Create Anthropic client
+	client := NewAnthropicClient(apiKey, model)
 
 	document := `
   Review 1: This product is amazing, best purchase ever!
@@ -203,12 +216,37 @@ func main() {
 	// Repeat to make it longer
 	document = strings.Repeat(document, 200)
 
+	query := "What percentage of reviews are positive (4-5 stars) vs negative (1-2 stars)?"
+
+	// Create logger with context and query
+	log, err := logger.New("logs", logger.Config{
+		RootModel:     model,
+		MaxIterations: 10,
+		Backend:       "anthropic",
+		BackendKwargs: map[string]any{"model_name": model},
+		Context:       document,
+		Query:         query,
+	})
+	if err != nil {
+		fmt.Printf("Warning: could not create logger: %v\n", err)
+	} else {
+		defer log.Close()
+		fmt.Printf("Logging to: %s\n", log.Path())
+	}
+
+	// Create RLM instance
+	r := rlm.New(client, client,
+		rlm.WithMaxIterations(10),
+		rlm.WithVerbose(true),
+		rlm.WithLogger(log),
+	)
+
 	ctx := context.Background()
 
 	fmt.Println("Starting RLM completion...")
 	fmt.Printf("Context size: %d characters\n\n", len(document))
 
-	result, err := r.Complete(ctx, document, "What percentage of reviews are positive (4-5 stars) vs negative (1-2 stars)?")
+	result, err := r.Complete(ctx, document, query)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
