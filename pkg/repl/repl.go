@@ -25,9 +25,11 @@ type LLMClient interface {
 
 // LLMCall represents a sub-LLM call made from within the REPL.
 type LLMCall struct {
-	Prompt   string  `json:"prompt"`
-	Response string  `json:"response"`
-	Duration float64 `json:"duration"`
+	Prompt           string  `json:"prompt"`
+	Response         string  `json:"response"`
+	Duration         float64 `json:"duration"`
+	PromptTokens     int     `json:"prompt_tokens"`
+	CompletionTokens int     `json:"completion_tokens"`
 }
 
 // REPL represents a Yaegi-based Go interpreter with RLM capabilities.
@@ -296,6 +298,32 @@ func (r *REPL) ClearLLMCalls() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.llmCalls = nil
+}
+
+// GetLocals extracts user-defined variables from the interpreter.
+// Returns a map of variable names to their values (JSON-serializable via encoding/json).
+func (r *REPL) GetLocals() map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	locals := make(map[string]any)
+
+	// Check for commonly used variable names in RLM code
+	varNames := []string{
+		"context", "result", "answer", "data", "output", "response",
+		"analysis", "summary", "final_answer", "count", "total",
+		"items", "records", "values", "results", "findings",
+	}
+
+	for _, name := range varNames {
+		v, err := r.interp.Eval(name)
+		if err != nil || !v.IsValid() {
+			continue
+		}
+		locals[name] = v.Interface()
+	}
+
+	return locals
 }
 
 // ContextInfo returns metadata about the loaded context.

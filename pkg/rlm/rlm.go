@@ -165,47 +165,57 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		var rlmCalls []logger.RLMCallEntry
 		for _, call := range replEnv.GetLLMCalls() {
 			rlmCalls = append(rlmCalls, logger.RLMCallEntry{
-				Prompt:   call.Prompt,
-				Response: call.Response,
-				Duration: call.Duration,
+				Prompt:           call.Prompt,
+				Response:         call.Response,
+				PromptTokens:     call.PromptTokens,
+				CompletionTokens: call.CompletionTokens,
+				ExecutionTime:    call.Duration,
 			})
 		}
 
+		// Get locals from REPL for logging
+		locals := replEnv.GetLocals()
+
 		// Check for final answer
-		var finalAnswerStr *string
+		var finalAnswer any // nil, string, or []string{varname, value}
+		var resultResponse string
 		if final := parsing.FindFinalAnswer(response); final != nil {
-			answer := final.Content
+			varName := final.Content
+			varValue := varName // Default to content itself
 
 			// Resolve variable if FINAL_VAR
 			if final.Type == core.FinalTypeVariable {
-				varValue, err := replEnv.GetVariable(final.Content)
+				resolved, err := replEnv.GetVariable(varName)
 				if err != nil {
-					// Fall back to content if variable not found
 					if r.config.Verbose {
-						fmt.Printf("[RLM] Warning: could not resolve variable %q: %v\n", final.Content, err)
+						fmt.Printf("[RLM] Warning: could not resolve variable %q: %v\n", varName, err)
 					}
 				} else {
-					answer = varValue
+					varValue = resolved
 				}
+				// FINAL_VAR: output as [varname, value] tuple
+				finalAnswer = []string{varName, varValue}
+			} else {
+				// FINAL: output as string directly
+				finalAnswer = varValue
 			}
-
-			finalAnswerStr = &answer
+			resultResponse = varValue
 
 			// Log iteration before returning
 			if r.config.Logger != nil {
-				_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, finalAnswerStr, time.Since(iterStart))
+				_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, locals, finalAnswer, time.Since(iterStart))
 			}
 
 			return &core.CompletionResult{
-				Response:   answer,
+				Response:   resultResponse,
 				Iterations: i + 1,
 				Duration:   time.Since(start),
 			}, nil
 		}
 
-		// Log iteration
+		// Log iteration (no final answer)
 		if r.config.Logger != nil {
-			_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, finalAnswerStr, time.Since(iterStart))
+			_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, locals, nil, time.Since(iterStart))
 		}
 
 		// Append iteration results to history

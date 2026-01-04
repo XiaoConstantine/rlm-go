@@ -51,7 +51,7 @@ type IterationEntry struct {
 	Prompt        []core.Message   `json:"prompt"`
 	Response      string           `json:"response"`
 	CodeBlocks    []CodeBlockEntry `json:"code_blocks"`
-	FinalAnswer   *string          `json:"final_answer"`
+	FinalAnswer   any              `json:"final_answer"` // string or [varname, value] tuple
 	IterationTime float64          `json:"iteration_time"`
 }
 
@@ -71,10 +71,13 @@ type CodeResultEntry struct {
 }
 
 // RLMCallEntry represents a sub-LLM call made from within REPL code.
+// Fields match the visualizer's RLMChatCompletion interface.
 type RLMCallEntry struct {
-	Prompt   string  `json:"prompt"`
-	Response string  `json:"response"`
-	Duration float64 `json:"duration"`
+	Prompt           string  `json:"prompt"`
+	Response         string  `json:"response"`
+	PromptTokens     int     `json:"prompt_tokens"`
+	CompletionTokens int     `json:"completion_tokens"`
+	ExecutionTime    float64 `json:"execution_time"`
 }
 
 // New creates a new Logger and writes the metadata entry.
@@ -131,13 +134,18 @@ func New(logDir string, cfg Config) (*Logger, error) {
 }
 
 // LogIteration logs a single RLM iteration.
+// finalAnswer can be:
+//   - nil: no final answer
+//   - string: direct FINAL answer
+//   - []string{varname, value}: FINAL_VAR answer as tuple
 func (l *Logger) LogIteration(
 	iteration int,
 	prompt []core.Message,
 	response string,
 	codeBlocks []core.CodeBlock,
 	rlmCalls []RLMCallEntry,
-	finalAnswer *string,
+	locals map[string]any,
+	finalAnswer any,
 	iterationTime time.Duration,
 ) error {
 	blocks := make([]CodeBlockEntry, len(codeBlocks))
@@ -147,9 +155,9 @@ func (l *Logger) LogIteration(
 			Result: CodeResultEntry{
 				Stdout:        cb.Result.Stdout,
 				Stderr:        cb.Result.Stderr,
-				Locals:        map[string]any{},
+				Locals:        locals,
 				ExecutionTime: cb.Result.Duration.Seconds(),
-				RLMCalls:      rlmCalls, // All RLM calls for this iteration
+				RLMCalls:      rlmCalls,
 			},
 		}
 	}
