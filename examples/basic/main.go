@@ -15,6 +15,7 @@ import (
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
 	"github.com/XiaoConstantine/rlm-go/pkg/logger"
+	"github.com/XiaoConstantine/rlm-go/pkg/repl"
 	"github.com/XiaoConstantine/rlm-go/pkg/rlm"
 )
 
@@ -63,6 +64,10 @@ type anthropicResponse struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	} `json:"content"`
+	Usage struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
@@ -92,11 +97,12 @@ func (c *AnthropicClient) Complete(ctx context.Context, messages []core.Message)
 		System:    systemPrompt,
 	}
 
-	return c.doRequest(ctx, reqBody)
+	text, _, _, err := c.doRequest(ctx, reqBody)
+	return text, err
 }
 
 // Query implements repl.LLMClient for sub-LLM calls from REPL.
-func (c *AnthropicClient) Query(ctx context.Context, prompt string) (string, error) {
+func (c *AnthropicClient) Query(ctx context.Context, prompt string) (repl.QueryResponse, error) {
 	reqBody := anthropicRequest{
 		Model:     c.model,
 		MaxTokens: c.maxTokens,
@@ -105,13 +111,18 @@ func (c *AnthropicClient) Query(ctx context.Context, prompt string) (string, err
 		},
 	}
 
-	return c.doRequest(ctx, reqBody)
+	text, inputTokens, outputTokens, err := c.doRequest(ctx, reqBody)
+	return repl.QueryResponse{
+		Response:         text,
+		PromptTokens:     inputTokens,
+		CompletionTokens: outputTokens,
+	}, err
 }
 
 // QueryBatched implements repl.LLMClient for concurrent sub-LLM calls.
 // Each goroutine writes to its own unique slice index, so no mutex is needed.
-func (c *AnthropicClient) QueryBatched(ctx context.Context, prompts []string) ([]string, error) {
-	results := make([]string, len(prompts))
+func (c *AnthropicClient) QueryBatched(ctx context.Context, prompts []string) ([]repl.QueryResponse, error) {
+	results := make([]repl.QueryResponse, len(prompts))
 	var wg sync.WaitGroup
 
 	for i, prompt := range prompts {
@@ -120,7 +131,7 @@ func (c *AnthropicClient) QueryBatched(ctx context.Context, prompts []string) ([
 			defer wg.Done()
 			result, err := c.Query(ctx, p)
 			if err != nil {
-				results[idx] = fmt.Sprintf("Error: %v", err)
+				results[idx] = repl.QueryResponse{Response: fmt.Sprintf("Error: %v", err)}
 			} else {
 				results[idx] = result
 			}
@@ -132,18 +143,19 @@ func (c *AnthropicClient) QueryBatched(ctx context.Context, prompts []string) ([
 }
 
 // doRequest makes the actual HTTP request to Anthropic API.
-func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicRequest) (string, error) {
+// Returns (text, inputTokens, outputTokens, error).
+func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicRequest) (string, int, int, error) {
 	start := time.Now()
 
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", err)
+		return "", 0, 0, fmt.Errorf("marshal request: %w", err)
 	}
 	marshalTime := time.Since(start)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(jsonBody))
 	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
+		return "", 0, 0, fmt.Errorf("create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -153,7 +165,7 @@ func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicReques
 	httpStart := time.Now()
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("http request: %w", err)
+		return "", 0, 0, fmt.Errorf("http request: %w", err)
 	}
 	defer resp.Body.Close()
 	httpTime := time.Since(httpStart)
@@ -161,18 +173,18 @@ func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicReques
 	readStart := time.Now()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("read response: %w", err)
+		return "", 0, 0, fmt.Errorf("read response: %w", err)
 	}
 	readTime := time.Since(readStart)
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(body))
+		return "", 0, 0, fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(body))
 	}
 
 	unmarshalStart := time.Now()
 	var apiResp anthropicResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return "", fmt.Errorf("unmarshal response: %w", err)
+		return "", 0, 0, fmt.Errorf("unmarshal response: %w", err)
 	}
 	unmarshalTime := time.Since(unmarshalStart)
 
@@ -180,7 +192,7 @@ func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicReques
 		marshalTime, httpTime, readTime, unmarshalTime, time.Since(start))
 
 	if apiResp.Error != nil {
-		return "", fmt.Errorf("api error: %s", apiResp.Error.Message)
+		return "", 0, 0, fmt.Errorf("api error: %s", apiResp.Error.Message)
 	}
 
 	// Extract text from response
@@ -191,7 +203,7 @@ func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicReques
 		}
 	}
 
-	return strings.Join(texts, ""), nil
+	return strings.Join(texts, ""), apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens, nil
 }
 
 func main() {

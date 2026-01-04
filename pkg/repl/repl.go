@@ -17,10 +17,17 @@ import (
 	"github.com/traefik/yaegi/stdlib"
 )
 
+// QueryResponse contains the LLM response with usage metadata.
+type QueryResponse struct {
+	Response         string
+	PromptTokens     int
+	CompletionTokens int
+}
+
 // LLMClient defines the interface for making LLM calls from within the REPL.
 type LLMClient interface {
-	Query(ctx context.Context, prompt string) (string, error)
-	QueryBatched(ctx context.Context, prompts []string) ([]string, error)
+	Query(ctx context.Context, prompt string) (QueryResponse, error)
+	QueryBatched(ctx context.Context, prompts []string) ([]QueryResponse, error)
 }
 
 // LLMCall represents a sub-LLM call made from within the REPL.
@@ -104,16 +111,18 @@ func (r *REPL) llmQuery(prompt string) string {
 	result, err := r.llmClient.Query(r.ctx, prompt)
 	duration := time.Since(start).Seconds()
 
-	response := result
+	response := result.Response
 	if err != nil {
 		response = fmt.Sprintf("Error: %v", err)
 	}
 
-	// Record the call
+	// Record the call with token usage
 	r.llmCalls = append(r.llmCalls, LLMCall{
-		Prompt:   prompt,
-		Response: response,
-		Duration: duration,
+		Prompt:           prompt,
+		Response:         response,
+		Duration:         duration,
+		PromptTokens:     result.PromptTokens,
+		CompletionTokens: result.CompletionTokens,
 	})
 
 	return response
@@ -141,15 +150,19 @@ func (r *REPL) llmQueryBatched(prompts []string) []string {
 		return errResults
 	}
 
-	// Record each successful call
+	// Record each successful call with token usage
+	responses := make([]string, len(results))
 	for i, p := range prompts {
+		responses[i] = results[i].Response
 		r.llmCalls = append(r.llmCalls, LLMCall{
-			Prompt:   p,
-			Response: results[i],
-			Duration: duration / float64(len(prompts)),
+			Prompt:           p,
+			Response:         results[i].Response,
+			Duration:         duration / float64(len(prompts)),
+			PromptTokens:     results[i].PromptTokens,
+			CompletionTokens: results[i].CompletionTokens,
 		})
 	}
-	return results
+	return responses
 }
 
 // LoadContext injects the context payload into the interpreter as the `context` variable.
