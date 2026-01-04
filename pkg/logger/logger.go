@@ -126,7 +126,7 @@ func New(logDir string, cfg Config) (*Logger, error) {
 	}
 
 	if err := l.writeEntry(metadata); err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, fmt.Errorf("write metadata: %w", err)
 	}
 

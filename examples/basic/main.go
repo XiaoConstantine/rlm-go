@@ -167,7 +167,7 @@ func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicReques
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("http request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	httpTime := time.Since(httpStart)
 
 	readStart := time.Now()
@@ -242,7 +242,7 @@ func main() {
 	if err != nil {
 		fmt.Printf("Warning: could not create logger: %v\n", err)
 	} else {
-		defer log.Close()
+		defer func() { _ = log.Close() }()
 		fmt.Printf("Logging to: %s\n", log.Path())
 	}
 

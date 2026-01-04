@@ -52,11 +52,6 @@ func TestExecutionResult(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Test that fields are accessible
-			if tt.result.Stdout == "" && tt.result.Stderr == "" {
-				// Empty result is valid
-			}
-
 			hasError := tt.result.Stderr != ""
 			if hasError != tt.hasError {
 				t.Errorf("hasError = %v, want %v", hasError, tt.hasError)
@@ -335,11 +330,12 @@ func TestUsageStats(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Verify total is sum of parts (if that's the invariant)
-			expectedTotal := tt.stats.PromptTokens + tt.stats.CompletionTokens
-			if tt.stats.TotalTokens != expectedTotal && tt.stats.TotalTokens != 0 {
-				// Note: This only validates if TotalTokens is set correctly
-				// The actual struct doesn't enforce this invariant
+			// Verify fields are accessible and have expected values
+			if tt.stats.PromptTokens < 0 {
+				t.Errorf("PromptTokens should not be negative: %d", tt.stats.PromptTokens)
+			}
+			if tt.stats.CompletionTokens < 0 {
+				t.Errorf("CompletionTokens should not be negative: %d", tt.stats.CompletionTokens)
 			}
 		})
 	}

@@ -66,7 +66,7 @@ func TestNewLogger(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			defer logger.Close()
+			defer func() { _ = logger.Close() }()
 
 			// Verify log file was created
 			path := logger.Path()
@@ -140,7 +140,7 @@ func TestLogIteration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create logger: %v", err)
 	}
-	defer logger.Close()
+	defer func() { _ = logger.Close() }()
 
 	// Test logging iteration with code blocks
 	prompt := []core.Message{
@@ -257,7 +257,7 @@ func TestLogIterationWithFinalAnswer(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to create logger: %v", err)
 			}
-			defer logger.Close()
+			defer func() { _ = logger.Close() }()
 
 			err = logger.LogIteration(
 				1,
@@ -340,7 +340,7 @@ func TestLoggerPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create logger: %v", err)
 	}
-	defer logger.Close()
+	defer func() { _ = logger.Close() }()
 
 	path := logger.Path()
 

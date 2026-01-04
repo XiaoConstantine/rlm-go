@@ -219,7 +219,7 @@ func parseLog(filename string) (*LogData, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	data := &LogData{Filename: filename}
 	scanner := bufio.NewScanner(file)
@@ -540,7 +540,6 @@ func printDetailedStats(data *LogData) {
 	var totalCodeBlocks, totalLLMCalls int
 	var totalPromptTokens, totalCompletionTokens int
 	var iterTimes []float64
-	var codeExecTimes []float64
 	var llmCallTimes []float64
 
 	for _, iter := range data.Iterations {
@@ -549,7 +548,6 @@ func printDetailedStats(data *LogData) {
 		totalCodeBlocks += len(iter.CodeBlocks)
 
 		for _, block := range iter.CodeBlocks {
-			codeExecTimes = append(codeExecTimes, block.Result.ExecutionTime)
 			for _, call := range block.Result.RLMCalls {
 				totalLLMCalls++
 				totalPromptTokens += call.PromptTokens
@@ -691,7 +689,7 @@ func runInteractive(data *LogData, cfg ViewerConfig) {
 		viewLog(data, cfg)
 		return
 	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
 
 	currentIdx := 0
 	expanded := !cfg.Compact
@@ -716,7 +714,8 @@ func runInteractive(data *LogData, cfg ViewerConfig) {
 			break
 		}
 
-		if n == 1 {
+		switch n {
+		case 1:
 			switch buf[0] {
 			case 'q', 3: // q or Ctrl+C
 				clearScreen()
@@ -746,7 +745,7 @@ func runInteractive(data *LogData, cfg ViewerConfig) {
 					currentIdx = searchResults[searchIdx]
 				}
 			case '/':
-				term.Restore(int(os.Stdin.Fd()), oldState)
+				_ = term.Restore(int(os.Stdin.Fd()), oldState)
 				fmt.Print("\r\033[K/")
 				reader := bufio.NewReader(os.Stdin)
 				query, _ := reader.ReadString('\n')
@@ -756,25 +755,25 @@ func runInteractive(data *LogData, cfg ViewerConfig) {
 				if len(searchResults) > 0 {
 					currentIdx = searchResults[0]
 				}
-				term.MakeRaw(int(os.Stdin.Fd()))
+				_, _ = term.MakeRaw(int(os.Stdin.Fd()))
 			case 's':
 				// Show stats
-				term.Restore(int(os.Stdin.Fd()), oldState)
+				_ = term.Restore(int(os.Stdin.Fd()), oldState)
 				clearScreen()
 				printDetailedStats(data)
 				fmt.Print("\nPress any key to continue...")
-				os.Stdin.Read(make([]byte, 1))
-				term.MakeRaw(int(os.Stdin.Fd()))
+				_, _ = os.Stdin.Read(make([]byte, 1))
+				_, _ = term.MakeRaw(int(os.Stdin.Fd()))
 			case '?':
 				// Show help
-				term.Restore(int(os.Stdin.Fd()), oldState)
+				_ = term.Restore(int(os.Stdin.Fd()), oldState)
 				clearScreen()
 				printInteractiveHelp()
 				fmt.Print("\nPress any key to continue...")
-				os.Stdin.Read(make([]byte, 1))
-				term.MakeRaw(int(os.Stdin.Fd()))
+				_, _ = os.Stdin.Read(make([]byte, 1))
+				_, _ = term.MakeRaw(int(os.Stdin.Fd()))
 			}
-		} else if n == 3 {
+		case 3:
 			// Arrow keys
 			if buf[0] == 27 && buf[1] == 91 {
 				switch buf[2] {
