@@ -51,6 +51,13 @@ type UsageStats struct {
 	TotalTokens      int
 }
 
+// LLMResponse represents the response from an LLM call with usage metadata.
+type LLMResponse struct {
+	Content          string
+	PromptTokens     int
+	CompletionTokens int
+}
+
 // CompletionResult represents the final result of an RLM completion.
 type CompletionResult struct {
 	Response   string

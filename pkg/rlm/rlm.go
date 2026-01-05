@@ -14,7 +14,8 @@ import (
 // LLMClient defines the interface for the root LLM.
 type LLMClient interface {
 	// Complete generates a completion for the given messages.
-	Complete(ctx context.Context, messages []core.Message) (string, error)
+	// Returns LLMResponse with content and token usage.
+	Complete(ctx context.Context, messages []core.Message) (core.LLMResponse, error)
 }
 
 // Config holds RLM configuration.
@@ -111,6 +112,9 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 	// Build initial message history
 	messages := r.buildInitialMessages(replEnv, query)
 
+	// Track total token usage across iterations
+	var totalPromptTokens, totalCompletionTokens int
+
 	// Iteration loop
 	for i := 0; i < r.config.MaxIterations; i++ {
 		iterStart := time.Now()
@@ -126,13 +130,18 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		}
 
 		// Add iteration-specific user prompt
-		currentMessages := r.appendIterationPrompt(messages, i)
+		currentMessages := r.appendIterationPrompt(messages, i, query)
 
 		// Get LLM response
-		response, err := r.client.Complete(ctx, currentMessages)
+		llmResp, err := r.client.Complete(ctx, currentMessages)
 		if err != nil {
 			return nil, fmt.Errorf("iteration %d: llm completion failed: %w", i, err)
 		}
+		response := llmResp.Content
+
+		// Aggregate root LLM tokens
+		totalPromptTokens += llmResp.PromptTokens
+		totalCompletionTokens += llmResp.CompletionTokens
 
 		if r.config.Verbose {
 			fmt.Printf("[RLM] Response: %s\n", truncate(response, 200))
@@ -161,7 +170,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 			}
 		}
 
-		// Get RLM calls made during code execution
+		// Get RLM calls made during code execution and aggregate tokens
 		var rlmCalls []logger.RLMCallEntry
 		for _, call := range replEnv.GetLLMCalls() {
 			rlmCalls = append(rlmCalls, logger.RLMCallEntry{
@@ -171,6 +180,9 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 				CompletionTokens: call.CompletionTokens,
 				ExecutionTime:    call.Duration,
 			})
+			// Aggregate token usage
+			totalPromptTokens += call.PromptTokens
+			totalCompletionTokens += call.CompletionTokens
 		}
 
 		// Get locals from REPL for logging
@@ -210,6 +222,11 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 				Response:   resultResponse,
 				Iterations: i + 1,
 				Duration:   time.Since(start),
+				Usage: core.UsageStats{
+					PromptTokens:     totalPromptTokens,
+					CompletionTokens: totalCompletionTokens,
+					TotalTokens:      totalPromptTokens + totalCompletionTokens,
+				},
 			}, nil
 		}
 
@@ -223,7 +240,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 	}
 
 	// Max iterations exhausted - force final answer
-	return r.forceDefaultAnswer(ctx, messages, start)
+	return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens)
 }
 
 // buildInitialMessages creates the initial message history.
@@ -238,16 +255,16 @@ func (r *RLM) buildInitialMessages(replEnv *repl.REPL, query string) []core.Mess
 }
 
 // appendIterationPrompt adds the appropriate user prompt for the current iteration.
-func (r *RLM) appendIterationPrompt(messages []core.Message, iteration int) []core.Message {
+func (r *RLM) appendIterationPrompt(messages []core.Message, iteration int, query string) []core.Message {
 	if iteration == 0 {
 		// First iteration - messages already include the initial user prompt
 		return messages
 	}
 
-	// Subsequent iterations - add continuation prompt
+	// Subsequent iterations - add continuation prompt with query reminder
 	return append(messages, core.Message{
 		Role:    "user",
-		Content: IterationPromptTemplate,
+		Content: fmt.Sprintf(IterationPromptTemplate, query),
 	})
 }
 
@@ -276,20 +293,24 @@ func (r *RLM) appendIterationToHistory(messages []core.Message, response string,
 }
 
 // forceDefaultAnswer forces the LLM to provide a final answer.
-func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, start time.Time) (*core.CompletionResult, error) {
+func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, start time.Time, promptTokens, completionTokens int) (*core.CompletionResult, error) {
 	messages = append(messages, core.Message{
 		Role:    "user",
 		Content: DefaultAnswerPrompt,
 	})
 
-	response, err := r.client.Complete(ctx, messages)
+	llmResp, err := r.client.Complete(ctx, messages)
 	if err != nil {
 		return nil, fmt.Errorf("default answer: llm completion failed: %w", err)
 	}
 
+	// Add tokens from this final call
+	promptTokens += llmResp.PromptTokens
+	completionTokens += llmResp.CompletionTokens
+
 	// Try to extract FINAL from response
-	answer := response
-	if final := parsing.FindFinalAnswer(response); final != nil {
+	answer := llmResp.Content
+	if final := parsing.FindFinalAnswer(llmResp.Content); final != nil {
 		answer = final.Content
 	}
 
@@ -297,6 +318,11 @@ func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, s
 		Response:   answer,
 		Iterations: r.config.MaxIterations,
 		Duration:   time.Since(start),
+		Usage: core.UsageStats{
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      promptTokens + completionTokens,
+		},
 	}, nil
 }
 

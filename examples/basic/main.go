@@ -74,7 +74,7 @@ type anthropicResponse struct {
 }
 
 // Complete implements rlm.LLMClient for root LLM orchestration.
-func (c *AnthropicClient) Complete(ctx context.Context, messages []core.Message) (string, error) {
+func (c *AnthropicClient) Complete(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
 	// Extract system message if present
 	var systemPrompt string
 	var apiMessages []anthropicMessage
@@ -97,8 +97,15 @@ func (c *AnthropicClient) Complete(ctx context.Context, messages []core.Message)
 		System:    systemPrompt,
 	}
 
-	text, _, _, err := c.doRequest(ctx, reqBody)
-	return text, err
+	text, inputTokens, outputTokens, err := c.doRequest(ctx, reqBody)
+	if err != nil {
+		return core.LLMResponse{}, err
+	}
+	return core.LLMResponse{
+		Content:          text,
+		PromptTokens:     inputTokens,
+		CompletionTokens: outputTokens,
+	}, nil
 }
 
 // Query implements repl.LLMClient for sub-LLM calls from REPL.

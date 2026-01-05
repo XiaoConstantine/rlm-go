@@ -13,11 +13,11 @@ import (
 
 // mockLLMClient implements LLMClient for testing the root LLM
 type mockLLMClient struct {
-	completeFunc func(ctx context.Context, messages []core.Message) (string, error)
+	completeFunc func(ctx context.Context, messages []core.Message) (core.LLMResponse, error)
 	calls        [][]core.Message
 }
 
-func (m *mockLLMClient) Complete(ctx context.Context, messages []core.Message) (string, error) {
+func (m *mockLLMClient) Complete(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
 	m.calls = append(m.calls, messages)
 	return m.completeFunc(ctx, messages)
 }
@@ -104,9 +104,9 @@ func TestDefaultConfig(t *testing.T) {
 func TestCompleteWithDirectFinal(t *testing.T) {
 	callCount := 0
 	client := &mockLLMClient{
-		completeFunc: func(ctx context.Context, messages []core.Message) (string, error) {
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
 			callCount++
-			return "FINAL(42)", nil
+			return core.LLMResponse{Content: "FINAL(42)", PromptTokens: 10, CompletionTokens: 5}, nil
 		},
 	}
 	replClient := &mockREPLClient{}
@@ -132,12 +132,12 @@ func TestCompleteWithDirectFinal(t *testing.T) {
 func TestCompleteWithFinalVar(t *testing.T) {
 	callCount := 0
 	client := &mockLLMClient{
-		completeFunc: func(ctx context.Context, messages []core.Message) (string, error) {
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
 			callCount++
 			if callCount == 1 {
-				return "```go\nanswer := \"the answer is 42\"\n```\nFINAL_VAR(answer)", nil
+				return core.LLMResponse{Content: "```go\nanswer := \"the answer is 42\"\n```\nFINAL_VAR(answer)", PromptTokens: 10, CompletionTokens: 20}, nil
 			}
-			return "FINAL(unexpected)", nil
+			return core.LLMResponse{Content: "FINAL(unexpected)"}, nil
 		},
 	}
 	replClient := &mockREPLClient{}
@@ -160,12 +160,12 @@ func TestCompleteWithFinalVar(t *testing.T) {
 func TestCompleteMultipleIterations(t *testing.T) {
 	callCount := 0
 	client := &mockLLMClient{
-		completeFunc: func(ctx context.Context, messages []core.Message) (string, error) {
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
 			callCount++
 			if callCount < 3 {
-				return "```go\nfmt.Println(\"thinking...\")\n```", nil
+				return core.LLMResponse{Content: "```go\nfmt.Println(\"thinking...\")\n```", PromptTokens: 10, CompletionTokens: 15}, nil
 			}
-			return "FINAL(done after 3 iterations)", nil
+			return core.LLMResponse{Content: "FINAL(done after 3 iterations)", PromptTokens: 10, CompletionTokens: 10}, nil
 		},
 	}
 	replClient := &mockREPLClient{}
@@ -188,13 +188,13 @@ func TestCompleteMultipleIterations(t *testing.T) {
 func TestCompleteMaxIterationsExhausted(t *testing.T) {
 	callCount := 0
 	client := &mockLLMClient{
-		completeFunc: func(ctx context.Context, messages []core.Message) (string, error) {
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
 			callCount++
 			if callCount <= 3 {
-				return "```go\nfmt.Println(\"still thinking\")\n```", nil
+				return core.LLMResponse{Content: "```go\nfmt.Println(\"still thinking\")\n```", PromptTokens: 10, CompletionTokens: 15}, nil
 			}
 			// Default answer prompt should extract FINAL
-			return "FINAL(forced answer)", nil
+			return core.LLMResponse{Content: "FINAL(forced answer)", PromptTokens: 10, CompletionTokens: 10}, nil
 		},
 	}
 	replClient := &mockREPLClient{}
@@ -216,8 +216,8 @@ func TestCompleteMaxIterationsExhausted(t *testing.T) {
 
 func TestCompleteLLMError(t *testing.T) {
 	client := &mockLLMClient{
-		completeFunc: func(ctx context.Context, messages []core.Message) (string, error) {
-			return "", errors.New("LLM unavailable")
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{}, errors.New("LLM unavailable")
 		},
 	}
 	replClient := &mockREPLClient{}
@@ -235,13 +235,13 @@ func TestCompleteLLMError(t *testing.T) {
 
 func TestCompleteContextCancellation(t *testing.T) {
 	client := &mockLLMClient{
-		completeFunc: func(ctx context.Context, messages []core.Message) (string, error) {
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
 			// Simulate long operation
 			select {
 			case <-ctx.Done():
-				return "", ctx.Err()
+				return core.LLMResponse{}, ctx.Err()
 			case <-time.After(100 * time.Millisecond):
-				return "```go\nfmt.Println(1)\n```", nil
+				return core.LLMResponse{Content: "```go\nfmt.Println(1)\n```"}, nil
 			}
 		},
 	}
@@ -298,22 +298,25 @@ func TestAppendIterationPrompt(t *testing.T) {
 		{Role: "user", Content: "initial"},
 	}
 
+	testQuery := "What is the answer?"
+
 	// First iteration - should not add anything
-	messages := rlm.appendIterationPrompt(initialMessages, 0)
+	messages := rlm.appendIterationPrompt(initialMessages, 0, testQuery)
 	if len(messages) != 2 {
 		t.Errorf("iteration 0: expected 2 messages, got %d", len(messages))
 	}
 
 	// Second iteration - should add continuation prompt
-	messages = rlm.appendIterationPrompt(initialMessages, 1)
+	messages = rlm.appendIterationPrompt(initialMessages, 1, testQuery)
 	if len(messages) != 3 {
 		t.Errorf("iteration 1: expected 3 messages, got %d", len(messages))
 	}
 	if messages[2].Role != "user" {
 		t.Errorf("added message role = %q, want 'user'", messages[2].Role)
 	}
-	if messages[2].Content != IterationPromptTemplate {
-		t.Errorf("added message content should be IterationPromptTemplate")
+	// The prompt should contain the query as a reminder
+	if !strings.Contains(messages[2].Content, testQuery) {
+		t.Errorf("added message should contain query reminder")
 	}
 }
 
@@ -494,12 +497,12 @@ func TestTruncateString(t *testing.T) {
 func TestCompleteWithCodeExecution(t *testing.T) {
 	callCount := 0
 	client := &mockLLMClient{
-		completeFunc: func(ctx context.Context, messages []core.Message) (string, error) {
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
 			callCount++
 			if callCount == 1 {
-				return "```go\nresult := 2 + 2\nfmt.Println(result)\n```", nil
+				return core.LLMResponse{Content: "```go\nresult := 2 + 2\nfmt.Println(result)\n```", PromptTokens: 10, CompletionTokens: 15}, nil
 			}
-			return "FINAL(4)", nil
+			return core.LLMResponse{Content: "FINAL(4)", PromptTokens: 10, CompletionTokens: 5}, nil
 		},
 	}
 	replClient := &mockREPLClient{}
@@ -519,8 +522,8 @@ func TestCompleteWithCodeExecution(t *testing.T) {
 
 func TestCompleteWithMapContext(t *testing.T) {
 	client := &mockLLMClient{
-		completeFunc: func(ctx context.Context, messages []core.Message) (string, error) {
-			return "FINAL(done)", nil
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{Content: "FINAL(done)", PromptTokens: 10, CompletionTokens: 5}, nil
 		},
 	}
 	replClient := &mockREPLClient{}
@@ -544,8 +547,8 @@ func TestCompleteWithMapContext(t *testing.T) {
 
 func TestCompleteWithSliceContext(t *testing.T) {
 	client := &mockLLMClient{
-		completeFunc: func(ctx context.Context, messages []core.Message) (string, error) {
-			return "FINAL(processed)", nil
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{Content: "FINAL(processed)", PromptTokens: 10, CompletionTokens: 5}, nil
 		},
 	}
 	replClient := &mockREPLClient{}
@@ -598,9 +601,9 @@ func TestPromptsConstants(t *testing.T) {
 
 func TestCompleteResultDuration(t *testing.T) {
 	client := &mockLLMClient{
-		completeFunc: func(ctx context.Context, messages []core.Message) (string, error) {
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
 			time.Sleep(10 * time.Millisecond)
-			return "FINAL(done)", nil
+			return core.LLMResponse{Content: "FINAL(done)", PromptTokens: 10, CompletionTokens: 5}, nil
 		},
 	}
 	replClient := &mockREPLClient{}
