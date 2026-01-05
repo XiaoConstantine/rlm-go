@@ -29,15 +29,17 @@ The result is ~100x less latency per sub-LLM call compared to socket IPC.
 - An LLM API key:
   - `ANTHROPIC_API_KEY` for Claude models (default)
   - `GEMINI_API_KEY` for Gemini models
+  - `OPENAI_API_KEY` for OpenAI models
 
 ## Supported Models
 
-| Provider | Models | Default |
-|----------|--------|---------|
-| Anthropic | claude-sonnet-4-20250514, claude-opus-4-20250514, etc. | Yes |
-| Google | gemini-3-flash-preview, gemini-3-pro-preview | No |
+| Provider | Models | Env Variable |
+|----------|--------|--------------|
+| Anthropic | claude-sonnet-4-20250514, claude-opus-4-20250514, etc. | `ANTHROPIC_API_KEY` |
+| Google | gemini-3-flash-preview, gemini-3-pro-preview | `GEMINI_API_KEY` |
+| OpenAI | gpt-5, gpt-5-mini | `OPENAI_API_KEY` |
 
-The provider is auto-detected based on model name.
+The provider is auto-detected based on model name. Anthropic is the default.
 
 ## Installation
 
@@ -94,8 +96,11 @@ After installation, restart Claude Code to activate the skill.
 # Basic usage with Anthropic (default)
 rlm -context file.txt -query "Summarize the key points"
 
-# Use Gemini instead
+# Use Gemini
 rlm -model gemini-3-flash-preview -context file.txt -query "Analyze this data"
+
+# Use OpenAI
+rlm -model gpt-5-mini -context file.txt -query "Summarize this"
 
 # Verbose output with iteration details
 rlm -context logs.json -query "Find all errors" -verbose
