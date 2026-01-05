@@ -25,14 +25,57 @@ The result is ~100x less latency per sub-LLM call compared to socket IPC.
 
 ## Requirements
 
-- Go 1.23 or later
+- Go 1.23 or later (for building from source)
 - An LLM API key (e.g., `ANTHROPIC_API_KEY` for Anthropic)
 
 ## Installation
 
+### Quick Install (Recommended)
+
+```bash
+# Download and install the latest release
+curl -fsSL https://raw.githubusercontent.com/XiaoConstantine/rlm-go/main/install.sh | bash
+```
+
+This installs the `rlm` binary to `~/.local/bin/rlm`.
+
+### Go Install
+
+```bash
+go install github.com/XiaoConstantine/rlm-go/cmd/rlm@latest
+```
+
+### From Source
+
+```bash
+git clone https://github.com/XiaoConstantine/rlm-go.git
+cd rlm-go
+go build -o rlm ./cmd/rlm
+```
+
+### As a Library
+
 ```bash
 go get github.com/XiaoConstantine/rlm-go
 ```
+
+## Claude Code Integration
+
+RLM includes a skill for [Claude Code](https://claude.com/claude-code) that provides documentation and usage guidance for large context processing.
+
+### Install the Skill
+
+```bash
+rlm install-claude-code
+```
+
+This creates a skill at `~/.claude/skills/rlm/SKILL.md` that teaches Claude Code:
+- When to use RLM (contexts >50KB, token efficiency needed)
+- Command usage and options
+- The Query() and FINAL() patterns
+- Token efficiency benefits (40% savings on large contexts)
+
+After installation, restart Claude Code to activate the skill.
 
 ## Quick Start
 

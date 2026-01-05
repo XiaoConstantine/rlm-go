@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/rlm_start.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/rlm_stop.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

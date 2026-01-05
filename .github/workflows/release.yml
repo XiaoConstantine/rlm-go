@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+
+          # Linux amd64
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/rlm-linux-amd64 ./cmd/rlm
+
+          # Darwin amd64 (Intel Mac)
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o dist/rlm-darwin-amd64 ./cmd/rlm
+
+          # Darwin arm64 (Apple Silicon)
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dist/rlm-darwin-arm64 ./cmd/rlm
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/rlm-linux-amd64
+            dist/rlm-darwin-amd64
+            dist/rlm-darwin-arm64
+            dist/checksums.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

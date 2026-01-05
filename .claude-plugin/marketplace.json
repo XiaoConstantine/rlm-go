@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "rlm",
+  "owner": {
+    "name": "XiaoConstantine",
+    "email": "constantine124@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "rlm",
+      "source": "./plugins/rlm",
+      "description": "Recursive Language Model for large context processing with token efficiency",
+      "version": "0.1.0",
+      "author": {
+        "name": "Xiao Cui"
+      },
+      "skills": ["./skills/rlm"]
+    }
+  ]
+}

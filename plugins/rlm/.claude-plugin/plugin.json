@@ -1,0 +1,9 @@
+{
+  "name": "rlm",
+  "description": "Recursive Language Model for large context processing with token efficiency",
+  "version": "0.1.0",
+  "author": {
+    "name": "Xiao Cui"
+  },
+  "hooks": "./hooks/hook.json"
+}
