@@ -26,7 +26,18 @@ The result is ~100x less latency per sub-LLM call compared to socket IPC.
 ## Requirements
 
 - Go 1.23 or later (for building from source)
-- An LLM API key (e.g., `ANTHROPIC_API_KEY` for Anthropic)
+- An LLM API key:
+  - `ANTHROPIC_API_KEY` for Claude models (default)
+  - `GEMINI_API_KEY` for Gemini models
+
+## Supported Models
+
+| Provider | Models | Default |
+|----------|--------|---------|
+| Anthropic | claude-sonnet-4-20250514, claude-opus-4-20250514, etc. | Yes |
+| Google | gemini-3-flash-preview, gemini-3-pro-preview | No |
+
+The provider is auto-detected based on model name.
 
 ## Installation
 
@@ -77,7 +88,39 @@ This creates a skill at `~/.claude/skills/rlm/SKILL.md` that teaches Claude Code
 
 After installation, restart Claude Code to activate the skill.
 
-## Quick Start
+## CLI Usage
+
+```bash
+# Basic usage with Anthropic (default)
+rlm -context file.txt -query "Summarize the key points"
+
+# Use Gemini instead
+rlm -model gemini-3-flash-preview -context file.txt -query "Analyze this data"
+
+# Verbose output with iteration details
+rlm -context logs.json -query "Find all errors" -verbose
+
+# JSON output for programmatic use
+rlm -context data.csv -query "Extract anomalies" -json
+
+# Pipe context from stdin
+cat largefile.txt | rlm -query "What patterns do you see?"
+```
+
+### CLI Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-context` | Path to context file | - |
+| `-context-string` | Context string directly | - |
+| `-query` | Query to run against context | Required |
+| `-model` | LLM model to use | claude-sonnet-4-20250514 |
+| `-max-iterations` | Maximum iterations | 30 |
+| `-verbose` | Enable verbose output | false |
+| `-json` | Output result as JSON | false |
+| `-log-dir` | Directory for JSONL logs | - |
+
+## Quick Start (Library)
 
 ```go
 package main
