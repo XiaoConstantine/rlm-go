@@ -130,14 +130,18 @@ func TestCompleteWithDirectFinal(t *testing.T) {
 }
 
 func TestCompleteWithFinalVar(t *testing.T) {
+	// Test that FINAL_VAR is only processed when there are NO code blocks in the response.
+	// This ensures the model waits for execution results before providing a final answer.
 	callCount := 0
 	client := &mockLLMClient{
 		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
 			callCount++
 			if callCount == 1 {
+				// First call: code block to set up the variable (FINAL_VAR ignored because code blocks present)
 				return core.LLMResponse{Content: "```go\nanswer := \"the answer is 42\"\n```\nFINAL_VAR(answer)", PromptTokens: 10, CompletionTokens: 20}, nil
 			}
-			return core.LLMResponse{Content: "FINAL(unexpected)"}, nil
+			// Second call: just FINAL_VAR without code blocks - now it's processed
+			return core.LLMResponse{Content: "FINAL_VAR(answer)", PromptTokens: 10, CompletionTokens: 5}, nil
 		},
 	}
 	replClient := &mockREPLClient{}
@@ -152,8 +156,9 @@ func TestCompleteWithFinalVar(t *testing.T) {
 	if result.Response != "the answer is 42" {
 		t.Errorf("Response = %q, want %q", result.Response, "the answer is 42")
 	}
-	if result.Iterations != 1 {
-		t.Errorf("Iterations = %d, want 1", result.Iterations)
+	// Now takes 2 iterations: first sets up variable, second returns it
+	if result.Iterations != 2 {
+		t.Errorf("Iterations = %d, want 2", result.Iterations)
 	}
 }
 

@@ -188,10 +188,14 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		// Get locals from REPL for logging
 		locals := replEnv.GetLocals()
 
-		// Check for final answer
+		// Check for final answer - BUT only if there were NO code blocks in this response.
+		// If there are code blocks, we need to wait for the next iteration so the model
+		// can see the execution results before providing a final answer.
 		var finalAnswer any // nil, string, or []string{varname, value}
 		var resultResponse string
-		if final := parsing.FindFinalAnswer(response); final != nil {
+		if len(codeBlocks) == 0 && parsing.FindFinalAnswer(response) != nil {
+			// No code blocks and has final answer - process it
+			final := parsing.FindFinalAnswer(response)
 			varName := final.Content
 			varValue := varName // Default to content itself
 
