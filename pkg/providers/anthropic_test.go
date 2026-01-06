@@ -10,24 +10,29 @@ import (
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
 )
 
-func TestAnthropicClient_Complete(t *testing.T) {
-	// Create a mock server
+func TestAnthropicClient_Complete_Success(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify request
 		if r.Method != "POST" {
 			t.Errorf("Expected POST, got %s", r.Method)
 		}
-		if r.Header.Get("Content-Type") != "application/json" {
-			t.Errorf("Expected Content-Type application/json")
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("Expected /v1/messages, got %s", r.URL.Path)
 		}
 		if r.Header.Get("x-api-key") != "test-key" {
-			t.Errorf("Expected x-api-key test-key")
+			t.Errorf("Expected x-api-key test-key, got %s", r.Header.Get("x-api-key"))
 		}
 		if r.Header.Get("anthropic-version") != "2023-06-01" {
 			t.Errorf("Expected anthropic-version 2023-06-01")
 		}
 
-		// Return mock response
+		var req anthropicRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("Failed to decode request: %v", err)
+		}
+		if req.System != "You are helpful" {
+			t.Errorf("Expected system prompt, got %s", req.System)
+		}
+
 		resp := anthropicResponse{
 			Content: []struct {
 				Type string `json:"type"`
@@ -48,77 +53,184 @@ func TestAnthropicClient_Complete(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Create client with mock server URL
 	client := NewAnthropicClient("test-key", "claude-test", false)
-	client.httpClient = server.Client()
+	client.baseURL = server.URL
 
-	// Override the URL by creating a custom doRequest (we can't easily override the URL)
-	// Instead, test with the real client structure validation
 	messages := []core.Message{
 		{Role: "system", Content: "You are helpful"},
 		{Role: "user", Content: "Hello"},
 	}
 
-	// This test validates the client creation and message handling
-	// Full integration tests would require more setup
-	if client.apiKey != "test-key" {
-		t.Errorf("apiKey not set correctly")
+	resp, err := client.Complete(context.Background(), messages)
+	if err != nil {
+		t.Fatalf("Complete failed: %v", err)
 	}
-	if client.model != "claude-test" {
-		t.Errorf("model not set correctly")
+	if resp.Content != "Hello, world!" {
+		t.Errorf("Expected 'Hello, world!', got %s", resp.Content)
 	}
-	if len(messages) != 2 {
-		t.Errorf("messages not created correctly")
+	if resp.PromptTokens != 10 {
+		t.Errorf("Expected 10 prompt tokens, got %d", resp.PromptTokens)
 	}
-}
-
-func TestAnthropicClient_Query(t *testing.T) {
-	client := NewAnthropicClient("test-key", "claude-test", false)
-
-	// Verify client is properly configured
-	if client.maxTokens != 4096 {
-		t.Errorf("maxTokens = %d, want 4096", client.maxTokens)
+	if resp.CompletionTokens != 5 {
+		t.Errorf("Expected 5 completion tokens, got %d", resp.CompletionTokens)
 	}
 }
 
-func TestAnthropicClient_QueryBatched(t *testing.T) {
+func TestAnthropicClient_Complete_Error(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error": {"message": "Invalid request"}}`))
+	}))
+	defer server.Close()
+
+	client := NewAnthropicClient("test-key", "claude-test", false)
+	client.baseURL = server.URL
+
+	_, err := client.Complete(context.Background(), []core.Message{{Role: "user", Content: "Hi"}})
+	if err == nil {
+		t.Error("Expected error, got nil")
+	}
+}
+
+func TestAnthropicClient_Query_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := anthropicResponse{
+			Content: []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}{
+				{Type: "text", Text: "Query response"},
+			},
+			Usage: struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			}{
+				InputTokens:  5,
+				OutputTokens: 3,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewAnthropicClient("test-key", "claude-test", false)
+	client.baseURL = server.URL
+
+	resp, err := client.Query(context.Background(), "Test prompt")
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	if resp.Response != "Query response" {
+		t.Errorf("Expected 'Query response', got %s", resp.Response)
+	}
+	if resp.PromptTokens != 5 {
+		t.Errorf("Expected 5 prompt tokens, got %d", resp.PromptTokens)
+	}
+}
+
+func TestAnthropicClient_QueryBatched_Success(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		resp := anthropicResponse{
+			Content: []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}{
+				{Type: "text", Text: "Response"},
+			},
+			Usage: struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			}{
+				InputTokens:  1,
+				OutputTokens: 1,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewAnthropicClient("test-key", "claude-test", false)
+	client.baseURL = server.URL
+
+	prompts := []string{"Prompt 1", "Prompt 2", "Prompt 3"}
+	results, err := client.QueryBatched(context.Background(), prompts)
+	if err != nil {
+		t.Fatalf("QueryBatched failed: %v", err)
+	}
+	if len(results) != 3 {
+		t.Errorf("Expected 3 results, got %d", len(results))
+	}
+	if callCount != 3 {
+		t.Errorf("Expected 3 API calls, got %d", callCount)
+	}
+}
+
+func TestAnthropicClient_QueryBatched_Empty(t *testing.T) {
 	client := NewAnthropicClient("test-key", "claude-test", false)
 
-	// Test that QueryBatched handles empty input
-	ctx := context.Background()
-	results, err := client.QueryBatched(ctx, []string{})
+	results, err := client.QueryBatched(context.Background(), []string{})
 	if err != nil {
 		t.Errorf("QueryBatched with empty input returned error: %v", err)
 	}
 	if len(results) != 0 {
-		t.Errorf("QueryBatched with empty input returned %d results, want 0", len(results))
+		t.Errorf("Expected 0 results, got %d", len(results))
 	}
 }
 
-func TestAnthropicRequest_Marshal(t *testing.T) {
-	req := anthropicRequest{
-		Model:     "claude-test",
-		MaxTokens: 4096,
-		Messages: []anthropicMessage{
-			{Role: "user", Content: "Hello"},
-		},
-		System: "Be helpful",
-	}
+func TestAnthropicClient_Verbose(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := anthropicResponse{
+			Content: []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}{
+				{Type: "text", Text: "Response"},
+			},
+			Usage: struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			}{
+				InputTokens:  10,
+				OutputTokens: 5,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
 
-	data, err := json.Marshal(req)
+	client := NewAnthropicClient("test-key", "claude-test", true)
+	client.baseURL = server.URL
+
+	_, err := client.Query(context.Background(), "Test")
 	if err != nil {
-		t.Fatalf("Failed to marshal request: %v", err)
+		t.Fatalf("Query failed: %v", err)
 	}
+}
 
-	var unmarshaled anthropicRequest
-	if err := json.Unmarshal(data, &unmarshaled); err != nil {
-		t.Fatalf("Failed to unmarshal request: %v", err)
-	}
+func TestAnthropicClient_APIError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := anthropicResponse{
+			Error: &struct {
+				Message string `json:"message"`
+			}{
+				Message: "Rate limit exceeded",
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
 
-	if unmarshaled.Model != req.Model {
-		t.Errorf("Model mismatch: got %s, want %s", unmarshaled.Model, req.Model)
-	}
-	if unmarshaled.System != req.System {
-		t.Errorf("System mismatch: got %s, want %s", unmarshaled.System, req.System)
+	client := NewAnthropicClient("test-key", "claude-test", false)
+	client.baseURL = server.URL
+
+	_, err := client.Query(context.Background(), "Test")
+	if err == nil {
+		t.Error("Expected error for API error response")
 	}
 }

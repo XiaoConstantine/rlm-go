@@ -20,6 +20,7 @@ type OpenAIClient struct {
 	model      string
 	httpClient *http.Client
 	verbose    bool
+	baseURL    string // For testing; defaults to OpenAI API
 }
 
 // NewOpenAIClient creates a new OpenAI client.
@@ -28,6 +29,7 @@ func NewOpenAIClient(apiKey, model string, verbose bool) *OpenAIClient {
 		apiKey:  apiKey,
 		model:   model,
 		verbose: verbose,
+		baseURL: "https://api.openai.com",
 		httpClient: &http.Client{
 			Timeout: 180 * time.Second,
 			Transport: &http.Transport{
@@ -141,7 +143,7 @@ func (c *OpenAIClient) doRequest(ctx context.Context, reqBody openaiRequest) (st
 		return "", 0, 0, fmt.Errorf("marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/chat/completions", bytes.NewReader(jsonBody))
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("create request: %w", err)
 	}

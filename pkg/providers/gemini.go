@@ -21,6 +21,7 @@ type GeminiClient struct {
 	model      string
 	httpClient *http.Client
 	verbose    bool
+	baseURL    string // For testing; defaults to Gemini API
 }
 
 // NewGeminiClient creates a new Gemini client.
@@ -29,6 +30,7 @@ func NewGeminiClient(apiKey, model string, verbose bool) *GeminiClient {
 		apiKey:  apiKey,
 		model:   model,
 		verbose: verbose,
+		baseURL: "https://generativelanguage.googleapis.com",
 		httpClient: &http.Client{
 			Timeout: 180 * time.Second,
 			Transport: &http.Transport{
@@ -168,7 +170,7 @@ func (c *GeminiClient) doRequest(ctx context.Context, reqBody geminiRequest) (st
 		return "", 0, 0, fmt.Errorf("marshal request: %w", err)
 	}
 
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", c.model, c.apiKey)
+	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent?key=%s", c.baseURL, c.model, c.apiKey)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("create request: %w", err)

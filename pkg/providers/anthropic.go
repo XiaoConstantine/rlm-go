@@ -22,6 +22,7 @@ type AnthropicClient struct {
 	maxTokens  int
 	httpClient *http.Client
 	verbose    bool
+	baseURL    string // For testing; defaults to Anthropic API
 }
 
 // NewAnthropicClient creates a new Anthropic client.
@@ -31,6 +32,7 @@ func NewAnthropicClient(apiKey, model string, verbose bool) *AnthropicClient {
 		model:     model,
 		maxTokens: 4096,
 		verbose:   verbose,
+		baseURL:   "https://api.anthropic.com",
 		httpClient: &http.Client{
 			Timeout: 180 * time.Second,
 			Transport: &http.Transport{
@@ -151,7 +153,7 @@ func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicReques
 		return "", 0, 0, fmt.Errorf("marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/messages", bytes.NewReader(jsonBody))
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("create request: %w", err)
 	}
