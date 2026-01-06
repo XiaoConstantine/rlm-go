@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
@@ -219,9 +220,9 @@ func TestGeminiClient_Query_Success(t *testing.T) {
 }
 
 func TestGeminiClient_QueryBatched_Success(t *testing.T) {
-	callCount := 0
+	var callCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
+		atomic.AddInt32(&callCount, 1)
 		resp := geminiResponse{
 			Candidates: []struct {
 				Content struct {

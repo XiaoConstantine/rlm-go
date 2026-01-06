@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
@@ -130,9 +131,9 @@ func TestAnthropicClient_Query_Success(t *testing.T) {
 }
 
 func TestAnthropicClient_QueryBatched_Success(t *testing.T) {
-	callCount := 0
+	var callCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
+		atomic.AddInt32(&callCount, 1)
 		resp := anthropicResponse{
 			Content: []struct {
 				Type string `json:"type"`
@@ -164,8 +165,8 @@ func TestAnthropicClient_QueryBatched_Success(t *testing.T) {
 	if len(results) != 3 {
 		t.Errorf("Expected 3 results, got %d", len(results))
 	}
-	if callCount != 3 {
-		t.Errorf("Expected 3 API calls, got %d", callCount)
+	if atomic.LoadInt32(&callCount) != 3 {
+		t.Errorf("Expected 3 API calls, got %d", atomic.LoadInt32(&callCount))
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
@@ -150,9 +151,9 @@ func TestOpenAIClient_Query_Success(t *testing.T) {
 }
 
 func TestOpenAIClient_QueryBatched_Success(t *testing.T) {
-	callCount := 0
+	var callCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
+		atomic.AddInt32(&callCount, 1)
 		resp := openaiResponse{
 			Choices: []struct {
 				Message struct {
@@ -193,8 +194,8 @@ func TestOpenAIClient_QueryBatched_Success(t *testing.T) {
 	if len(results) != 3 {
 		t.Errorf("Expected 3 results, got %d", len(results))
 	}
-	if callCount != 3 {
-		t.Errorf("Expected 3 API calls, got %d", callCount)
+	if atomic.LoadInt32(&callCount) != 3 {
+		t.Errorf("Expected 3 API calls, got %d", atomic.LoadInt32(&callCount))
 	}
 }
 
