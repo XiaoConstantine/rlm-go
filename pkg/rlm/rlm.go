@@ -3,6 +3,7 @@ package rlm
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
@@ -18,6 +19,17 @@ type LLMClient interface {
 	Complete(ctx context.Context, messages []core.Message) (core.LLMResponse, error)
 }
 
+// StreamHandler is called for each chunk of streamed content.
+type StreamHandler func(chunk string, done bool) error
+
+// StreamingLLMClient extends LLMClient with streaming support.
+type StreamingLLMClient interface {
+	LLMClient
+	// CompleteStream generates a streaming completion.
+	// The handler is called for each chunk of content as it arrives.
+	CompleteStream(ctx context.Context, messages []core.Message, handler StreamHandler) (core.LLMResponse, error)
+}
+
 // Config holds RLM configuration.
 type Config struct {
 	// MaxIterations is the maximum number of iteration loops (default: 30).
@@ -31,6 +43,36 @@ type Config struct {
 
 	// Logger is the optional JSONL logger.
 	Logger *logger.Logger
+
+	// EnableStreaming enables streaming for root LLM calls (default: false).
+	// When enabled, uses SSE streaming for lower perceived latency.
+	EnableStreaming bool
+
+	// OnStreamChunk is called for each chunk when streaming is enabled.
+	// Can be used to display streaming output to users.
+	OnStreamChunk StreamHandler
+
+	// REPLPool is an optional pool of REPL instances for reduced startup overhead.
+	// When set, REPLs will be acquired from and returned to this pool.
+	REPLPool *repl.REPLPool
+
+	// HistoryCompression configures incremental history compression.
+	// When enabled, older iterations are summarized to reduce context size.
+	HistoryCompression *HistoryCompressionConfig
+}
+
+// HistoryCompressionConfig configures how message history is compressed.
+type HistoryCompressionConfig struct {
+	// Enabled turns on history compression (default: false).
+	Enabled bool
+
+	// VerbatimIterations is the number of recent iterations to keep verbatim.
+	// Older iterations will be summarized. Default: 3.
+	VerbatimIterations int
+
+	// MaxSummaryTokens is the approximate maximum tokens for summarized history.
+	// Default: 500.
+	MaxSummaryTokens int
 }
 
 // DefaultConfig returns the default RLM configuration.
@@ -95,14 +137,73 @@ func WithLogger(l *logger.Logger) Option {
 	}
 }
 
+// WithStreaming enables streaming mode for root LLM calls.
+// When enabled, the LLM client must implement StreamingLLMClient.
+func WithStreaming(enabled bool) Option {
+	return func(c *Config) {
+		c.EnableStreaming = enabled
+	}
+}
+
+// WithStreamHandler sets the handler for streaming chunks.
+// Only used when streaming is enabled.
+func WithStreamHandler(handler StreamHandler) Option {
+	return func(c *Config) {
+		c.OnStreamChunk = handler
+	}
+}
+
+// WithREPLPool sets a REPL pool for reduced REPL startup overhead.
+// When set, REPLs will be acquired from and returned to this pool.
+func WithREPLPool(pool *repl.REPLPool) Option {
+	return func(c *Config) {
+		c.REPLPool = pool
+	}
+}
+
+// WithHistoryCompression enables incremental history compression.
+// verbatimIterations is how many recent iterations to keep in full (default: 3).
+// maxSummaryTokens is the approximate max tokens for the summary (default: 500).
+func WithHistoryCompression(verbatimIterations, maxSummaryTokens int) Option {
+	return func(c *Config) {
+		if verbatimIterations <= 0 {
+			verbatimIterations = 3
+		}
+		if maxSummaryTokens <= 0 {
+			maxSummaryTokens = 500
+		}
+		c.HistoryCompression = &HistoryCompressionConfig{
+			Enabled:            true,
+			VerbatimIterations: verbatimIterations,
+			MaxSummaryTokens:   maxSummaryTokens,
+		}
+	}
+}
+
 // Complete runs an RLM completion.
 // contextPayload is the context data (string, map, or slice).
 // query is the user's question.
 func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*core.CompletionResult, error) {
 	start := time.Now()
 
-	// Create REPL environment
-	replEnv := repl.New(r.replClient)
+	// Create or acquire REPL environment
+	var replEnv *repl.REPL
+	var returnToPool bool
+	if r.config.REPLPool != nil {
+		replEnv = r.config.REPLPool.Get()
+		returnToPool = true
+	} else {
+		replEnv = repl.New(r.replClient)
+	}
+
+	// Ensure REPL is returned to pool on function exit
+	defer func() {
+		if returnToPool && r.config.REPLPool != nil {
+			r.config.REPLPool.Put(replEnv)
+		} else {
+			replEnv.Close()
+		}
+	}()
 
 	// Load context into REPL
 	if err := replEnv.LoadContext(contextPayload); err != nil {
@@ -132,8 +233,8 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		// Add iteration-specific user prompt
 		currentMessages := r.appendIterationPrompt(messages, i, query)
 
-		// Get LLM response
-		llmResp, err := r.client.Complete(ctx, currentMessages)
+		// Get LLM response (streaming or non-streaming)
+		llmResp, err := r.completeWithOptionalStreaming(ctx, currentMessages)
 		if err != nil {
 			return nil, fmt.Errorf("iteration %d: llm completion failed: %w", i, err)
 		}
@@ -241,6 +342,11 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 
 		// Append iteration results to history
 		messages = r.appendIterationToHistory(messages, response, execResults)
+
+		// Apply history compression if enabled and we have enough iterations
+		if r.config.HistoryCompression != nil && r.config.HistoryCompression.Enabled {
+			messages = r.compressHistory(messages, i+1)
+		}
 	}
 
 	// Max iterations exhausted - force final answer
@@ -296,6 +402,146 @@ func (r *RLM) appendIterationToHistory(messages []core.Message, response string,
 	return messages
 }
 
+// compressHistory compresses older iterations in the message history.
+// It keeps the system message and initial user prompt, plus the most recent N iterations verbatim.
+// Older iterations are summarized into a single message.
+func (r *RLM) compressHistory(messages []core.Message, currentIteration int) []core.Message {
+	cfg := r.config.HistoryCompression
+	if cfg == nil || !cfg.Enabled {
+		return messages
+	}
+
+	// Calculate how many messages constitute one iteration:
+	// - 1 assistant message (LLM response)
+	// - 1+ user messages (execution results, iteration prompts)
+	// For simplicity, we estimate each iteration adds ~2-3 messages on average.
+
+	// We keep:
+	// - messages[0]: system prompt
+	// - messages[1]: initial user prompt with context
+	// - Last N iterations of messages
+
+	if len(messages) <= 2 {
+		return messages // Nothing to compress
+	}
+
+	// Estimate messages per iteration (assistant + user messages for code results)
+	// This is approximate - each iteration has at least 2 messages
+	messagesPerIteration := 2
+
+	// Calculate how many messages to keep verbatim at the end
+	verbatimMessageCount := cfg.VerbatimIterations * messagesPerIteration
+	if verbatimMessageCount <= 0 {
+		verbatimMessageCount = 6 // Default: keep last 3 iterations (2 msgs each)
+	}
+
+	// If we don't have enough messages to compress, return as-is
+	totalIterationMessages := len(messages) - 2 // Subtract system + initial user
+	if totalIterationMessages <= verbatimMessageCount {
+		return messages
+	}
+
+	// Calculate split point
+	splitIdx := len(messages) - verbatimMessageCount
+	if splitIdx <= 2 {
+		return messages // Not enough to compress
+	}
+
+	// Build compressed history
+	result := make([]core.Message, 0, 3+verbatimMessageCount)
+
+	// Keep system and initial user prompts
+	result = append(result, messages[0], messages[1])
+
+	// Summarize messages from index 2 to splitIdx
+	toCompress := messages[2:splitIdx]
+	if len(toCompress) > 0 {
+		summary := r.summarizeIterations(toCompress, cfg.MaxSummaryTokens)
+		result = append(result, core.Message{
+			Role:    "user",
+			Content: summary,
+		})
+	}
+
+	// Append verbatim recent messages
+	result = append(result, messages[splitIdx:]...)
+
+	if r.config.Verbose {
+		fmt.Printf("[RLM] Compressed history: %d -> %d messages (summarized %d iteration messages)\n",
+			len(messages), len(result), len(toCompress))
+	}
+
+	return result
+}
+
+// summarizeIterations creates a concise summary of older iteration messages.
+func (r *RLM) summarizeIterations(messages []core.Message, maxTokens int) string {
+	var summary strings.Builder
+	summary.WriteString("[Previous iterations summary]\n")
+
+	// Extract key information from each iteration
+	iterCount := 0
+	for i := 0; i < len(messages); i++ {
+		msg := messages[i]
+
+		if msg.Role == "assistant" {
+			iterCount++
+
+			// Extract code block presence and any FINAL mentions
+			hasCode := strings.Contains(msg.Content, "```go")
+			hasFinal := strings.Contains(msg.Content, "FINAL")
+
+			// Keep first ~100 chars of assistant response as context
+			preview := msg.Content
+			if len(preview) > 150 {
+				preview = preview[:150] + "..."
+			}
+
+			summary.WriteString(fmt.Sprintf("- Iteration %d: ", iterCount))
+			if hasCode {
+				summary.WriteString("executed code")
+			}
+			if hasFinal {
+				summary.WriteString(" (mentioned FINAL)")
+			}
+			summary.WriteString("\n")
+		} else if msg.Role == "user" && strings.Contains(msg.Content, "REPL output:") {
+			// Summarize execution results
+			if strings.Contains(msg.Content, "Error:") || strings.Contains(msg.Content, "error") {
+				summary.WriteString("  -> execution had errors\n")
+			} else if strings.Contains(msg.Content, "No output") {
+				summary.WriteString("  -> no output\n")
+			} else {
+				// Extract first line of output
+				lines := strings.Split(msg.Content, "\n")
+				for _, line := range lines {
+					if strings.HasPrefix(line, "REPL output:") {
+						continue
+					}
+					if strings.TrimSpace(line) != "" && !strings.HasPrefix(line, "Code executed:") && !strings.HasPrefix(line, "```") {
+						outputPreview := line
+						if len(outputPreview) > 80 {
+							outputPreview = outputPreview[:80] + "..."
+						}
+						summary.WriteString(fmt.Sprintf("  -> output: %s\n", outputPreview))
+						break
+					}
+				}
+			}
+		}
+	}
+
+	result := summary.String()
+
+	// Rough token estimation: ~4 chars per token
+	maxChars := maxTokens * 4
+	if len(result) > maxChars {
+		result = result[:maxChars] + "\n[...truncated]"
+	}
+
+	return result
+}
+
 // forceDefaultAnswer forces the LLM to provide a final answer.
 func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, start time.Time, promptTokens, completionTokens int) (*core.CompletionResult, error) {
 	messages = append(messages, core.Message{
@@ -328,6 +574,21 @@ func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, s
 			TotalTokens:      promptTokens + completionTokens,
 		},
 	}, nil
+}
+
+// completeWithOptionalStreaming calls the LLM with streaming if enabled and supported.
+func (r *RLM) completeWithOptionalStreaming(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+	// Check if streaming is enabled and the client supports it
+	if r.config.EnableStreaming {
+		if streamClient, ok := r.client.(StreamingLLMClient); ok {
+			return streamClient.CompleteStream(ctx, messages, r.config.OnStreamChunk)
+		}
+		// Fall back to non-streaming if client doesn't support it
+		if r.config.Verbose {
+			fmt.Println("[RLM] Streaming requested but client doesn't support it, falling back to non-streaming")
+		}
+	}
+	return r.client.Complete(ctx, messages)
 }
 
 // truncate shortens a string for logging.

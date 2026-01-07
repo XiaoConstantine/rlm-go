@@ -13,6 +13,7 @@ import (
 
 	"github.com/XiaoConstantine/rlm-go/pkg/logger"
 	"github.com/XiaoConstantine/rlm-go/pkg/providers"
+	"github.com/XiaoConstantine/rlm-go/pkg/repl"
 	"github.com/XiaoConstantine/rlm-go/pkg/rlm"
 )
 
@@ -25,6 +26,10 @@ var (
 	verbose       = flag.Bool("verbose", false, "Enable verbose output")
 	logDir        = flag.String("log-dir", "", "Directory for JSONL logs (optional)")
 	jsonOutput    = flag.Bool("json", false, "Output result as JSON")
+	enablePooling     = flag.Bool("pooling", false, "Enable REPL instance pooling")
+	poolSize          = flag.Int("pool-size", 3, "REPL pool size (requires -pooling)")
+	enableCompression = flag.Bool("compression", false, "Enable history compression")
+	verbatimIters     = flag.Int("verbatim-iters", 3, "Keep last N iterations verbatim (requires -compression)")
 )
 
 // Result represents the JSON output format.
@@ -153,6 +158,14 @@ Options:
 		}
 	}
 
+	var pool *repl.REPLPool
+	if *enablePooling {
+		pool = repl.NewREPLPool(client, *poolSize, true)
+		if *verbose {
+			fmt.Fprintf(os.Stderr, "REPL pool initialized with %d instances\n", *poolSize)
+		}
+	}
+
 	// Create RLM instance
 	opts := []rlm.Option{
 		rlm.WithMaxIterations(*maxIterations),
@@ -160,6 +173,12 @@ Options:
 	}
 	if log != nil {
 		opts = append(opts, rlm.WithLogger(log))
+	}
+	if pool != nil {
+		opts = append(opts, rlm.WithREPLPool(pool))
+	}
+	if *enableCompression {
+		opts = append(opts, rlm.WithHistoryCompression(*verbatimIters, 500))
 	}
 	r := rlm.New(client, client, opts...)
 

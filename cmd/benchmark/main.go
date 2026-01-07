@@ -384,13 +384,23 @@ func runBaseline(ctx context.Context, task Task, client *AnthropicClient) Benchm
 	}
 }
 
+// RLMOptions holds configuration for RLM runs.
+type RLMOptions struct {
+	LogDir          string
+	Verbose         bool
+	Streaming       bool
+	Pool            *repl.REPLPool
+	Compression     bool
+	VerbatimIters   int
+}
+
 // runRLM runs a task with RLM.
-func runRLM(ctx context.Context, task Task, client *AnthropicClient, logDir string, verbose bool) BenchmarkResult {
+func runRLM(ctx context.Context, task Task, client *AnthropicClient, opts RLMOptions) BenchmarkResult {
 	var log *logger.Logger
 	var err error
 
-	if logDir != "" {
-		log, err = logger.New(logDir, logger.Config{
+	if opts.LogDir != "" {
+		log, err = logger.New(opts.LogDir, logger.Config{
 			RootModel:     client.model,
 			MaxIterations: 30,
 			Backend:       "anthropic",
@@ -405,11 +415,26 @@ func runRLM(ctx context.Context, task Task, client *AnthropicClient, logDir stri
 		}
 	}
 
-	r := rlm.New(client, client,
+	// Build RLM options
+	rlmOpts := []rlm.Option{
 		rlm.WithMaxIterations(30),
-		rlm.WithVerbose(verbose),
+		rlm.WithVerbose(opts.Verbose),
 		rlm.WithLogger(log),
-	)
+	}
+
+	if opts.Streaming {
+		rlmOpts = append(rlmOpts, rlm.WithStreaming(true))
+	}
+
+	if opts.Pool != nil {
+		rlmOpts = append(rlmOpts, rlm.WithREPLPool(opts.Pool))
+	}
+
+	if opts.Compression {
+		rlmOpts = append(rlmOpts, rlm.WithHistoryCompression(opts.VerbatimIters, 500))
+	}
+
+	r := rlm.New(client, client, rlmOpts...)
 
 	start := time.Now()
 	result, err := r.Complete(ctx, task.Context, task.Question)
@@ -496,12 +521,17 @@ func truncate(s string, maxLen int) string {
 
 func main() {
 	var (
-		tasksFile  = flag.String("tasks", "", "Path to tasks JSON file")
-		model      = flag.String("model", "claude-sonnet-4-5-20250929", "Model to use")
-		numTasks   = flag.Int("num-tasks", 10, "Number of tasks to run")
-		logDir     = flag.String("log-dir", "./logs", "Directory for RLM logs")
-		outputFile = flag.String("output", "", "Output JSON file for results")
-		verbose    = flag.Bool("verbose", false, "Enable verbose RLM output")
+		tasksFile       = flag.String("tasks", "", "Path to tasks JSON file")
+		model           = flag.String("model", "claude-sonnet-4-5-20250929", "Model to use")
+		numTasks        = flag.Int("num-tasks", 10, "Number of tasks to run")
+		logDir          = flag.String("log-dir", "./logs", "Directory for RLM logs")
+		outputFile      = flag.String("output", "", "Output JSON file for results")
+		verbose         = flag.Bool("verbose", false, "Enable verbose RLM output")
+		enableStreaming = flag.Bool("streaming", false, "Enable streaming for root LLM calls")
+		enablePooling   = flag.Bool("pooling", false, "Enable REPL instance pooling")
+		poolSize        = flag.Int("pool-size", 5, "REPL pool size (requires -pooling)")
+		enableCompression = flag.Bool("compression", false, "Enable history compression")
+		verbatimIters   = flag.Int("verbatim-iters", 3, "Keep last N iterations verbatim (requires -compression)")
 	)
 	flag.Parse()
 
@@ -535,10 +565,36 @@ func main() {
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Printf("Model: %s\n", *model)
 	fmt.Printf("Tasks: %d\n", len(tasks))
+	if *enableStreaming {
+		fmt.Println("Streaming: enabled")
+	}
+	if *enablePooling {
+		fmt.Printf("REPL Pooling: enabled (size=%d)\n", *poolSize)
+	}
+	if *enableCompression {
+		fmt.Printf("History Compression: enabled (verbatim=%d)\n", *verbatimIters)
+	}
 	fmt.Println(strings.Repeat("-", 60))
 
 	client := NewAnthropicClient(apiKey, *model)
 	ctx := context.Background()
+
+	// Create REPL pool if enabled
+	var pool *repl.REPLPool
+	if *enablePooling {
+		pool = repl.NewREPLPool(client, *poolSize, true) // pre-warm
+		fmt.Printf("REPL pool initialized with %d instances\n", *poolSize)
+	}
+
+	// Build RLM options
+	rlmOpts := RLMOptions{
+		LogDir:        *logDir,
+		Verbose:       *verbose,
+		Streaming:     *enableStreaming,
+		Pool:          pool,
+		Compression:   *enableCompression,
+		VerbatimIters: *verbatimIters,
+	}
 
 	var baselineResults []BenchmarkResult
 	var rlmResults []BenchmarkResult
@@ -564,7 +620,7 @@ func main() {
 
 		// Run RLM
 		fmt.Println("  Running RLM...")
-		rlmResult := runRLM(ctx, task, client, *logDir, *verbose)
+		rlmResult := runRLM(ctx, task, client, rlmOpts)
 		rlmResults = append(rlmResults, rlmResult)
 
 		status = "CORRECT"

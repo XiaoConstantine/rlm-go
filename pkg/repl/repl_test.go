@@ -642,3 +642,177 @@ func TestLLMCallTracking(t *testing.T) {
 		t.Error("expected positive duration")
 	}
 }
+
+func TestNewREPLPool(t *testing.T) {
+	client := newMockClient()
+
+	// Test without pre-warming
+	pool := NewREPLPool(client, 3, false)
+	if pool == nil {
+		t.Fatal("expected non-nil pool")
+	}
+
+	poolSize, created := pool.Stats()
+	if poolSize != 0 {
+		t.Errorf("expected empty pool without pre-warm, got %d", poolSize)
+	}
+	if created != 0 {
+		t.Errorf("expected 0 created without pre-warm, got %d", created)
+	}
+}
+
+func TestNewREPLPoolPreWarmed(t *testing.T) {
+	client := newMockClient()
+
+	// Test with pre-warming
+	pool := NewREPLPool(client, 3, true)
+	if pool == nil {
+		t.Fatal("expected non-nil pool")
+	}
+
+	poolSize, created := pool.Stats()
+	if poolSize != 3 {
+		t.Errorf("expected pool size 3, got %d", poolSize)
+	}
+	if created != 3 {
+		t.Errorf("expected 3 created with pre-warm, got %d", created)
+	}
+}
+
+func TestREPLPoolGetPut(t *testing.T) {
+	client := newMockClient()
+	pool := NewREPLPool(client, 2, true)
+
+	// Get first REPL
+	r1 := pool.Get()
+	if r1 == nil {
+		t.Fatal("expected non-nil REPL from Get")
+	}
+
+	poolSize, _ := pool.Stats()
+	if poolSize != 1 {
+		t.Errorf("expected pool size 1 after Get, got %d", poolSize)
+	}
+
+	// Execute something to verify it works
+	result, err := r1.Execute(context.Background(), `fmt.Println("hello")`)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "hello") {
+		t.Errorf("expected hello in stdout, got %q", result.Stdout)
+	}
+
+	// Put it back
+	pool.Put(r1)
+
+	// Pool should have 2 again (Put creates a fresh REPL)
+	poolSize, _ = pool.Stats()
+	if poolSize != 2 {
+		t.Errorf("expected pool size 2 after Put, got %d", poolSize)
+	}
+}
+
+func TestREPLPoolExhausted(t *testing.T) {
+	client := newMockClient()
+	pool := NewREPLPool(client, 1, true)
+
+	// Exhaust the pool
+	r1 := pool.Get()
+	if r1 == nil {
+		t.Fatal("expected non-nil REPL")
+	}
+
+	// Get another - should create new one
+	r2 := pool.Get()
+	if r2 == nil {
+		t.Fatal("expected non-nil REPL even when pool exhausted")
+	}
+
+	// Both should work
+	result1, _ := r1.Execute(context.Background(), `fmt.Println(1)`)
+	result2, _ := r2.Execute(context.Background(), `fmt.Println(2)`)
+
+	if !strings.Contains(result1.Stdout, "1") {
+		t.Errorf("r1 stdout wrong: %q", result1.Stdout)
+	}
+	if !strings.Contains(result2.Stdout, "2") {
+		t.Errorf("r2 stdout wrong: %q", result2.Stdout)
+	}
+}
+
+func TestREPLClose(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+
+	// Execute something
+	_, _ = repl.Execute(context.Background(), `Query("test")`)
+
+	// Should have calls
+	calls := repl.GetLLMCalls()
+	if len(calls) == 0 {
+		t.Skip("no calls to verify close clears them")
+	}
+
+	// Close should clear state
+	repl.Close()
+
+	// GetLLMCalls should return empty now
+	calls = repl.GetLLMCalls()
+	if len(calls) != 0 {
+		t.Errorf("expected 0 calls after Close, got %d", len(calls))
+	}
+}
+
+func TestREPLResetState(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+
+	// Execute something to put data in buffers
+	_, _ = repl.Execute(context.Background(), `
+fmt.Println("test output")
+Query("test prompt")
+`)
+
+	// Reset state
+	repl.resetState()
+
+	// Buffers should be clear
+	result, _ := repl.Execute(context.Background(), `// no-op`)
+	if result.Stdout != "" {
+		t.Errorf("expected empty stdout after resetState, got %q", result.Stdout)
+	}
+
+	// LLM calls should be clear
+	calls := repl.GetLLMCalls()
+	if len(calls) != 0 {
+		t.Errorf("expected 0 calls after resetState, got %d", len(calls))
+	}
+}
+
+func TestNewPooled(t *testing.T) {
+	client := newMockClient()
+	repl := NewPooled(client)
+
+	if repl == nil {
+		t.Fatal("expected non-nil REPL from NewPooled")
+	}
+
+	// Should work like regular REPL
+	result, err := repl.Execute(context.Background(), `fmt.Println("pooled")`)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "pooled") {
+		t.Errorf("expected pooled in stdout, got %q", result.Stdout)
+	}
+}
+
+func TestWithPoolingOption(t *testing.T) {
+	client := newMockClient()
+	repl := New(client, WithPooling(true))
+
+	if !repl.usePooling {
+		t.Error("expected usePooling to be true")
+	}
+}

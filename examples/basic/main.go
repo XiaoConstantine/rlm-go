@@ -20,6 +20,7 @@ import (
 )
 
 // AnthropicClient implements both rlm.LLMClient and repl.LLMClient interfaces.
+// Note: Streaming is optional - if not implemented, RLM falls back to non-streaming.
 type AnthropicClient struct {
 	apiKey     string
 	model      string
@@ -253,11 +254,16 @@ func main() {
 		fmt.Printf("Logging to: %s\n", log.Path())
 	}
 
-	// Create RLM instance
+	// Create REPL pool for performance
+	pool := repl.NewREPLPool(client, 3, true) // 3 REPLs, pre-warmed
+
+	// Create RLM instance with optimizations
 	r := rlm.New(client, client,
 		rlm.WithMaxIterations(10),
 		rlm.WithVerbose(true),
 		rlm.WithLogger(log),
+		rlm.WithREPLPool(pool),
+		rlm.WithHistoryCompression(3, 500),
 	)
 
 	ctx := context.Background()

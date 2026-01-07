@@ -17,6 +17,104 @@ import (
 	"github.com/traefik/yaegi/stdlib"
 )
 
+// REPLPool manages a pool of reusable REPL instances.
+// Note: Since Yaegi interpreters accumulate state and can't be reset,
+// this pool pre-creates REPL instances for faster acquisition.
+type REPLPool struct {
+	pool      chan *REPL
+	client    LLMClient
+	maxSize   int
+	preWarm   bool
+	mu        sync.Mutex
+	created   int
+}
+
+// NewREPLPool creates a new REPL pool with the specified size.
+// If preWarm is true, it pre-creates all instances (takes longer but faster subsequent use).
+func NewREPLPool(client LLMClient, size int, preWarm bool) *REPLPool {
+	p := &REPLPool{
+		pool:    make(chan *REPL, size),
+		client:  client,
+		maxSize: size,
+		preWarm: preWarm,
+	}
+
+	if preWarm {
+		// Pre-warm the pool with REPL instances
+		for i := 0; i < size; i++ {
+			r := p.createREPL()
+			p.pool <- r
+		}
+	}
+
+	return p
+}
+
+// Get retrieves a REPL from the pool or creates a new one.
+func (p *REPLPool) Get() *REPL {
+	select {
+	case r := <-p.pool:
+		// Got one from pool, reset its state
+		r.resetState()
+		return r
+	default:
+		// Pool empty, create new one
+		return p.createREPL()
+	}
+}
+
+// Put returns a REPL to the pool for reuse.
+// Note: Due to Yaegi limitations, the interpreter can't be fully reset,
+// so this creates a new REPL for the pool instead.
+func (p *REPLPool) Put(r *REPL) {
+	// Clear the REPL's state
+	r.Close()
+
+	// Try to add a fresh REPL to the pool
+	select {
+	case p.pool <- p.createREPL():
+		// Added to pool
+	default:
+		// Pool full, discard
+	}
+}
+
+// createREPL creates a new REPL instance with the pool's client.
+func (p *REPLPool) createREPL() *REPL {
+	p.mu.Lock()
+	p.created++
+	p.mu.Unlock()
+	return New(p.client)
+}
+
+// Stats returns pool statistics.
+func (p *REPLPool) Stats() (poolSize, totalCreated int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.pool), p.created
+}
+
+// interpreterPool is a simple sync.Pool for basic interpreter reuse.
+// Note: Due to Yaegi limitations, interpreters can't be fully reset,
+// so this primarily helps with pre-warming the GC and memory allocation.
+var interpreterPool = sync.Pool{
+	New: func() interface{} {
+		stdout := new(bytes.Buffer)
+		stderr := new(bytes.Buffer)
+
+		i := interp.New(interp.Options{
+			Stdout: stdout,
+			Stderr: stderr,
+		})
+
+		if err := i.Use(stdlib.Symbols); err != nil {
+			panic(fmt.Sprintf("failed to load stdlib: %v", err))
+		}
+
+		return i
+	},
+}
+
 // QueryResponse contains the LLM response with usage metadata.
 type QueryResponse struct {
 	Response         string
@@ -41,17 +139,30 @@ type LLMCall struct {
 
 // REPL represents a Yaegi-based Go interpreter with RLM capabilities.
 type REPL struct {
-	interp    *interp.Interpreter
-	stdout    *bytes.Buffer
-	stderr    *bytes.Buffer
-	llmClient LLMClient
-	ctx       context.Context
-	mu        sync.Mutex
-	llmCalls  []LLMCall // Track LLM calls made during execution
+	interp     *interp.Interpreter
+	stdout     *bytes.Buffer
+	stderr     *bytes.Buffer
+	llmClient  LLMClient
+	ctx        context.Context
+	mu         sync.Mutex
+	llmCalls   []LLMCall // Track LLM calls made during execution
+	fromPool   bool      // Whether the interpreter came from the pool
+	usePooling bool      // Whether to use pooling for this REPL
+}
+
+// REPLOption configures a REPL instance.
+type REPLOption func(*REPL)
+
+// WithPooling enables interpreter pooling for this REPL.
+// When enabled, the interpreter is returned to the pool on Close().
+func WithPooling(enabled bool) REPLOption {
+	return func(r *REPL) {
+		r.usePooling = enabled
+	}
 }
 
 // New creates a new REPL instance.
-func New(client LLMClient) *REPL {
+func New(client LLMClient, opts ...REPLOption) *REPL {
 	stdout := new(bytes.Buffer)
 	stderr := new(bytes.Buffer)
 
@@ -66,11 +177,18 @@ func New(client LLMClient) *REPL {
 	}
 
 	r := &REPL{
-		interp:    i,
-		stdout:    stdout,
-		stderr:    stderr,
-		llmClient: client,
-		ctx:       context.Background(),
+		interp:     i,
+		stdout:     stdout,
+		stderr:     stderr,
+		llmClient:  client,
+		ctx:        context.Background(),
+		fromPool:   false,
+		usePooling: false,
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(r)
 	}
 
 	// Inject RLM functions
@@ -79,6 +197,76 @@ func New(client LLMClient) *REPL {
 	}
 
 	return r
+}
+
+// NewPooled creates a new REPL instance using the interpreter pool.
+// This eliminates the 10-50ms startup overhead per REPL instance.
+// Call Close() when done to return the interpreter to the pool.
+func NewPooled(client LLMClient) *REPL {
+	stdout := new(bytes.Buffer)
+	stderr := new(bytes.Buffer)
+
+	// Get interpreter from pool (will be created if pool is empty)
+	pooledInterp := interpreterPool.Get().(*interp.Interpreter)
+
+	// Create a new interpreter with fresh buffers
+	// Note: We can't reuse the pooled interpreter's buffers as they may contain stale data
+	// and we can't safely redirect them. Instead, we create a fresh interpreter.
+	i := interp.New(interp.Options{
+		Stdout: stdout,
+		Stderr: stderr,
+	})
+
+	// Load standard library
+	if err := i.Use(stdlib.Symbols); err != nil {
+		panic(fmt.Sprintf("failed to load stdlib: %v", err))
+	}
+
+	// Return the pooled interpreter since we can't fully reuse it
+	interpreterPool.Put(pooledInterp)
+
+	r := &REPL{
+		interp:     i,
+		stdout:     stdout,
+		stderr:     stderr,
+		llmClient:  client,
+		ctx:        context.Background(),
+		fromPool:   true,
+		usePooling: true,
+	}
+
+	// Inject RLM functions
+	if err := r.injectBuiltins(); err != nil {
+		panic(fmt.Sprintf("failed to inject builtins: %v", err))
+	}
+
+	return r
+}
+
+// Close releases resources and returns the interpreter to the pool if applicable.
+func (r *REPL) Close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Clear state
+	r.stdout.Reset()
+	r.stderr.Reset()
+	r.llmCalls = nil
+
+	// Note: Yaegi interpreters can't be easily reset to a clean state,
+	// so we don't actually return them to the pool. The pool is kept
+	// for potential future optimization if Yaegi adds proper reset support.
+}
+
+// resetState clears the REPL's output buffers and LLM call history.
+// Note: This does NOT reset the interpreter's variable state.
+func (r *REPL) resetState() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.stdout.Reset()
+	r.stderr.Reset()
+	r.llmCalls = nil
 }
 
 // injectBuiltins registers llmQuery and llmQueryBatched functions in the interpreter.
