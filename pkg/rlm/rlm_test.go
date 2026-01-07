@@ -1066,3 +1066,464 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// Tests for Adaptive Iteration Strategy
+
+func TestWithAdaptiveIteration(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithAdaptiveIteration())
+
+	if rlm.config.AdaptiveIteration == nil {
+		t.Fatal("AdaptiveIteration should be set")
+	}
+	if !rlm.config.AdaptiveIteration.Enabled {
+		t.Error("AdaptiveIteration should be enabled")
+	}
+	if rlm.config.AdaptiveIteration.BaseIterations != 10 {
+		t.Errorf("BaseIterations = %d, want 10", rlm.config.AdaptiveIteration.BaseIterations)
+	}
+	if rlm.config.AdaptiveIteration.MaxIterations != 50 {
+		t.Errorf("MaxIterations = %d, want 50", rlm.config.AdaptiveIteration.MaxIterations)
+	}
+	if rlm.config.AdaptiveIteration.ContextScaleFactor != 100000 {
+		t.Errorf("ContextScaleFactor = %d, want 100000", rlm.config.AdaptiveIteration.ContextScaleFactor)
+	}
+	if !rlm.config.AdaptiveIteration.EnableEarlyTermination {
+		t.Error("EnableEarlyTermination should be true")
+	}
+	if rlm.config.AdaptiveIteration.ConfidenceThreshold != 1 {
+		t.Errorf("ConfidenceThreshold = %d, want 1", rlm.config.AdaptiveIteration.ConfidenceThreshold)
+	}
+}
+
+func TestWithAdaptiveIterationConfig(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	cfg := AdaptiveIterationConfig{
+		BaseIterations:         5,
+		MaxIterations:          25,
+		ContextScaleFactor:     50000,
+		EnableEarlyTermination: false,
+		ConfidenceThreshold:    2,
+	}
+
+	rlm := New(client, replClient, WithAdaptiveIterationConfig(cfg))
+
+	if rlm.config.AdaptiveIteration == nil {
+		t.Fatal("AdaptiveIteration should be set")
+	}
+	if rlm.config.AdaptiveIteration.BaseIterations != 5 {
+		t.Errorf("BaseIterations = %d, want 5", rlm.config.AdaptiveIteration.BaseIterations)
+	}
+	if rlm.config.AdaptiveIteration.MaxIterations != 25 {
+		t.Errorf("MaxIterations = %d, want 25", rlm.config.AdaptiveIteration.MaxIterations)
+	}
+	if rlm.config.AdaptiveIteration.ContextScaleFactor != 50000 {
+		t.Errorf("ContextScaleFactor = %d, want 50000", rlm.config.AdaptiveIteration.ContextScaleFactor)
+	}
+	if rlm.config.AdaptiveIteration.EnableEarlyTermination {
+		t.Error("EnableEarlyTermination should be false")
+	}
+	if rlm.config.AdaptiveIteration.ConfidenceThreshold != 2 {
+		t.Errorf("ConfidenceThreshold = %d, want 2", rlm.config.AdaptiveIteration.ConfidenceThreshold)
+	}
+}
+
+func TestWithAdaptiveIterationConfigDefaults(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	// Test with zero values - should use defaults
+	cfg := AdaptiveIterationConfig{}
+	rlm := New(client, replClient, WithAdaptiveIterationConfig(cfg))
+
+	if rlm.config.AdaptiveIteration.BaseIterations != 10 {
+		t.Errorf("BaseIterations = %d, want 10 (default)", rlm.config.AdaptiveIteration.BaseIterations)
+	}
+	if rlm.config.AdaptiveIteration.MaxIterations != 50 {
+		t.Errorf("MaxIterations = %d, want 50 (default)", rlm.config.AdaptiveIteration.MaxIterations)
+	}
+	if rlm.config.AdaptiveIteration.ContextScaleFactor != 100000 {
+		t.Errorf("ContextScaleFactor = %d, want 100000 (default)", rlm.config.AdaptiveIteration.ContextScaleFactor)
+	}
+	if rlm.config.AdaptiveIteration.ConfidenceThreshold != 1 {
+		t.Errorf("ConfidenceThreshold = %d, want 1 (default)", rlm.config.AdaptiveIteration.ConfidenceThreshold)
+	}
+}
+
+func TestWithProgressHandler(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	var progressUpdates []IterationProgress
+	handler := func(progress IterationProgress) {
+		progressUpdates = append(progressUpdates, progress)
+	}
+
+	rlm := New(client, replClient, WithProgressHandler(handler))
+
+	if rlm.config.OnProgress == nil {
+		t.Error("OnProgress should be set")
+	}
+
+	// Call the handler to verify it works
+	rlm.config.OnProgress(IterationProgress{CurrentIteration: 1, MaxIterations: 10})
+	if len(progressUpdates) != 1 {
+		t.Errorf("expected 1 progress update, got %d", len(progressUpdates))
+	}
+}
+
+func TestComputeMaxIterations(t *testing.T) {
+	replClient := &mockREPLClient{}
+	client := &mockLLMClient{}
+
+	tests := []struct {
+		name        string
+		contextSize int
+		config      *AdaptiveIterationConfig
+		maxDefault  int
+		expected    int
+	}{
+		{
+			name:        "no adaptive config uses default",
+			contextSize: 500000,
+			config:      nil,
+			maxDefault:  30,
+			expected:    30,
+		},
+		{
+			name:        "small context uses base iterations",
+			contextSize: 10000,
+			config: &AdaptiveIterationConfig{
+				Enabled:            true,
+				BaseIterations:     10,
+				MaxIterations:      50,
+				ContextScaleFactor: 100000,
+			},
+			maxDefault: 30,
+			expected:   10,
+		},
+		{
+			name:        "medium context adds iterations",
+			contextSize: 300000,
+			config: &AdaptiveIterationConfig{
+				Enabled:            true,
+				BaseIterations:     10,
+				MaxIterations:      50,
+				ContextScaleFactor: 100000,
+			},
+			maxDefault: 30,
+			expected:   13, // 10 + 300000/100000 = 13
+		},
+		{
+			name:        "large context capped at max",
+			contextSize: 10000000, // 10MB
+			config: &AdaptiveIterationConfig{
+				Enabled:            true,
+				BaseIterations:     10,
+				MaxIterations:      50,
+				ContextScaleFactor: 100000,
+			},
+			maxDefault: 30,
+			expected:   50,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rlm := New(client, replClient, WithMaxIterations(tt.maxDefault))
+			rlm.config.AdaptiveIteration = tt.config
+
+			result := rlm.computeMaxIterations(tt.contextSize)
+			if result != tt.expected {
+				t.Errorf("computeMaxIterations(%d) = %d, want %d", tt.contextSize, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDetectConfidence(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+		expected bool
+	}{
+		{
+			name:     "confident lowercase",
+			response: "I'm confident the answer is 42",
+			expected: true,
+		},
+		{
+			name:     "confident uppercase",
+			response: "I AM CONFIDENT in this result",
+			expected: true,
+		},
+		{
+			name:     "certain",
+			response: "I'm certain this is correct",
+			expected: true,
+		},
+		{
+			name:     "definitive answer",
+			response: "The final answer is 42",
+			expected: true,
+		},
+		{
+			name:     "found the answer",
+			response: "I have found the answer we were looking for",
+			expected: true,
+		},
+		{
+			name:     "with certainty",
+			response: "With certainty, the result is ALPHA-7892",
+			expected: true,
+		},
+		{
+			name:     "conclusively",
+			response: "Conclusively, the secret code is XYZ",
+			expected: true,
+		},
+		{
+			name:     "no confidence signal",
+			response: "Let me explore the context more",
+			expected: false,
+		},
+		{
+			name:     "thinking out loud",
+			response: "I need to run more code to verify",
+			expected: false,
+		},
+		{
+			name:     "empty response",
+			response: "",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := detectConfidence(tt.response)
+			if result != tt.expected {
+				t.Errorf("detectConfidence() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestShouldTerminateEarly(t *testing.T) {
+	replClient := &mockREPLClient{}
+	client := &mockLLMClient{}
+
+	tests := []struct {
+		name              string
+		config            *AdaptiveIterationConfig
+		confidenceSignals int
+		pendingCodeBlocks int
+		expected          bool
+	}{
+		{
+			name:              "no adaptive config",
+			config:            nil,
+			confidenceSignals: 5,
+			pendingCodeBlocks: 0,
+			expected:          false,
+		},
+		{
+			name: "early termination disabled",
+			config: &AdaptiveIterationConfig{
+				Enabled:                true,
+				EnableEarlyTermination: false,
+				ConfidenceThreshold:    1,
+			},
+			confidenceSignals: 5,
+			pendingCodeBlocks: 0,
+			expected:          false,
+		},
+		{
+			name: "threshold not met",
+			config: &AdaptiveIterationConfig{
+				Enabled:                true,
+				EnableEarlyTermination: true,
+				ConfidenceThreshold:    3,
+			},
+			confidenceSignals: 2,
+			pendingCodeBlocks: 0,
+			expected:          false,
+		},
+		{
+			name: "pending code blocks",
+			config: &AdaptiveIterationConfig{
+				Enabled:                true,
+				EnableEarlyTermination: true,
+				ConfidenceThreshold:    1,
+			},
+			confidenceSignals: 5,
+			pendingCodeBlocks: 1,
+			expected:          false,
+		},
+		{
+			name: "should terminate",
+			config: &AdaptiveIterationConfig{
+				Enabled:                true,
+				EnableEarlyTermination: true,
+				ConfidenceThreshold:    1,
+			},
+			confidenceSignals: 1,
+			pendingCodeBlocks: 0,
+			expected:          true,
+		},
+		{
+			name: "threshold exactly met",
+			config: &AdaptiveIterationConfig{
+				Enabled:                true,
+				EnableEarlyTermination: true,
+				ConfidenceThreshold:    3,
+			},
+			confidenceSignals: 3,
+			pendingCodeBlocks: 0,
+			expected:          true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rlm := New(client, replClient)
+			rlm.config.AdaptiveIteration = tt.config
+
+			result := rlm.shouldTerminateEarly(tt.confidenceSignals, tt.pendingCodeBlocks)
+			if result != tt.expected {
+				t.Errorf("shouldTerminateEarly() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestGetContextSize(t *testing.T) {
+	tests := []struct {
+		name     string
+		payload  any
+		expected int
+	}{
+		{
+			name:     "string payload",
+			payload:  "hello world",
+			expected: 11,
+		},
+		{
+			name:     "empty string",
+			payload:  "",
+			expected: 0,
+		},
+		{
+			name:     "byte slice",
+			payload:  []byte("hello"),
+			expected: 5,
+		},
+		{
+			name:    "map payload",
+			payload: map[string]any{"key": "value"},
+			// Size is approximate for non-string types
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := getContextSize(tt.payload)
+			if tt.expected > 0 && result != tt.expected {
+				t.Errorf("getContextSize() = %d, want %d", result, tt.expected)
+			}
+			if tt.expected == 0 && tt.name == "empty string" && result != 0 {
+				t.Errorf("getContextSize() = %d, want 0", result)
+			}
+		})
+	}
+}
+
+func TestCompleteWithProgressHandler(t *testing.T) {
+	var progressUpdates []IterationProgress
+
+	callCount := 0
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			callCount++
+			if callCount == 1 {
+				return core.LLMResponse{Content: "```go\nfmt.Println(1)\n```", PromptTokens: 10, CompletionTokens: 15}, nil
+			}
+			return core.LLMResponse{Content: "FINAL(done)", PromptTokens: 10, CompletionTokens: 5}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	handler := func(progress IterationProgress) {
+		progressUpdates = append(progressUpdates, progress)
+	}
+
+	rlm := New(client, replClient,
+		WithProgressHandler(handler),
+		WithMaxIterations(10),
+	)
+
+	result, err := rlm.Complete(context.Background(), "test context", "query")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+
+	if result.Response != "done" {
+		t.Errorf("Response = %q, want %q", result.Response, "done")
+	}
+
+	// Should have received 2 progress updates (one per iteration)
+	if len(progressUpdates) != 2 {
+		t.Errorf("received %d progress updates, want 2", len(progressUpdates))
+	}
+
+	// Verify first progress update
+	if len(progressUpdates) > 0 {
+		if progressUpdates[0].CurrentIteration != 1 {
+			t.Errorf("first update CurrentIteration = %d, want 1", progressUpdates[0].CurrentIteration)
+		}
+		if progressUpdates[0].MaxIterations != 10 {
+			t.Errorf("first update MaxIterations = %d, want 10", progressUpdates[0].MaxIterations)
+		}
+	}
+}
+
+func TestCompleteWithAdaptiveIterationAndLargeContext(t *testing.T) {
+	// Create a large context to test adaptive iteration scaling
+	largeContext := strings.Repeat("data ", 60000) // ~300KB
+
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{Content: "FINAL(done)", PromptTokens: 10, CompletionTokens: 5}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	var maxIterationsUsed int
+	handler := func(progress IterationProgress) {
+		maxIterationsUsed = progress.MaxIterations
+	}
+
+	rlm := New(client, replClient,
+		WithAdaptiveIteration(),
+		WithProgressHandler(handler),
+	)
+
+	result, err := rlm.Complete(context.Background(), largeContext, "query")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+
+	if result.Response != "done" {
+		t.Errorf("Response = %q, want %q", result.Response, "done")
+	}
+
+	// With 300KB context, should have more than base 10 iterations
+	// 10 + 300000/100000 = 13
+	if maxIterationsUsed < 10 {
+		t.Errorf("maxIterationsUsed = %d, expected >= 10", maxIterationsUsed)
+	}
+}

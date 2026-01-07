@@ -335,3 +335,270 @@ func TestFindCodeBlocksBoundary(t *testing.T) {
 		})
 	}
 }
+
+// TestEnhancedFinalParsing tests the enhanced FINAL parsing capabilities
+func TestEnhancedFinalParsing(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected *core.FinalAnswer
+	}{
+		// Colon format tests
+		{
+			name:     "FINAL with colon format",
+			input:    "FINAL: 42",
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "42"},
+		},
+		{
+			name:     "FINAL with colon and quoted value",
+			input:    "FINAL: \"the answer\"",
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "the answer"},
+		},
+		{
+			name:     "case insensitive colon format",
+			input:    "final: result123",
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "result123"},
+		},
+
+		// Arrow format tests
+		{
+			name:     "FINAL with arrow format =>",
+			input:    "FINAL => answer",
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "answer"},
+		},
+		{
+			name:     "FINAL with arrow format ->",
+			input:    "FINAL -> 42",
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "42"},
+		},
+
+		// JSON structured output tests
+		{
+			name:     "JSON result field",
+			input:    `{"result": "the answer"}`,
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "the answer"},
+		},
+		{
+			name:     "JSON answer field",
+			input:    `{"answer": "42"}`,
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "42"},
+		},
+		{
+			name:     "JSON final field",
+			input:    `{"final": "done"}`,
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "done"},
+		},
+		{
+			name:     "JSON output field",
+			input:    `{"output": "result value"}`,
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "result value"},
+		},
+		{
+			name:     "JSON with numeric value",
+			input:    `{"result": 42}`,
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "42"},
+		},
+		{
+			name:     "JSON with float value",
+			input:    `{"result": 3.14159}`,
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "3.14159"},
+		},
+		{
+			name:     "JSON with boolean value",
+			input:    `{"result": true}`,
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "true"},
+		},
+		{
+			name:     "JSON embedded in text",
+			input:    `Here is my answer: {"result": "ALPHA-7892"}`,
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "ALPHA-7892"},
+		},
+
+		// Multi-line FINAL tests
+		{
+			name: "multiline FINAL",
+			input: `FINAL(line1
+line2
+line3)`,
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "line1\nline2\nline3"},
+		},
+
+		// Standard formats still work
+		{
+			name:     "standard FINAL still works",
+			input:    "FINAL(42)",
+			expected: &core.FinalAnswer{Type: core.FinalTypeDirect, Content: "42"},
+		},
+		{
+			name:     "FINAL_VAR still works",
+			input:    "FINAL_VAR(answer)",
+			expected: &core.FinalAnswer{Type: core.FinalTypeVariable, Content: "answer"},
+		},
+
+		// Priority tests - FINAL_VAR should take precedence
+		{
+			name:     "FINAL_VAR takes precedence over JSON",
+			input:    "FINAL_VAR(result)\n{\"answer\": \"ignored\"}",
+			expected: &core.FinalAnswer{Type: core.FinalTypeVariable, Content: "result"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := FindFinalAnswer(tt.input)
+			if tt.expected == nil {
+				if result != nil {
+					t.Errorf("FindFinalAnswer() = %+v, want nil", result)
+				}
+				return
+			}
+			if result == nil {
+				t.Errorf("FindFinalAnswer() = nil, want %+v", tt.expected)
+				return
+			}
+			if result.Type != tt.expected.Type {
+				t.Errorf("FindFinalAnswer().Type = %v, want %v", result.Type, tt.expected.Type)
+			}
+			if result.Content != tt.expected.Content {
+				t.Errorf("FindFinalAnswer().Content = %q, want %q", result.Content, tt.expected.Content)
+			}
+		})
+	}
+}
+
+// TestFindJSONEnd tests JSON boundary detection
+func TestFindJSONEnd(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected int
+	}{
+		{
+			name:     "simple object",
+			input:    `{"key": "value"}`,
+			expected: 15,
+		},
+		{
+			name:     "nested object",
+			input:    `{"outer": {"inner": "value"}}`,
+			expected: 28,
+		},
+		{
+			name:     "with escaped quotes",
+			input:    `{"key": "value with \"quotes\""}`,
+			expected: 31, // Actual length including final }
+		},
+		{
+			name:     "not JSON",
+			input:    `plain text`,
+			expected: -1,
+		},
+		{
+			name:     "unclosed brace",
+			input:    `{"key": "value"`,
+			expected: -1,
+		},
+		{
+			name:     "empty",
+			input:    ``,
+			expected: -1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := findJSONEnd(tt.input)
+			if result != tt.expected {
+				t.Errorf("findJSONEnd() = %d, want %d", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestFormatFloat tests the float formatting function
+func TestFormatFloat(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    float64
+		expected string
+	}{
+		{
+			name:     "whole number",
+			input:    42.0,
+			expected: "42",
+		},
+		{
+			name:     "decimal",
+			input:    3.14159,
+			expected: "3.14159",
+		},
+		{
+			name:     "negative",
+			input:    -42.5,
+			expected: "-42.5",
+		},
+		{
+			name:     "zero",
+			input:    0.0,
+			expected: "0",
+		},
+		{
+			name:     "large number",
+			input:    1000000.0,
+			expected: "1000000",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := formatFloat(tt.input)
+			if result != tt.expected {
+				t.Errorf("formatFloat(%v) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestExtractParenContent tests multi-line parenthesis content extraction
+func TestExtractParenContent(t *testing.T) {
+	tests := []struct {
+		name     string
+		lines    []string
+		startIdx int
+		expected string
+	}{
+		{
+			name:     "single line",
+			lines:    []string{"FINAL(42)"},
+			startIdx: 0,
+			expected: "42",
+		},
+		{
+			name:     "multi-line",
+			lines:    []string{"FINAL(line1", "line2", "line3)"},
+			startIdx: 0,
+			expected: "line1\nline2\nline3",
+		},
+		{
+			name:     "with nested parens",
+			lines:    []string{"FINAL(func(x))"},
+			startIdx: 0,
+			expected: "func(x)",
+		},
+		{
+			name:     "unclosed",
+			lines:    []string{"FINAL(unclosed"},
+			startIdx: 0,
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractParenContent(tt.lines, tt.startIdx)
+			if result != tt.expected {
+				t.Errorf("extractParenContent() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}

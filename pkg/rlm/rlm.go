@@ -59,6 +59,14 @@ type Config struct {
 	// HistoryCompression configures incremental history compression.
 	// When enabled, older iterations are summarized to reduce context size.
 	HistoryCompression *HistoryCompressionConfig
+
+	// AdaptiveIteration configures adaptive iteration strategy.
+	// When enabled, max iterations are dynamically calculated based on context size.
+	AdaptiveIteration *AdaptiveIterationConfig
+
+	// OnProgress is called at the start of each iteration with progress info.
+	// Can be used to display progress to users or implement custom termination logic.
+	OnProgress func(progress IterationProgress)
 }
 
 // HistoryCompressionConfig configures how message history is compressed.
@@ -73,6 +81,51 @@ type HistoryCompressionConfig struct {
 	// MaxSummaryTokens is the approximate maximum tokens for summarized history.
 	// Default: 500.
 	MaxSummaryTokens int
+}
+
+// AdaptiveIterationConfig configures adaptive iteration behavior.
+type AdaptiveIterationConfig struct {
+	// Enabled turns on adaptive iteration (default: false).
+	Enabled bool
+
+	// BaseIterations is the base number of iterations before context scaling.
+	// Default: 10.
+	BaseIterations int
+
+	// MaxIterations caps the total iterations regardless of context size.
+	// Default: 50.
+	MaxIterations int
+
+	// ContextScaleFactor determines how much context size increases iterations.
+	// iterations = BaseIterations + (contextSize / ContextScaleFactor)
+	// Default: 100000 (100KB per additional iteration).
+	ContextScaleFactor int
+
+	// EnableEarlyTermination allows early exit when model signals confidence.
+	// Default: true.
+	EnableEarlyTermination bool
+
+	// ConfidenceThreshold is the number of confidence signals needed for early termination.
+	// Default: 1.
+	ConfidenceThreshold int
+}
+
+// IterationProgress tracks progress and confidence during iteration.
+type IterationProgress struct {
+	// CurrentIteration is the current iteration number (1-indexed).
+	CurrentIteration int
+
+	// MaxIterations is the computed maximum iterations for this request.
+	MaxIterations int
+
+	// ConfidenceSignals counts how many times the model has signaled confidence.
+	ConfidenceSignals int
+
+	// HasFinalAttempt indicates the model tried to give a final answer.
+	HasFinalAttempt bool
+
+	// ContextSize is the size of the input context in bytes.
+	ContextSize int
 }
 
 // DefaultConfig returns the default RLM configuration.
@@ -180,6 +233,125 @@ func WithHistoryCompression(verbatimIterations, maxSummaryTokens int) Option {
 	}
 }
 
+// WithAdaptiveIteration enables adaptive iteration strategy.
+// This dynamically adjusts max iterations based on context size and enables
+// early termination when the model signals confidence.
+func WithAdaptiveIteration() Option {
+	return func(c *Config) {
+		c.AdaptiveIteration = &AdaptiveIterationConfig{
+			Enabled:                true,
+			BaseIterations:         10,
+			MaxIterations:          50,
+			ContextScaleFactor:     100000, // 100KB per additional iteration
+			EnableEarlyTermination: true,
+			ConfidenceThreshold:    1,
+		}
+	}
+}
+
+// WithAdaptiveIterationConfig enables adaptive iteration with custom configuration.
+func WithAdaptiveIterationConfig(cfg AdaptiveIterationConfig) Option {
+	return func(c *Config) {
+		cfg.Enabled = true
+		if cfg.BaseIterations <= 0 {
+			cfg.BaseIterations = 10
+		}
+		if cfg.MaxIterations <= 0 {
+			cfg.MaxIterations = 50
+		}
+		if cfg.ContextScaleFactor <= 0 {
+			cfg.ContextScaleFactor = 100000
+		}
+		if cfg.ConfidenceThreshold <= 0 {
+			cfg.ConfidenceThreshold = 1
+		}
+		c.AdaptiveIteration = &cfg
+	}
+}
+
+// WithProgressHandler sets a callback for iteration progress updates.
+func WithProgressHandler(handler func(IterationProgress)) Option {
+	return func(c *Config) {
+		c.OnProgress = handler
+	}
+}
+
+// confidencePhrases are phrases that indicate the model is confident in its answer.
+var confidencePhrases = []string{
+	"i'm confident",
+	"i am confident",
+	"i'm certain",
+	"i am certain",
+	"the answer is definitely",
+	"the final answer is",
+	"based on my analysis, the answer is",
+	"after thorough analysis",
+	"i have found the answer",
+	"the definitive answer",
+	"i can confirm that",
+	"with certainty",
+	"conclusively",
+}
+
+// detectConfidence checks if the response contains confidence signals.
+func detectConfidence(response string) bool {
+	lower := strings.ToLower(response)
+	for _, phrase := range confidencePhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// computeMaxIterations calculates the dynamic max iterations based on context size.
+func (r *RLM) computeMaxIterations(contextSize int) int {
+	if r.config.AdaptiveIteration == nil || !r.config.AdaptiveIteration.Enabled {
+		return r.config.MaxIterations
+	}
+
+	cfg := r.config.AdaptiveIteration
+	additionalIterations := contextSize / cfg.ContextScaleFactor
+	computed := cfg.BaseIterations + additionalIterations
+
+	if computed > cfg.MaxIterations {
+		return cfg.MaxIterations
+	}
+	return computed
+}
+
+// getContextSize returns the size of the context payload in bytes.
+func getContextSize(payload any) int {
+	switch v := payload.(type) {
+	case string:
+		return len(v)
+	case []byte:
+		return len(v)
+	default:
+		// For complex types, estimate based on JSON representation
+		// This is a rough approximation
+		return len(fmt.Sprintf("%v", v))
+	}
+}
+
+// shouldTerminateEarly checks if we should terminate early based on confidence signals.
+// Early termination only happens when:
+// 1. Adaptive iteration is enabled with early termination
+// 2. Confidence threshold is met
+// 3. There are no pending code blocks (the model isn't waiting for execution results)
+func (r *RLM) shouldTerminateEarly(confidenceSignals, pendingCodeBlocks int) bool {
+	if r.config.AdaptiveIteration == nil || !r.config.AdaptiveIteration.Enabled {
+		return false
+	}
+	if !r.config.AdaptiveIteration.EnableEarlyTermination {
+		return false
+	}
+	if pendingCodeBlocks > 0 {
+		return false // Don't terminate while code is pending execution
+	}
+	return confidenceSignals >= r.config.AdaptiveIteration.ConfidenceThreshold
+}
+
 // Complete runs an RLM completion.
 // contextPayload is the context data (string, map, or slice).
 // query is the user's question.
@@ -216,8 +388,15 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 	// Track total token usage across iterations
 	var totalPromptTokens, totalCompletionTokens int
 
+	// Compute max iterations (adaptive or fixed)
+	contextSize := getContextSize(contextPayload)
+	maxIterations := r.computeMaxIterations(contextSize)
+
+	// Track confidence signals for early termination
+	var confidenceSignals int
+
 	// Iteration loop
-	for i := 0; i < r.config.MaxIterations; i++ {
+	for i := 0; i < maxIterations; i++ {
 		iterStart := time.Now()
 
 		select {
@@ -226,8 +405,19 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		default:
 		}
 
+		// Report progress if handler is set
+		if r.config.OnProgress != nil {
+			r.config.OnProgress(IterationProgress{
+				CurrentIteration:  i + 1,
+				MaxIterations:     maxIterations,
+				ConfidenceSignals: confidenceSignals,
+				HasFinalAttempt:   false,
+				ContextSize:       contextSize,
+			})
+		}
+
 		if r.config.Verbose {
-			fmt.Printf("[RLM] Iteration %d/%d\n", i+1, r.config.MaxIterations)
+			fmt.Printf("[RLM] Iteration %d/%d\n", i+1, maxIterations)
 		}
 
 		// Add iteration-specific user prompt
@@ -289,6 +479,14 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		// Get locals from REPL for logging
 		locals := replEnv.GetLocals()
 
+		// Detect confidence signals for adaptive early termination
+		if detectConfidence(response) {
+			confidenceSignals++
+			if r.config.Verbose {
+				fmt.Printf("[RLM] Confidence signal detected (total: %d)\n", confidenceSignals)
+			}
+		}
+
 		// Check for final answer - BUT only if there were NO code blocks in this response.
 		// If there are code blocks, we need to wait for the next iteration so the model
 		// can see the execution results before providing a final answer.
@@ -338,6 +536,15 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		// Log iteration (no final answer)
 		if r.config.Logger != nil {
 			_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, locals, nil, time.Since(iterStart))
+		}
+
+		// Check for early termination based on confidence signals
+		if r.shouldTerminateEarly(confidenceSignals, len(codeBlocks)) {
+			if r.config.Verbose {
+				fmt.Printf("[RLM] Early termination triggered (confidence signals: %d)\n", confidenceSignals)
+			}
+			// Force immediate final answer due to high confidence
+			return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens)
 		}
 
 		// Append iteration results to history
