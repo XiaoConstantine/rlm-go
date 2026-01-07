@@ -10,6 +10,10 @@ The REPL environment is initialized with:
 3. A "QueryBatched(prompts []string) []string" function for concurrent queries (much faster).
 4. Standard Go packages: fmt, strings, regexp, strconv.
 
+Sub-LLM Capacity: Sub-LLMs can handle ~500K characters. For efficiency, batch ~200K characters per Query call.
+IMPORTANT: REPL outputs are truncated. Use Query() to analyze full content rather than printing large outputs.
+Make sure to explicitly look through the entire context before answering.
+
 Write Go code in markdown blocks with the "go" language tag.
 
 STRATEGY FOR LONG CONTEXTS:
@@ -37,6 +41,31 @@ for i := 0; i < 5; i++ {
     prompts = append(prompts, fmt.Sprintf("Find secret codes in: %s", context[start:end]))
 }
 results := QueryBatched(prompts)
+
+EXAMPLE - Large context (800K+ chars), filter first then batch:
+errorRe := regexp.MustCompile("(?i)error|exception|failed")
+matches := errorRe.FindAllString(context, -1)
+fmt.Println("Total potential errors:", len(matches))
+fmt.Println("Sample:", context[:1000])
+
+EXAMPLE - Very large context (1M+ chars), chunk strategically at ~200K per Query:
+docs := strings.Split(context, "---")
+fmt.Println("Found", len(docs), "documents")
+
+var prompts []string
+var batch string
+for _, doc := range docs {
+    if len(batch)+len(doc) > 200000 && batch != "" {
+        prompts = append(prompts, "Identify main themes in these documents:\n"+batch)
+        batch = ""
+    }
+    batch += doc + "\n---\n"
+}
+if batch != "" {
+    prompts = append(prompts, "Identify main themes in these documents:\n"+batch)
+}
+results := QueryBatched(prompts)
+for i, r := range results { fmt.Printf("Batch %d themes: %s\n", i, r) }
 
 CRITICAL - SIGNALING COMPLETION:
 When you have the answer, you MUST signal using ONE of these (NOT inside code blocks):
