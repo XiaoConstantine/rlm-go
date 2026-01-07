@@ -22,10 +22,6 @@ var (
 	// finalRe matches FINAL(...) at start of line.
 	finalRe = regexp.MustCompile(`(?m)^\s*FINAL\((.+?)\)\s*$`)
 
-	// Multi-line FINAL patterns for enhanced parsing
-	// finalMultilineRe matches FINAL( with content spanning multiple lines until )
-	finalMultilineRe = regexp.MustCompile(`(?s)^\s*FINAL\((.*?)\)\s*$`)
-
 	// finalColonRe matches "FINAL:" or "Final:" followed by content
 	finalColonRe = regexp.MustCompile(`(?im)^\s*FINAL\s*:\s*(.+)$`)
 
@@ -260,9 +256,10 @@ func findJSONEnd(text string) int {
 		}
 
 		if !inString {
-			if ch == '{' {
+			switch ch {
+			case '{':
 				depth++
-			} else if ch == '}' {
+			case '}':
 				depth--
 				if depth == 0 {
 					return i

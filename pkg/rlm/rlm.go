@@ -708,12 +708,6 @@ func (r *RLM) summarizeIterations(messages []core.Message, maxTokens int) string
 			hasCode := strings.Contains(msg.Content, "```go")
 			hasFinal := strings.Contains(msg.Content, "FINAL")
 
-			// Keep first ~100 chars of assistant response as context
-			preview := msg.Content
-			if len(preview) > 150 {
-				preview = preview[:150] + "..."
-			}
-
 			summary.WriteString(fmt.Sprintf("- Iteration %d: ", iterCount))
 			if hasCode {
 				summary.WriteString("executed code")

@@ -510,8 +510,8 @@ func TestGeminiClient_CompleteStream_Success(t *testing.T) {
 		}
 
 		for _, event := range events {
-			fmt.Fprintln(w, event)
-			fmt.Fprintln(w, "")
+			_, _ = fmt.Fprintln(w, event)
+			_, _ = fmt.Fprintln(w, "")
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
@@ -572,8 +572,8 @@ func TestGeminiClient_CompleteStream_WithSystemPrompt(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 
-		fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"Response"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":15,"candidatesTokenCount":3}}`)
-		fmt.Fprintln(w, "")
+		_, _ = fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"Response"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":15,"candidatesTokenCount":3}}`)
+		_, _ = fmt.Fprintln(w, "")
 	}))
 	defer server.Close()
 
@@ -609,8 +609,8 @@ func TestGeminiClient_CompleteStream_RoleMapping(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 
-		fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"OK"}],"role":"model"}}]}`)
-		fmt.Fprintln(w, "")
+		_, _ = fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"OK"}],"role":"model"}}]}`)
+		_, _ = fmt.Fprintln(w, "")
 	}))
 	defer server.Close()
 
@@ -654,8 +654,8 @@ func TestGeminiClient_CompleteStream_StreamError(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 
-		fmt.Fprintln(w, `data: {"error":{"message":"Rate limit exceeded","code":429}}`)
-		fmt.Fprintln(w, "")
+		_, _ = fmt.Fprintln(w, `data: {"error":{"message":"Rate limit exceeded","code":429}}`)
+		_, _ = fmt.Fprintln(w, "")
 	}))
 	defer server.Close()
 
@@ -680,8 +680,8 @@ func TestGeminiClient_CompleteStream_HandlerError(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 
-		fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"Hello"}],"role":"model"}}]}`)
-		fmt.Fprintln(w, "")
+		_, _ = fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"Hello"}],"role":"model"}}]}`)
+		_, _ = fmt.Fprintln(w, "")
 	}))
 	defer server.Close()
 
@@ -711,8 +711,8 @@ func TestGeminiClient_CompleteStream_NilHandler(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 
-		fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"Hello"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":1}}`)
-		fmt.Fprintln(w, "")
+		_, _ = fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"Hello"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":1}}`)
+		_, _ = fmt.Fprintln(w, "")
 	}))
 	defer server.Close()
 
@@ -737,8 +737,8 @@ func TestGeminiClient_CompleteStream_ContextCancellation(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 
-		fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"Hello"}],"role":"model"}}]}`)
-		fmt.Fprintln(w, "")
+		_, _ = fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"Hello"}],"role":"model"}}]}`)
+		_, _ = fmt.Fprintln(w, "")
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
@@ -767,8 +767,8 @@ func TestGeminiClient_CompleteStream_Verbose(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 
-		fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"Response"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`)
-		fmt.Fprintln(w, "")
+		_, _ = fmt.Fprintln(w, `data: {"candidates":[{"content":{"parts":[{"text":"Response"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`)
+		_, _ = fmt.Fprintln(w, "")
 	}))
 	defer server.Close()
 
@@ -797,8 +797,8 @@ func TestGeminiClient_CompleteStream_MultipleChunksWithUsage(t *testing.T) {
 		}
 
 		for _, event := range events {
-			fmt.Fprintln(w, event)
-			fmt.Fprintln(w, "")
+			_, _ = fmt.Fprintln(w, event)
+			_, _ = fmt.Fprintln(w, "")
 		}
 	}))
 	defer server.Close()
@@ -838,8 +838,8 @@ func TestGeminiClient_CompleteStream_CacheHit(t *testing.T) {
 		}
 
 		for _, event := range events {
-			fmt.Fprintln(w, event)
-			fmt.Fprintln(w, "")
+			_, _ = fmt.Fprintln(w, event)
+			_, _ = fmt.Fprintln(w, "")
 		}
 	}))
 	defer server.Close()
@@ -880,8 +880,8 @@ func TestGeminiClient_CompleteStream_CacheHitDisabled(t *testing.T) {
 		}
 
 		for _, event := range events {
-			fmt.Fprintln(w, event)
-			fmt.Fprintln(w, "")
+			_, _ = fmt.Fprintln(w, event)
+			_, _ = fmt.Fprintln(w, "")
 		}
 	}))
 	defer server.Close()
@@ -915,8 +915,8 @@ func TestGeminiClient_CompleteStream_VerboseCacheHit(t *testing.T) {
 		}
 
 		for _, event := range events {
-			fmt.Fprintln(w, event)
-			fmt.Fprintln(w, "")
+			_, _ = fmt.Fprintln(w, event)
+			_, _ = fmt.Fprintln(w, "")
 		}
 	}))
 	defer server.Close()

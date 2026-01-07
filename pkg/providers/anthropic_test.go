@@ -368,8 +368,8 @@ func TestAnthropicClient_CompleteStream_Success(t *testing.T) {
 		}
 
 		for _, event := range events {
-			fmt.Fprintln(w, event)
-			fmt.Fprintln(w, "") // Empty line between events
+			_, _ = fmt.Fprintln(w, event)
+			_, _ = fmt.Fprintln(w, "") // Empty line between events
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
@@ -448,8 +448,8 @@ func TestAnthropicClient_CompleteStream_HandlerError(t *testing.T) {
 		}
 
 		for _, event := range events {
-			fmt.Fprintln(w, event)
-			fmt.Fprintln(w, "")
+			_, _ = fmt.Fprintln(w, event)
+			_, _ = fmt.Fprintln(w, "")
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
@@ -491,8 +491,8 @@ func TestAnthropicClient_CompleteStream_NilHandler(t *testing.T) {
 		}
 
 		for _, event := range events {
-			fmt.Fprintln(w, event)
-			fmt.Fprintln(w, "")
+			_, _ = fmt.Fprintln(w, event)
+			_, _ = fmt.Fprintln(w, "")
 		}
 	}))
 	defer server.Close()
@@ -520,8 +520,8 @@ func TestAnthropicClient_CompleteStream_ContextCancellation(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 
 		// Write initial event
-		fmt.Fprintln(w, `data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}`)
-		fmt.Fprintln(w, "")
+		_, _ = fmt.Fprintln(w, `data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}`)
+		_, _ = fmt.Fprintln(w, "")
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}

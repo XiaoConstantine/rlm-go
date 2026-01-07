@@ -142,9 +142,6 @@ var (
 
 	// XML patterns
 	xmlPatternRe = regexp.MustCompile(`(?s)^\s*<\?xml|^\s*<[a-zA-Z][a-zA-Z0-9]*(\s|>)`)
-
-	// CSV patterns (lines with consistent comma/tab delimiters)
-	csvPatternRe = regexp.MustCompile(`(?m)^[^,\t]+([,\t][^,\t]+)+$`)
 )
 
 // Analyze examines the context payload and returns analysis results.
