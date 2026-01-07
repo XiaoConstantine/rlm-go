@@ -427,6 +427,259 @@ func TestMessageJSONFields(t *testing.T) {
 	}
 }
 
+func TestNewRecursionContext(t *testing.T) {
+	tests := []struct {
+		name     string
+		maxDepth int
+	}{
+		{"max depth 1", 1},
+		{"max depth 3", 3},
+		{"max depth 10", 10},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := NewRecursionContext(tt.maxDepth)
+
+			if ctx == nil {
+				t.Fatal("expected non-nil RecursionContext")
+			}
+			if ctx.CurrentDepth != 0 {
+				t.Errorf("CurrentDepth = %d, want 0", ctx.CurrentDepth)
+			}
+			if ctx.MaxDepth != tt.maxDepth {
+				t.Errorf("MaxDepth = %d, want %d", ctx.MaxDepth, tt.maxDepth)
+			}
+			if ctx.ParentID != "" {
+				t.Errorf("ParentID = %q, want empty string", ctx.ParentID)
+			}
+			if ctx.TraceID != "" {
+				t.Errorf("TraceID = %q, want empty string", ctx.TraceID)
+			}
+		})
+	}
+}
+
+func TestRecursionContext_Child(t *testing.T) {
+	parent := NewRecursionContext(5)
+	parent.TraceID = "trace-abc-123"
+
+	child := parent.Child("parent-call-1")
+
+	if child == nil {
+		t.Fatal("expected non-nil child context")
+	}
+	if child.CurrentDepth != parent.CurrentDepth+1 {
+		t.Errorf("child.CurrentDepth = %d, want %d", child.CurrentDepth, parent.CurrentDepth+1)
+	}
+	if child.MaxDepth != parent.MaxDepth {
+		t.Errorf("child.MaxDepth = %d, want %d", child.MaxDepth, parent.MaxDepth)
+	}
+	if child.ParentID != "parent-call-1" {
+		t.Errorf("child.ParentID = %q, want %q", child.ParentID, "parent-call-1")
+	}
+	if child.TraceID != parent.TraceID {
+		t.Errorf("child.TraceID = %q, want %q (inherited from parent)", child.TraceID, parent.TraceID)
+	}
+}
+
+func TestRecursionContext_ChildChain(t *testing.T) {
+	// Test creating a chain of child contexts
+	root := NewRecursionContext(5)
+	root.TraceID = "trace-root"
+
+	level1 := root.Child("call-1")
+	level2 := level1.Child("call-2")
+	level3 := level2.Child("call-3")
+
+	if level1.CurrentDepth != 1 {
+		t.Errorf("level1.CurrentDepth = %d, want 1", level1.CurrentDepth)
+	}
+	if level2.CurrentDepth != 2 {
+		t.Errorf("level2.CurrentDepth = %d, want 2", level2.CurrentDepth)
+	}
+	if level3.CurrentDepth != 3 {
+		t.Errorf("level3.CurrentDepth = %d, want 3", level3.CurrentDepth)
+	}
+
+	// All should inherit the same TraceID
+	if level1.TraceID != root.TraceID || level2.TraceID != root.TraceID || level3.TraceID != root.TraceID {
+		t.Error("TraceID should be inherited through the chain")
+	}
+
+	// ParentIDs should be set correctly
+	if level2.ParentID != "call-2" {
+		t.Errorf("level2.ParentID = %q, want %q", level2.ParentID, "call-2")
+	}
+	if level3.ParentID != "call-3" {
+		t.Errorf("level3.ParentID = %q, want %q", level3.ParentID, "call-3")
+	}
+}
+
+func TestRecursionContext_CanRecurse(t *testing.T) {
+	tests := []struct {
+		name         string
+		currentDepth int
+		maxDepth     int
+		expected     bool
+	}{
+		{"at root, can recurse", 0, 2, true},
+		{"at depth 1 of 3, can recurse", 1, 3, true},
+		{"at max depth, cannot recurse", 2, 2, false},
+		{"beyond max depth, cannot recurse", 3, 2, false},
+		{"max depth 0, cannot recurse", 0, 0, false},
+		{"at depth 4 of 5, can recurse", 4, 5, true},
+		{"at depth 5 of 5, cannot recurse", 5, 5, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := &RecursionContext{
+				CurrentDepth: tt.currentDepth,
+				MaxDepth:     tt.maxDepth,
+			}
+
+			result := ctx.CanRecurse()
+			if result != tt.expected {
+				t.Errorf("CanRecurse() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDepthExceededError(t *testing.T) {
+	tests := []struct {
+		name         string
+		currentDepth int
+		maxDepth     int
+		prompt       string
+	}{
+		{
+			name:         "simple error",
+			currentDepth: 3,
+			maxDepth:     2,
+			prompt:       "test prompt",
+		},
+		{
+			name:         "long prompt truncated",
+			currentDepth: 5,
+			maxDepth:     3,
+			prompt:       "This is a very long prompt that should be truncated in the error message because it exceeds the maximum length allowed for display",
+		},
+		{
+			name:         "empty prompt",
+			currentDepth: 2,
+			maxDepth:     1,
+			prompt:       "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := &DepthExceededError{
+				CurrentDepth: tt.currentDepth,
+				MaxDepth:     tt.maxDepth,
+				Prompt:       tt.prompt,
+			}
+
+			errMsg := err.Error()
+
+			// Should contain depth information
+			if !contains(errMsg, "depth exceeded") {
+				t.Errorf("error message should contain 'depth exceeded': %s", errMsg)
+			}
+			if !contains(errMsg, "current=") {
+				t.Errorf("error message should contain 'current=': %s", errMsg)
+			}
+			if !contains(errMsg, "max=") {
+				t.Errorf("error message should contain 'max=': %s", errMsg)
+			}
+
+			// Long prompts should be truncated
+			if len(tt.prompt) > 50 && !contains(errMsg, "...") {
+				t.Errorf("long prompts should be truncated with '...': %s", errMsg)
+			}
+		})
+	}
+}
+
+func TestDepthExceededError_Implements_Error(t *testing.T) {
+	var err error = &DepthExceededError{
+		CurrentDepth: 1,
+		MaxDepth:     1,
+		Prompt:       "test",
+	}
+
+	if err.Error() == "" {
+		t.Error("Error() should return non-empty string")
+	}
+}
+
+func TestTruncatePrompt(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		maxLen   int
+		expected string
+	}{
+		{
+			name:     "short string unchanged",
+			input:    "hello",
+			maxLen:   10,
+			expected: "hello",
+		},
+		{
+			name:     "exact length unchanged",
+			input:    "hello",
+			maxLen:   5,
+			expected: "hello",
+		},
+		{
+			name:     "long string truncated",
+			input:    "hello world",
+			maxLen:   5,
+			expected: "hello...",
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			maxLen:   5,
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := truncatePrompt(tt.input, tt.maxLen)
+			if result != tt.expected {
+				t.Errorf("truncatePrompt() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRecursionContext_Immutability(t *testing.T) {
+	// Verify that creating a child doesn't modify the parent
+	parent := NewRecursionContext(5)
+	parent.TraceID = "parent-trace"
+	originalDepth := parent.CurrentDepth
+
+	child := parent.Child("child-call")
+
+	// Parent should be unchanged
+	if parent.CurrentDepth != originalDepth {
+		t.Errorf("parent.CurrentDepth was modified: got %d, want %d", parent.CurrentDepth, originalDepth)
+	}
+	if parent.ParentID != "" {
+		t.Errorf("parent.ParentID was modified: got %q, want empty", parent.ParentID)
+	}
+
+	// Child should have incremented depth
+	if child.CurrentDepth != originalDepth+1 {
+		t.Errorf("child.CurrentDepth = %d, want %d", child.CurrentDepth, originalDepth+1)
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
 }

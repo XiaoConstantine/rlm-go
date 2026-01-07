@@ -67,6 +67,10 @@ type Config struct {
 	// OnProgress is called at the start of each iteration with progress info.
 	// Can be used to display progress to users or implement custom termination logic.
 	OnProgress func(progress IterationProgress)
+
+	// Recursion configures multi-depth recursion behavior.
+	// When enabled, sub-LLMs can spawn their own sub-LLMs.
+	Recursion *RecursionConfig
 }
 
 // HistoryCompressionConfig configures how message history is compressed.
@@ -108,6 +112,22 @@ type AdaptiveIterationConfig struct {
 	// ConfidenceThreshold is the number of confidence signals needed for early termination.
 	// Default: 1.
 	ConfidenceThreshold int
+}
+
+// RecursionConfig configures multi-depth recursion behavior.
+type RecursionConfig struct {
+	// MaxDepth is the maximum recursion depth allowed.
+	// Depth 0 = no recursion, 1 = one level of sub-RLM, etc.
+	// Default: 0 (disabled).
+	MaxDepth int
+
+	// OnRecursiveQuery is called when a recursive query is initiated.
+	// Can be used for logging/tracing.
+	OnRecursiveQuery func(depth int, prompt string)
+
+	// PerDepthMaxIterations optionally sets different max iterations per depth level.
+	// If nil or missing an entry, uses the default MaxIterations.
+	PerDepthMaxIterations map[int]int
 }
 
 // IterationProgress tracks progress and confidence during iteration.
@@ -273,6 +293,39 @@ func WithAdaptiveIterationConfig(cfg AdaptiveIterationConfig) Option {
 func WithProgressHandler(handler func(IterationProgress)) Option {
 	return func(c *Config) {
 		c.OnProgress = handler
+	}
+}
+
+// WithMaxRecursionDepth enables multi-depth recursion with the specified max depth.
+// Depth 0 = disabled, 1 = one level of sub-RLM, 2 = sub-RLM can spawn sub-RLM, etc.
+func WithMaxRecursionDepth(depth int) Option {
+	return func(c *Config) {
+		if depth < 0 {
+			depth = 0
+		}
+		c.Recursion = &RecursionConfig{
+			MaxDepth: depth,
+		}
+	}
+}
+
+// WithRecursionConfig enables multi-depth recursion with custom configuration.
+func WithRecursionConfig(cfg RecursionConfig) Option {
+	return func(c *Config) {
+		if cfg.MaxDepth < 0 {
+			cfg.MaxDepth = 0
+		}
+		c.Recursion = &cfg
+	}
+}
+
+// WithRecursionCallback sets a callback for when recursive queries are initiated.
+func WithRecursionCallback(callback func(depth int, prompt string)) Option {
+	return func(c *Config) {
+		if c.Recursion == nil {
+			c.Recursion = &RecursionConfig{}
+		}
+		c.Recursion.OnRecursiveQuery = callback
 	}
 }
 
@@ -834,4 +887,306 @@ func ContextMetadata(payload any) string {
 	default:
 		return fmt.Sprintf("%T", v)
 	}
+}
+
+// CompleteWithRecursion runs an RLM completion with multi-depth recursion support.
+// This method is called internally for nested RLM executions.
+func (r *RLM) CompleteWithRecursion(
+	ctx context.Context,
+	contextPayload any,
+	query string,
+	recursionCtx *core.RecursionContext,
+	tokenStats *RecursiveTokenStats,
+) (*core.CompletionResult, error) {
+	start := time.Now()
+
+	// Select system prompt based on recursion capability
+	systemPrompt := r.config.SystemPrompt
+	if recursionCtx != nil && recursionCtx.MaxDepth > 0 && recursionCtx.CanRecurse() {
+		systemPrompt = RecursiveSystemPrompt
+	}
+
+	// Create recursive client adapter for nested calls
+	var replEnv interface {
+		LoadContext(any) error
+		Execute(context.Context, string) (*core.ExecutionResult, error)
+		GetVariable(string) (string, error)
+		GetLLMCalls() []repl.LLMCall
+		GetLocals() map[string]any
+		ContextInfo() string
+		Close()
+	}
+
+	if recursionCtx != nil && recursionCtx.MaxDepth > 0 {
+		// Create recursive adapter
+		adapter := NewRecursiveClientAdapter(r, recursionCtx, tokenStats, contextPayload)
+		replEnv = repl.NewRecursiveREPL(adapter, recursionCtx)
+	} else {
+		// Standard REPL
+		if r.config.REPLPool != nil {
+			replEnv = r.config.REPLPool.Get()
+		} else {
+			replEnv = repl.New(r.replClient)
+		}
+	}
+
+	defer replEnv.Close()
+
+	// Load context into REPL
+	if err := replEnv.LoadContext(contextPayload); err != nil {
+		return nil, fmt.Errorf("failed to load context: %w", err)
+	}
+
+	// Build initial message history with appropriate system prompt
+	contextInfo := replEnv.ContextInfo()
+	userPrompt := fmt.Sprintf(UserPromptTemplate, contextInfo, query) + FirstIterationSuffix
+
+	messages := []core.Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userPrompt},
+	}
+
+	// Track total token usage across iterations
+	var totalPromptTokens, totalCompletionTokens int
+	var totalCacheCreationTokens, totalCacheReadTokens int
+
+	// Compute max iterations (may differ by depth)
+	contextSize := getContextSize(contextPayload)
+	maxIterations := r.computeMaxIterationsForDepth(contextSize, recursionCtx)
+
+	// Track confidence signals for early termination
+	var confidenceSignals int
+
+	// Iteration loop
+	for i := 0; i < maxIterations; i++ {
+		iterStart := time.Now()
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		// Report progress if handler is set
+		if r.config.OnProgress != nil {
+			depth := 0
+			if recursionCtx != nil {
+				depth = recursionCtx.CurrentDepth
+			}
+			r.config.OnProgress(IterationProgress{
+				CurrentIteration:  i + 1,
+				MaxIterations:     maxIterations,
+				ConfidenceSignals: confidenceSignals,
+				HasFinalAttempt:   false,
+				ContextSize:       contextSize,
+			})
+			_ = depth // Used for potential future logging
+		}
+
+		if r.config.Verbose {
+			depth := 0
+			if recursionCtx != nil {
+				depth = recursionCtx.CurrentDepth
+			}
+			fmt.Printf("[RLM] Depth %d, Iteration %d/%d\n", depth, i+1, maxIterations)
+		}
+
+		// Add iteration-specific user prompt
+		currentMessages := r.appendIterationPrompt(messages, i, query)
+
+		// Get LLM response (streaming or non-streaming)
+		llmResp, err := r.completeWithOptionalStreaming(ctx, currentMessages)
+		if err != nil {
+			return nil, fmt.Errorf("iteration %d: llm completion failed: %w", i, err)
+		}
+		response := llmResp.Content
+
+		// Aggregate root LLM tokens
+		totalPromptTokens += llmResp.PromptTokens
+		totalCompletionTokens += llmResp.CompletionTokens
+		totalCacheCreationTokens += llmResp.CacheCreationTokens
+		totalCacheReadTokens += llmResp.CacheReadTokens
+
+		// Track in token stats if provided
+		if tokenStats != nil && recursionCtx != nil {
+			tokenStats.Add(recursionCtx.CurrentDepth, llmResp.PromptTokens, llmResp.CompletionTokens)
+		}
+
+		if r.config.Verbose {
+			if llmResp.CacheCreationTokens > 0 || llmResp.CacheReadTokens > 0 {
+				fmt.Printf("[RLM] Cache stats this iteration: created=%d, read=%d\n",
+					llmResp.CacheCreationTokens, llmResp.CacheReadTokens)
+			}
+			fmt.Printf("[RLM] Response: %s\n", truncate(response, 200))
+		}
+
+		// Extract and execute code blocks
+		codeBlocks := parsing.FindCodeBlocks(response)
+		var execResults []core.CodeBlock
+
+		for _, code := range codeBlocks {
+			if r.config.Verbose {
+				fmt.Printf("[RLM] Executing code:\n%s\n", truncate(code, 200))
+			}
+
+			result, _ := replEnv.Execute(ctx, code)
+			execResults = append(execResults, core.CodeBlock{
+				Code:   code,
+				Result: *result,
+			})
+
+			if r.config.Verbose && result.Stdout != "" {
+				fmt.Printf("[RLM] Output: %s\n", truncate(result.Stdout, 200))
+			}
+			if r.config.Verbose && result.Stderr != "" {
+				fmt.Printf("[RLM] Stderr: %s\n", truncate(result.Stderr, 200))
+			}
+		}
+
+		// Get RLM calls made during code execution and aggregate tokens
+		var rlmCalls []logger.RLMCallEntry
+		for _, call := range replEnv.GetLLMCalls() {
+			rlmCalls = append(rlmCalls, logger.RLMCallEntry{
+				Prompt:           call.Prompt,
+				Response:         call.Response,
+				PromptTokens:     call.PromptTokens,
+				CompletionTokens: call.CompletionTokens,
+				ExecutionTime:    call.Duration,
+			})
+			totalPromptTokens += call.PromptTokens
+			totalCompletionTokens += call.CompletionTokens
+		}
+
+		// Log iteration
+		if r.config.Logger != nil {
+			locals := replEnv.GetLocals()
+			_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, locals, nil, time.Since(iterStart))
+		}
+
+		// Detect confidence signals for adaptive early termination
+		if detectConfidence(response) {
+			confidenceSignals++
+			if r.config.Verbose {
+				fmt.Printf("[RLM] Confidence signal detected (total: %d)\n", confidenceSignals)
+			}
+		}
+
+		// Check for final answer
+		if len(codeBlocks) == 0 && parsing.FindFinalAnswer(response) != nil {
+			final := parsing.FindFinalAnswer(response)
+			varName := final.Content
+			varValue := varName
+
+			if final.Type == core.FinalTypeVariable {
+				resolved, err := replEnv.GetVariable(varName)
+				if err != nil {
+					if r.config.Verbose {
+						fmt.Printf("[RLM] Warning: could not resolve variable %q: %v\n", varName, err)
+					}
+				} else {
+					varValue = resolved
+				}
+			}
+
+			return &core.CompletionResult{
+				Response:   varValue,
+				Iterations: i + 1,
+				Duration:   time.Since(start),
+				Usage: core.UsageStats{
+					PromptTokens:        totalPromptTokens,
+					CompletionTokens:    totalCompletionTokens,
+					TotalTokens:         totalPromptTokens + totalCompletionTokens,
+					CacheCreationTokens: totalCacheCreationTokens,
+					CacheReadTokens:     totalCacheReadTokens,
+				},
+			}, nil
+		}
+
+		// Check for early termination based on confidence signals
+		if r.shouldTerminateEarly(confidenceSignals, len(codeBlocks)) {
+			if r.config.Verbose {
+				fmt.Printf("[RLM] Early termination triggered (confidence signals: %d)\n", confidenceSignals)
+			}
+			return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens, totalCacheCreationTokens, totalCacheReadTokens)
+		}
+
+		// Append iteration results to history
+		messages = r.appendIterationToHistory(messages, response, execResults)
+
+		// Apply history compression if enabled
+		if r.config.HistoryCompression != nil && r.config.HistoryCompression.Enabled {
+			messages = r.compressHistory(messages, i+1)
+		}
+	}
+
+	// Max iterations exhausted - force final answer
+	return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens, totalCacheCreationTokens, totalCacheReadTokens)
+}
+
+// computeMaxIterationsForDepth calculates max iterations considering recursion depth.
+func (r *RLM) computeMaxIterationsForDepth(contextSize int, recursionCtx *core.RecursionContext) int {
+	// Check if there's a per-depth setting
+	if recursionCtx != nil && r.config.Recursion != nil && r.config.Recursion.PerDepthMaxIterations != nil {
+		if maxIter, ok := r.config.Recursion.PerDepthMaxIterations[recursionCtx.CurrentDepth]; ok {
+			return maxIter
+		}
+	}
+
+	// Fall back to adaptive or default calculation
+	return r.computeMaxIterations(contextSize)
+}
+
+// RecursiveComplete runs an RLM completion with multi-depth recursion enabled.
+// This is the public API for recursive completions.
+func (r *RLM) RecursiveComplete(ctx context.Context, contextPayload any, query string) (*RecursiveCompletionResult, error) {
+	// Validate recursion config
+	if r.config.Recursion == nil || r.config.Recursion.MaxDepth <= 0 {
+		// Fall back to regular Complete
+		result, err := r.Complete(ctx, contextPayload, query)
+		if err != nil {
+			return nil, err
+		}
+		return &RecursiveCompletionResult{
+			CompletionResult: *result,
+			TokenStats:       NewRecursiveTokenStats(),
+			MaxDepthReached:  0,
+		}, nil
+	}
+
+	// Create token stats tracker
+	tokenStats := NewRecursiveTokenStats()
+
+	// Create root recursion context
+	recursionCtx := core.NewRecursionContext(r.config.Recursion.MaxDepth)
+
+	// Run with recursion support
+	result, err := r.CompleteWithRecursion(ctx, contextPayload, query, recursionCtx, tokenStats)
+	if err != nil {
+		return nil, err
+	}
+
+	// Calculate max depth reached
+	maxDepth := 0
+	for depth := range tokenStats.CallsByDepth {
+		if depth > maxDepth {
+			maxDepth = depth
+		}
+	}
+
+	return &RecursiveCompletionResult{
+		CompletionResult: *result,
+		TokenStats:       tokenStats,
+		MaxDepthReached:  maxDepth,
+	}, nil
+}
+
+// RecursiveCompletionResult extends CompletionResult with recursion-specific data.
+type RecursiveCompletionResult struct {
+	core.CompletionResult
+
+	// TokenStats aggregates token usage across all recursion levels.
+	TokenStats *RecursiveTokenStats
+
+	// MaxDepthReached is the maximum recursion depth that was used.
+	MaxDepthReached int
 }

@@ -1,7 +1,10 @@
 // Package core provides core types for rlm-go.
 package core
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // ExecutionResult represents the result of executing code in the REPL.
 type ExecutionResult struct {
@@ -68,4 +71,65 @@ type CompletionResult struct {
 	Iterations int
 	Duration   time.Duration
 	Usage      UsageStats
+}
+
+// RecursionContext tracks the current recursion state for multi-depth RLM.
+type RecursionContext struct {
+	// CurrentDepth is the current recursion depth (0 = root).
+	CurrentDepth int
+
+	// MaxDepth is the maximum allowed recursion depth.
+	MaxDepth int
+
+	// ParentID identifies the parent RLM call for tracing/logging.
+	ParentID string
+
+	// TraceID is the root trace identifier shared across all recursive calls.
+	TraceID string
+}
+
+// NewRecursionContext creates a new RecursionContext with the given max depth.
+func NewRecursionContext(maxDepth int) *RecursionContext {
+	return &RecursionContext{
+		CurrentDepth: 0,
+		MaxDepth:     maxDepth,
+		ParentID:     "",
+		TraceID:      "",
+	}
+}
+
+// Child creates a child RecursionContext with incremented depth.
+func (rc *RecursionContext) Child(parentID string) *RecursionContext {
+	return &RecursionContext{
+		CurrentDepth: rc.CurrentDepth + 1,
+		MaxDepth:     rc.MaxDepth,
+		ParentID:     parentID,
+		TraceID:      rc.TraceID,
+	}
+}
+
+// CanRecurse returns true if another level of recursion is allowed.
+func (rc *RecursionContext) CanRecurse() bool {
+	return rc.CurrentDepth < rc.MaxDepth
+}
+
+// DepthExceededError is returned when MaxDepth is exceeded.
+type DepthExceededError struct {
+	CurrentDepth int
+	MaxDepth     int
+	Prompt       string
+}
+
+// Error implements the error interface.
+func (e *DepthExceededError) Error() string {
+	return fmt.Sprintf("recursion depth exceeded: current=%d, max=%d, prompt=%q",
+		e.CurrentDepth, e.MaxDepth, truncatePrompt(e.Prompt, 50))
+}
+
+// truncatePrompt truncates a prompt for error messages.
+func truncatePrompt(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
