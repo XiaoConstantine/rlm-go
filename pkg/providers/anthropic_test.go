@@ -27,13 +27,26 @@ func TestAnthropicClient_Complete_Success(t *testing.T) {
 		if r.Header.Get("anthropic-version") != "2023-06-01" {
 			t.Errorf("Expected anthropic-version 2023-06-01")
 		}
+		if r.Header.Get("anthropic-beta") != "prompt-caching-2024-07-31" {
+			t.Errorf("Expected anthropic-beta header for prefix caching, got %s", r.Header.Get("anthropic-beta"))
+		}
 
-		var req anthropicRequest
+		var req map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("Failed to decode request: %v", err)
 		}
-		if req.System != "You are helpful" {
-			t.Errorf("Expected system prompt, got %s", req.System)
+		system, ok := req["system"].([]any)
+		if !ok || len(system) != 1 {
+			t.Errorf("Expected system to be array with 1 element, got %v", req["system"])
+		} else {
+			block := system[0].(map[string]any)
+			if block["text"] != "You are helpful" {
+				t.Errorf("Expected system text 'You are helpful', got %v", block["text"])
+			}
+			cacheControl := block["cache_control"].(map[string]any)
+			if cacheControl["type"] != "ephemeral" {
+				t.Errorf("Expected cache_control type 'ephemeral', got %v", cacheControl["type"])
+			}
 		}
 
 		resp := anthropicResponse{
@@ -44,8 +57,10 @@ func TestAnthropicClient_Complete_Success(t *testing.T) {
 				{Type: "text", Text: "Hello, world!"},
 			},
 			Usage: struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
+				InputTokens              int `json:"input_tokens"`
+				OutputTokens             int `json:"output_tokens"`
+				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 			}{
 				InputTokens:  10,
 				OutputTokens: 5,
@@ -105,8 +120,10 @@ func TestAnthropicClient_Query_Success(t *testing.T) {
 				{Type: "text", Text: "Query response"},
 			},
 			Usage: struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
+				InputTokens              int `json:"input_tokens"`
+				OutputTokens             int `json:"output_tokens"`
+				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 			}{
 				InputTokens:  5,
 				OutputTokens: 3,
@@ -144,8 +161,10 @@ func TestAnthropicClient_QueryBatched_Success(t *testing.T) {
 				{Type: "text", Text: "Response"},
 			},
 			Usage: struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
+				InputTokens              int `json:"input_tokens"`
+				OutputTokens             int `json:"output_tokens"`
+				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 			}{
 				InputTokens:  1,
 				OutputTokens: 1,
@@ -194,8 +213,10 @@ func TestAnthropicClient_Verbose(t *testing.T) {
 				{Type: "text", Text: "Response"},
 			},
 			Usage: struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
+				InputTokens              int `json:"input_tokens"`
+				OutputTokens             int `json:"output_tokens"`
+				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 			}{
 				InputTokens:  10,
 				OutputTokens: 5,
@@ -212,6 +233,86 @@ func TestAnthropicClient_Verbose(t *testing.T) {
 	_, err := client.Query(context.Background(), "Test")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
+	}
+}
+
+func TestAnthropicClient_PrefixCachingDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("anthropic-beta") != "" {
+			t.Errorf("Expected no anthropic-beta header, got %s", r.Header.Get("anthropic-beta"))
+		}
+
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("Failed to decode request: %v", err)
+		}
+		if _, ok := req["system"].(string); !ok {
+			t.Errorf("Expected system to be a string when prefix caching is disabled, got %T", req["system"])
+		}
+
+		resp := anthropicResponse{
+			Content: []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}{
+				{Type: "text", Text: "Response"},
+			},
+			Usage: struct {
+				InputTokens              int `json:"input_tokens"`
+				OutputTokens             int `json:"output_tokens"`
+				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			}{
+				InputTokens:  10,
+				OutputTokens: 5,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewAnthropicClient("test-key", "claude-test", false, WithPrefixCaching(false))
+	client.baseURL = server.URL
+
+	messages := []core.Message{
+		{Role: "system", Content: "You are helpful"},
+		{Role: "user", Content: "Hello"},
+	}
+
+	_, err := client.Complete(context.Background(), messages)
+	if err != nil {
+		t.Fatalf("Complete failed: %v", err)
+	}
+}
+
+func TestAnthropicClient_PrefixCachingCacheHit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"content": [{"type": "text", "text": "Hello"}],
+			"usage": {
+				"input_tokens": 100,
+				"output_tokens": 10,
+				"cache_creation_input_tokens": 0,
+				"cache_read_input_tokens": 90
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	client := NewAnthropicClient("test-key", "claude-test", true)
+	client.baseURL = server.URL
+
+	messages := []core.Message{
+		{Role: "system", Content: "You are helpful"},
+		{Role: "user", Content: "Hello"},
+	}
+
+	_, err := client.Complete(context.Background(), messages)
+	if err != nil {
+		t.Fatalf("Complete failed: %v", err)
 	}
 }
 

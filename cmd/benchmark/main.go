@@ -2,21 +2,18 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
 	"github.com/XiaoConstantine/rlm-go/pkg/logger"
+	"github.com/XiaoConstantine/rlm-go/pkg/providers"
 	"github.com/XiaoConstantine/rlm-go/pkg/repl"
 	"github.com/XiaoConstantine/rlm-go/pkg/rlm"
 )
@@ -31,218 +28,31 @@ type Task struct {
 
 // BenchmarkResult represents the result of a single benchmark run.
 type BenchmarkResult struct {
-	TaskID        string  `json:"task_id"`
-	UseRLM        bool    `json:"use_rlm"`
-	Expected      string  `json:"expected"`
-	Got           string  `json:"got"`
-	IsCorrect     bool    `json:"is_correct"`
-	ExecutionTime float64 `json:"execution_time"`
-	InputTokens   int     `json:"input_tokens"`
-	OutputTokens  int     `json:"output_tokens"`
-	Error         string  `json:"error,omitempty"`
+	TaskID              string  `json:"task_id"`
+	UseRLM              bool    `json:"use_rlm"`
+	Expected            string  `json:"expected"`
+	Got                 string  `json:"got"`
+	IsCorrect           bool    `json:"is_correct"`
+	ExecutionTime       float64 `json:"execution_time"`
+	InputTokens         int     `json:"input_tokens"`
+	OutputTokens        int     `json:"output_tokens"`
+	CacheCreationTokens int     `json:"cache_creation_tokens,omitempty"`
+	CacheReadTokens     int     `json:"cache_read_tokens,omitempty"`
+	Error               string  `json:"error,omitempty"`
 }
 
 // BenchmarkSummary provides aggregate statistics.
 type BenchmarkSummary struct {
-	TotalTasks    int     `json:"total_tasks"`
-	CorrectTasks  int     `json:"correct_tasks"`
-	Accuracy      float64 `json:"accuracy"`
-	TotalTime     float64 `json:"total_time"`
-	AvgTimePerTask float64 `json:"avg_time_per_task"`
-	TotalInputTokens  int `json:"total_input_tokens"`
-	TotalOutputTokens int `json:"total_output_tokens"`
-}
-
-// AnthropicClient implements both rlm.LLMClient and repl.LLMClient.
-type AnthropicClient struct {
-	apiKey     string
-	model      string
-	maxTokens  int
-	httpClient *http.Client
-
-	// Track usage for baseline calls
-	mu              sync.Mutex
-	lastInputTokens  int
-	lastOutputTokens int
-}
-
-func NewAnthropicClient(apiKey, model string) *AnthropicClient {
-	return &AnthropicClient{
-		apiKey:    apiKey,
-		model:     model,
-		maxTokens: 4096,
-		httpClient: &http.Client{
-			Timeout: 180 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				MaxConnsPerHost:     10,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
-	}
-}
-
-type anthropicRequest struct {
-	Model     string             `json:"model"`
-	MaxTokens int                `json:"max_tokens"`
-	Messages  []anthropicMessage `json:"messages"`
-	System    string             `json:"system,omitempty"`
-}
-
-type anthropicMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type anthropicResponse struct {
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
-	Usage struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
-}
-
-// Complete implements rlm.LLMClient.
-func (c *AnthropicClient) Complete(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
-	var systemPrompt string
-	var apiMessages []anthropicMessage
-
-	for _, msg := range messages {
-		if msg.Role == "system" {
-			systemPrompt = msg.Content
-		} else {
-			apiMessages = append(apiMessages, anthropicMessage{
-				Role:    msg.Role,
-				Content: msg.Content,
-			})
-		}
-	}
-
-	reqBody := anthropicRequest{
-		Model:     c.model,
-		MaxTokens: c.maxTokens,
-		Messages:  apiMessages,
-		System:    systemPrompt,
-	}
-
-	text, inputTokens, outputTokens, err := c.doRequest(ctx, reqBody)
-	if err != nil {
-		return core.LLMResponse{}, err
-	}
-
-	c.mu.Lock()
-	c.lastInputTokens = inputTokens
-	c.lastOutputTokens = outputTokens
-	c.mu.Unlock()
-
-	return core.LLMResponse{
-		Content:          text,
-		PromptTokens:     inputTokens,
-		CompletionTokens: outputTokens,
-	}, nil
-}
-
-// Query implements repl.LLMClient.
-func (c *AnthropicClient) Query(ctx context.Context, prompt string) (repl.QueryResponse, error) {
-	reqBody := anthropicRequest{
-		Model:     c.model,
-		MaxTokens: c.maxTokens,
-		Messages: []anthropicMessage{
-			{Role: "user", Content: prompt},
-		},
-	}
-
-	text, inputTokens, outputTokens, err := c.doRequest(ctx, reqBody)
-	return repl.QueryResponse{
-		Response:         text,
-		PromptTokens:     inputTokens,
-		CompletionTokens: outputTokens,
-	}, err
-}
-
-// QueryBatched implements repl.LLMClient.
-func (c *AnthropicClient) QueryBatched(ctx context.Context, prompts []string) ([]repl.QueryResponse, error) {
-	results := make([]repl.QueryResponse, len(prompts))
-	var wg sync.WaitGroup
-
-	for i, prompt := range prompts {
-		wg.Add(1)
-		go func(idx int, p string) {
-			defer wg.Done()
-			result, err := c.Query(ctx, p)
-			if err != nil {
-				results[idx] = repl.QueryResponse{Response: fmt.Sprintf("Error: %v", err)}
-			} else {
-				results[idx] = result
-			}
-		}(i, prompt)
-	}
-
-	wg.Wait()
-	return results, nil
-}
-
-// GetLastUsage returns the last recorded token usage.
-func (c *AnthropicClient) GetLastUsage() (int, int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lastInputTokens, c.lastOutputTokens
-}
-
-func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicRequest) (string, int, int, error) {
-	jsonBody, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(jsonBody))
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", c.apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("http request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", 0, 0, fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	var apiResp anthropicResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return "", 0, 0, fmt.Errorf("unmarshal response: %w", err)
-	}
-
-	if apiResp.Error != nil {
-		return "", 0, 0, fmt.Errorf("api error: %s", apiResp.Error.Message)
-	}
-
-	var texts []string
-	for _, block := range apiResp.Content {
-		if block.Type == "text" {
-			texts = append(texts, block.Text)
-		}
-	}
-
-	return strings.Join(texts, ""), apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens, nil
+	TotalTasks               int     `json:"total_tasks"`
+	CorrectTasks             int     `json:"correct_tasks"`
+	Accuracy                 float64 `json:"accuracy"`
+	TotalTime                float64 `json:"total_time"`
+	AvgTimePerTask           float64 `json:"avg_time_per_task"`
+	TotalInputTokens         int     `json:"total_input_tokens"`
+	TotalOutputTokens        int     `json:"total_output_tokens"`
+	TotalCacheCreationTokens int     `json:"total_cache_creation_tokens"`
+	TotalCacheReadTokens     int     `json:"total_cache_read_tokens"`
+	CacheHitRate             float64 `json:"cache_hit_rate"`
 }
 
 // checkAnswer determines if the model's answer matches the expected answer.
@@ -345,7 +155,7 @@ Please provide a concise answer based only on the information in the text above.
 }
 
 // runBaseline runs a task with direct LLM call.
-func runBaseline(ctx context.Context, task Task, client *AnthropicClient) BenchmarkResult {
+func runBaseline(ctx context.Context, task Task, client providers.Client) BenchmarkResult {
 	prompt := buildPrompt(task)
 
 	start := time.Now()
@@ -373,38 +183,51 @@ func runBaseline(ctx context.Context, task Task, client *AnthropicClient) Benchm
 	isCorrect := checkAnswer(task.Answer, llmResp.Content)
 
 	return BenchmarkResult{
-		TaskID:        task.TaskID,
-		UseRLM:        false,
-		Expected:      task.Answer,
-		Got:           llmResp.Content,
-		IsCorrect:     isCorrect,
-		ExecutionTime: duration.Seconds(),
-		InputTokens:   llmResp.PromptTokens,
-		OutputTokens:  llmResp.CompletionTokens,
+		TaskID:              task.TaskID,
+		UseRLM:              false,
+		Expected:            task.Answer,
+		Got:                 llmResp.Content,
+		IsCorrect:           isCorrect,
+		ExecutionTime:       duration.Seconds(),
+		InputTokens:         llmResp.PromptTokens,
+		OutputTokens:        llmResp.CompletionTokens,
+		CacheCreationTokens: llmResp.CacheCreationTokens,
+		CacheReadTokens:     llmResp.CacheReadTokens,
 	}
 }
 
 // RLMOptions holds configuration for RLM runs.
 type RLMOptions struct {
-	LogDir          string
-	Verbose         bool
-	Streaming       bool
-	Pool            *repl.REPLPool
-	Compression     bool
-	VerbatimIters   int
+	LogDir        string
+	Verbose       bool
+	Streaming     bool
+	Pool          *repl.REPLPool
+	Compression   bool
+	VerbatimIters int
+	Backend       string
+}
+
+// ModelClient is an interface for clients that expose their model name.
+type ModelClient interface {
+	Model() string
 }
 
 // runRLM runs a task with RLM.
-func runRLM(ctx context.Context, task Task, client *AnthropicClient, opts RLMOptions) BenchmarkResult {
+func runRLM(ctx context.Context, task Task, client providers.Client, opts RLMOptions) BenchmarkResult {
 	var log *logger.Logger
 	var err error
 
+	modelName := ""
+	if mc, ok := client.(ModelClient); ok {
+		modelName = mc.Model()
+	}
+
 	if opts.LogDir != "" {
 		log, err = logger.New(opts.LogDir, logger.Config{
-			RootModel:     client.model,
+			RootModel:     modelName,
 			MaxIterations: 30,
-			Backend:       "anthropic",
-			BackendKwargs: map[string]any{"model_name": client.model},
+			Backend:       opts.Backend,
+			BackendKwargs: map[string]any{"model_name": modelName},
 			Context:       task.Context,
 			Query:         task.Question,
 		})
@@ -455,14 +278,16 @@ func runRLM(ctx context.Context, task Task, client *AnthropicClient, opts RLMOpt
 	isCorrect := checkAnswer(task.Answer, result.Response)
 
 	return BenchmarkResult{
-		TaskID:        task.TaskID,
-		UseRLM:        true,
-		Expected:      task.Answer,
-		Got:           result.Response,
-		IsCorrect:     isCorrect,
-		ExecutionTime: duration.Seconds(),
-		InputTokens:   result.Usage.PromptTokens,
-		OutputTokens:  result.Usage.CompletionTokens,
+		TaskID:              task.TaskID,
+		UseRLM:              true,
+		Expected:            task.Answer,
+		Got:                 result.Response,
+		IsCorrect:           isCorrect,
+		ExecutionTime:       duration.Seconds(),
+		InputTokens:         result.Usage.PromptTokens,
+		OutputTokens:        result.Usage.CompletionTokens,
+		CacheCreationTokens: result.Usage.CacheCreationTokens,
+		CacheReadTokens:     result.Usage.CacheReadTokens,
 	}
 }
 
@@ -475,6 +300,7 @@ func computeSummary(results []BenchmarkResult) BenchmarkSummary {
 	var correct int
 	var totalTime float64
 	var totalInput, totalOutput int
+	var totalCacheCreation, totalCacheRead int
 
 	for _, r := range results {
 		if r.IsCorrect {
@@ -483,16 +309,26 @@ func computeSummary(results []BenchmarkResult) BenchmarkSummary {
 		totalTime += r.ExecutionTime
 		totalInput += r.InputTokens
 		totalOutput += r.OutputTokens
+		totalCacheCreation += r.CacheCreationTokens
+		totalCacheRead += r.CacheReadTokens
+	}
+
+	var cacheHitRate float64
+	if totalCacheCreation+totalCacheRead > 0 {
+		cacheHitRate = float64(totalCacheRead) / float64(totalCacheCreation+totalCacheRead)
 	}
 
 	return BenchmarkSummary{
-		TotalTasks:        len(results),
-		CorrectTasks:      correct,
-		Accuracy:          float64(correct) / float64(len(results)),
-		TotalTime:         totalTime,
-		AvgTimePerTask:    totalTime / float64(len(results)),
-		TotalInputTokens:  totalInput,
-		TotalOutputTokens: totalOutput,
+		TotalTasks:               len(results),
+		CorrectTasks:             correct,
+		Accuracy:                 float64(correct) / float64(len(results)),
+		TotalTime:                totalTime,
+		AvgTimePerTask:           totalTime / float64(len(results)),
+		TotalInputTokens:         totalInput,
+		TotalOutputTokens:        totalOutput,
+		TotalCacheCreationTokens: totalCacheCreation,
+		TotalCacheReadTokens:     totalCacheRead,
+		CacheHitRate:             cacheHitRate,
 	}
 }
 
@@ -521,23 +357,31 @@ func truncate(s string, maxLen int) string {
 
 func main() {
 	var (
-		tasksFile       = flag.String("tasks", "", "Path to tasks JSON file")
-		model           = flag.String("model", "claude-sonnet-4-5-20250929", "Model to use")
-		numTasks        = flag.Int("num-tasks", 10, "Number of tasks to run")
-		logDir          = flag.String("log-dir", "./logs", "Directory for RLM logs")
-		outputFile      = flag.String("output", "", "Output JSON file for results")
-		verbose         = flag.Bool("verbose", false, "Enable verbose RLM output")
-		enableStreaming = flag.Bool("streaming", false, "Enable streaming for root LLM calls")
-		enablePooling   = flag.Bool("pooling", false, "Enable REPL instance pooling")
-		poolSize        = flag.Int("pool-size", 5, "REPL pool size (requires -pooling)")
-		enableCompression = flag.Bool("compression", false, "Enable history compression")
-		verbatimIters   = flag.Int("verbatim-iters", 3, "Keep last N iterations verbatim (requires -compression)")
+		tasksFile           = flag.String("tasks", "", "Path to tasks JSON file")
+		model               = flag.String("model", "claude-sonnet-4-5-20250929", "Model to use")
+		numTasks            = flag.Int("num-tasks", 10, "Number of tasks to run")
+		logDir              = flag.String("log-dir", "./logs", "Directory for RLM logs")
+		outputFile          = flag.String("output", "", "Output JSON file for results")
+		verbose             = flag.Bool("verbose", false, "Enable verbose RLM output")
+		enableStreaming     = flag.Bool("streaming", false, "Enable streaming for root LLM calls")
+		enablePooling       = flag.Bool("pooling", false, "Enable REPL instance pooling")
+		poolSize            = flag.Int("pool-size", 5, "REPL pool size (requires -pooling)")
+		enableCompression   = flag.Bool("compression", false, "Enable history compression")
+		verbatimIters       = flag.Int("verbatim-iters", 3, "Keep last N iterations verbatim (requires -compression)")
+		enablePrefixCaching = flag.Bool("prefix-caching", true, "Enable Anthropic prefix caching")
+		enableAsync         = flag.Bool("async", false, "Use async sub-LLM queries where possible")
 	)
 	flag.Parse()
 
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	// Silence unused warning for async (to be used in future)
+	_ = enableAsync
+
+	// Determine provider from model name
+	provider := providers.GetProvider(*model)
+	envKey := provider.EnvKey()
+	apiKey := os.Getenv(envKey)
 	if apiKey == "" {
-		fmt.Println("Error: ANTHROPIC_API_KEY environment variable not set")
+		fmt.Printf("Error: %s environment variable not set\n", envKey)
 		os.Exit(1)
 	}
 
@@ -563,6 +407,7 @@ func main() {
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Println("RLM-GO BENCHMARK")
 	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("Provider: %s\n", provider)
 	fmt.Printf("Model: %s\n", *model)
 	fmt.Printf("Tasks: %d\n", len(tasks))
 	if *enableStreaming {
@@ -574,9 +419,30 @@ func main() {
 	if *enableCompression {
 		fmt.Printf("History Compression: enabled (verbatim=%d)\n", *verbatimIters)
 	}
+	if *enablePrefixCaching && provider == providers.Anthropic {
+		fmt.Println("Prefix Caching: enabled (Anthropic)")
+	} else if provider == providers.Anthropic {
+		fmt.Println("Prefix Caching: disabled")
+	}
+	if provider == providers.Gemini {
+		if *enablePrefixCaching {
+			fmt.Println("Caching Tracking: enabled (Gemini implicit)")
+		} else {
+			fmt.Println("Caching Tracking: disabled")
+		}
+	}
 	fmt.Println(strings.Repeat("-", 60))
 
-	client := NewAnthropicClient(apiKey, *model)
+	// Create provider-specific client
+	var client providers.Client
+	switch provider {
+	case providers.Gemini:
+		client = providers.NewGeminiClient(apiKey, *model, *verbose, providers.WithGeminiCaching(*enablePrefixCaching))
+	case providers.OpenAI:
+		client = providers.NewOpenAIClient(apiKey, *model, *verbose)
+	default:
+		client = providers.NewAnthropicClient(apiKey, *model, *verbose, providers.WithPrefixCaching(*enablePrefixCaching))
+	}
 	ctx := context.Background()
 
 	// Create REPL pool if enabled
@@ -594,6 +460,7 @@ func main() {
 		Pool:          pool,
 		Compression:   *enableCompression,
 		VerbatimIters: *verbatimIters,
+		Backend:       string(provider),
 	}
 
 	var baselineResults []BenchmarkResult
@@ -615,6 +482,9 @@ func main() {
 			status = "ERROR: " + baselineResult.Error
 		}
 		fmt.Printf("    Baseline: %s (%.2fs)\n", status, baselineResult.ExecutionTime)
+		if baselineResult.CacheCreationTokens > 0 || baselineResult.CacheReadTokens > 0 {
+			fmt.Printf("      Cache: %d created, %d read\n", baselineResult.CacheCreationTokens, baselineResult.CacheReadTokens)
+		}
 		fmt.Printf("      Expected: %s\n", task.Answer)
 		fmt.Printf("      Got:      %s\n", truncate(baselineResult.Got, 100))
 
@@ -631,6 +501,9 @@ func main() {
 			status = "ERROR: " + rlmResult.Error
 		}
 		fmt.Printf("    RLM:      %s (%.2fs)\n", status, rlmResult.ExecutionTime)
+		if rlmResult.CacheCreationTokens > 0 || rlmResult.CacheReadTokens > 0 {
+			fmt.Printf("      Cache: %d created, %d read\n", rlmResult.CacheCreationTokens, rlmResult.CacheReadTokens)
+		}
 		fmt.Printf("      Expected: %s\n", task.Answer)
 		fmt.Printf("      Got:      %s\n", truncate(rlmResult.Got, 100))
 	}
@@ -655,6 +528,14 @@ func main() {
 	fmt.Printf("%-30s %12.2f %12.2f\n", "Avg Time/Task (s)", baselineSummary.AvgTimePerTask, rlmSummary.AvgTimePerTask)
 	fmt.Printf("%-30s %12d %12d\n", "Total Input Tokens", baselineSummary.TotalInputTokens, rlmSummary.TotalInputTokens)
 	fmt.Printf("%-30s %12d %12d\n", "Total Output Tokens", baselineSummary.TotalOutputTokens, rlmSummary.TotalOutputTokens)
+
+	// Show cache statistics if prefix caching is enabled
+	if *enablePrefixCaching {
+		fmt.Println(strings.Repeat("-", 60))
+		fmt.Printf("%-30s %12d %12d\n", "Cache Creation Tokens", baselineSummary.TotalCacheCreationTokens, rlmSummary.TotalCacheCreationTokens)
+		fmt.Printf("%-30s %12d %12d\n", "Cache Read Tokens", baselineSummary.TotalCacheReadTokens, rlmSummary.TotalCacheReadTokens)
+		fmt.Printf("%-30s %11.1f%% %11.1f%%\n", "Cache Hit Rate", baselineSummary.CacheHitRate*100, rlmSummary.CacheHitRate*100)
+	}
 	fmt.Println(strings.Repeat("=", 60))
 
 	// Highlight winner
@@ -672,6 +553,7 @@ func main() {
 	if *outputFile != "" {
 		output := map[string]any{
 			"model":            *model,
+			"prefix_caching":   *enablePrefixCaching,
 			"baseline_results": baselineResults,
 			"rlm_results":      rlmResults,
 			"baseline_summary": baselineSummary,

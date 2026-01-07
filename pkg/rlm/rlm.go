@@ -387,6 +387,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 
 	// Track total token usage across iterations
 	var totalPromptTokens, totalCompletionTokens int
+	var totalCacheCreationTokens, totalCacheReadTokens int
 
 	// Compute max iterations (adaptive or fixed)
 	contextSize := getContextSize(contextPayload)
@@ -433,8 +434,15 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		// Aggregate root LLM tokens
 		totalPromptTokens += llmResp.PromptTokens
 		totalCompletionTokens += llmResp.CompletionTokens
+		totalCacheCreationTokens += llmResp.CacheCreationTokens
+		totalCacheReadTokens += llmResp.CacheReadTokens
 
 		if r.config.Verbose {
+			if llmResp.CacheCreationTokens > 0 || llmResp.CacheReadTokens > 0 {
+				fmt.Printf("[RLM] Cache stats this iteration: created=%d, read=%d (totals: created=%d, read=%d)\n",
+					llmResp.CacheCreationTokens, llmResp.CacheReadTokens,
+					totalCacheCreationTokens, totalCacheReadTokens)
+			}
 			fmt.Printf("[RLM] Response: %s\n", truncate(response, 200))
 		}
 
@@ -526,9 +534,11 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 				Iterations: i + 1,
 				Duration:   time.Since(start),
 				Usage: core.UsageStats{
-					PromptTokens:     totalPromptTokens,
-					CompletionTokens: totalCompletionTokens,
-					TotalTokens:      totalPromptTokens + totalCompletionTokens,
+					PromptTokens:          totalPromptTokens,
+					CompletionTokens:      totalCompletionTokens,
+					TotalTokens:           totalPromptTokens + totalCompletionTokens,
+					CacheCreationTokens:   totalCacheCreationTokens,
+					CacheReadTokens:       totalCacheReadTokens,
 				},
 			}, nil
 		}
@@ -544,7 +554,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 				fmt.Printf("[RLM] Early termination triggered (confidence signals: %d)\n", confidenceSignals)
 			}
 			// Force immediate final answer due to high confidence
-			return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens)
+			return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens, totalCacheCreationTokens, totalCacheReadTokens)
 		}
 
 		// Append iteration results to history
@@ -557,7 +567,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 	}
 
 	// Max iterations exhausted - force final answer
-	return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens)
+	return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens, totalCacheCreationTokens, totalCacheReadTokens)
 }
 
 // buildInitialMessages creates the initial message history.
@@ -750,7 +760,7 @@ func (r *RLM) summarizeIterations(messages []core.Message, maxTokens int) string
 }
 
 // forceDefaultAnswer forces the LLM to provide a final answer.
-func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, start time.Time, promptTokens, completionTokens int) (*core.CompletionResult, error) {
+func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, start time.Time, promptTokens, completionTokens, cacheCreationTokens, cacheReadTokens int) (*core.CompletionResult, error) {
 	messages = append(messages, core.Message{
 		Role:    "user",
 		Content: DefaultAnswerPrompt,
@@ -764,6 +774,8 @@ func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, s
 	// Add tokens from this final call
 	promptTokens += llmResp.PromptTokens
 	completionTokens += llmResp.CompletionTokens
+	cacheCreationTokens += llmResp.CacheCreationTokens
+	cacheReadTokens += llmResp.CacheReadTokens
 
 	// Try to extract FINAL from response
 	answer := llmResp.Content
@@ -776,9 +788,11 @@ func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, s
 		Iterations: r.config.MaxIterations,
 		Duration:   time.Since(start),
 		Usage: core.UsageStats{
-			PromptTokens:     promptTokens,
-			CompletionTokens: completionTokens,
-			TotalTokens:      promptTokens + completionTokens,
+			PromptTokens:          promptTokens,
+			CompletionTokens:      completionTokens,
+			TotalTokens:           promptTokens + completionTokens,
+			CacheCreationTokens:   cacheCreationTokens,
+			CacheReadTokens:       cacheReadTokens,
 		},
 	}, nil
 }

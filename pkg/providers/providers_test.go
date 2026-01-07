@@ -10,6 +10,9 @@ func TestGetProvider(t *testing.T) {
 		expected Provider
 	}{
 		// Gemini models
+		{"gemini-2.5-flash", Gemini},
+		{"gemini-2.5-pro", Gemini},
+		{"gemini-2.0-flash", Gemini},
 		{"gemini-3-flash-preview", Gemini},
 		{"gemini-3-pro-preview", Gemini},
 		// OpenAI models
@@ -56,6 +59,9 @@ func TestProviderEnvKey(t *testing.T) {
 func TestSupportedModels(t *testing.T) {
 	// Verify all expected models are in the map
 	expectedModels := map[string]Provider{
+		"gemini-2.5-flash":       Gemini,
+		"gemini-2.5-pro":         Gemini,
+		"gemini-2.0-flash":       Gemini,
 		"gemini-3-flash-preview": Gemini,
 		"gemini-3-pro-preview":   Gemini,
 		"gpt-5":                  OpenAI,
@@ -91,15 +97,15 @@ func TestNewAnthropicClient(t *testing.T) {
 }
 
 func TestNewGeminiClient(t *testing.T) {
-	client := NewGeminiClient("test-key", "gemini-3-flash-preview", true)
+	client := NewGeminiClient("test-key", "gemini-2.5-flash", true)
 	if client == nil {
 		t.Fatal("NewGeminiClient returned nil")
 	}
 	if client.apiKey != "test-key" {
 		t.Errorf("apiKey = %q, want %q", client.apiKey, "test-key")
 	}
-	if client.model != "gemini-3-flash-preview" {
-		t.Errorf("model = %q, want %q", client.model, "gemini-3-flash-preview")
+	if client.model != "gemini-2.5-flash" {
+		t.Errorf("model = %q, want %q", client.model, "gemini-2.5-flash")
 	}
 	if client.verbose != true {
 		t.Error("verbose should be true")

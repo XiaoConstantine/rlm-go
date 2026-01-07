@@ -18,22 +18,46 @@ import (
 
 // AnthropicClient implements Client for Anthropic's Claude API.
 type AnthropicClient struct {
-	apiKey     string
-	model      string
-	maxTokens  int
-	httpClient *http.Client
-	verbose    bool
-	baseURL    string // For testing; defaults to Anthropic API
+	apiKey              string
+	model               string
+	maxTokens           int
+	httpClient          *http.Client
+	verbose             bool
+	baseURL             string // For testing; defaults to Anthropic API
+	enablePrefixCaching bool   // Enable Anthropic's prompt caching (default: true)
+}
+
+// AnthropicClientOption is a functional option for configuring AnthropicClient.
+type AnthropicClientOption func(*AnthropicClient)
+
+// WithPrefixCaching enables or disables Anthropic's prefix caching feature.
+func WithPrefixCaching(enabled bool) AnthropicClientOption {
+	return func(c *AnthropicClient) {
+		c.enablePrefixCaching = enabled
+	}
+}
+
+// SystemContentBlock represents a content block in the system prompt with optional cache control.
+type SystemContentBlock struct {
+	Type         string        `json:"type"`
+	Text         string        `json:"text"`
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
+}
+
+// CacheControl specifies caching behavior for a content block.
+type CacheControl struct {
+	Type string `json:"type"` // "ephemeral"
 }
 
 // NewAnthropicClient creates a new Anthropic client.
-func NewAnthropicClient(apiKey, model string, verbose bool) *AnthropicClient {
-	return &AnthropicClient{
-		apiKey:    apiKey,
-		model:     model,
-		maxTokens: 4096,
-		verbose:   verbose,
-		baseURL:   "https://api.anthropic.com",
+func NewAnthropicClient(apiKey, model string, verbose bool, opts ...AnthropicClientOption) *AnthropicClient {
+	c := &AnthropicClient{
+		apiKey:              apiKey,
+		model:               model,
+		maxTokens:           4096,
+		verbose:             verbose,
+		baseURL:             "https://api.anthropic.com",
+		enablePrefixCaching: true, // Enabled by default
 		httpClient: &http.Client{
 			Timeout: 180 * time.Second,
 			Transport: &http.Transport{
@@ -44,14 +68,18 @@ func NewAnthropicClient(apiKey, model string, verbose bool) *AnthropicClient {
 			},
 		},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 type anthropicRequest struct {
-	Model     string             `json:"model"`
-	MaxTokens int                `json:"max_tokens"`
-	Messages  []anthropicMessage `json:"messages"`
-	System    string             `json:"system,omitempty"`
-	Stream    bool               `json:"stream,omitempty"`
+	Model     string               `json:"model"`
+	MaxTokens int                  `json:"max_tokens"`
+	Messages  []anthropicMessage   `json:"messages"`
+	System    any                  `json:"system,omitempty"` // string or []SystemContentBlock
+	Stream    bool                 `json:"stream,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -65,8 +93,10 @@ type anthropicResponse struct {
 		Text string `json:"text"`
 	} `json:"content"`
 	Usage struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
@@ -91,8 +121,10 @@ type streamEvent struct {
 	} `json:"content_block,omitempty"`
 	Message struct {
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 		} `json:"usage,omitempty"`
 	} `json:"message,omitempty"`
 	Usage struct {
@@ -120,18 +152,44 @@ func (c *AnthropicClient) Complete(ctx context.Context, messages []core.Message)
 		Model:     c.model,
 		MaxTokens: c.maxTokens,
 		Messages:  apiMessages,
-		System:    systemPrompt,
+		System:    c.buildSystemPrompt(systemPrompt),
 	}
 
-	text, inputTokens, outputTokens, err := c.doRequest(ctx, reqBody)
+	text, stats, err := c.doRequest(ctx, reqBody)
 	if err != nil {
 		return core.LLMResponse{}, err
 	}
 	return core.LLMResponse{
-		Content:          text,
-		PromptTokens:     inputTokens,
-		CompletionTokens: outputTokens,
+		Content:             text,
+		PromptTokens:        stats.inputTokens,
+		CompletionTokens:    stats.outputTokens,
+		CacheCreationTokens: stats.cacheCreationTokens,
+		CacheReadTokens:     stats.cacheReadTokens,
 	}, nil
+}
+
+// buildSystemPrompt builds the system prompt with optional cache control.
+func (c *AnthropicClient) buildSystemPrompt(prompt string) any {
+	if prompt == "" {
+		return nil
+	}
+	if !c.enablePrefixCaching {
+		return prompt
+	}
+	return []SystemContentBlock{
+		{
+			Type: "text",
+			Text: prompt,
+			CacheControl: &CacheControl{
+				Type: "ephemeral",
+			},
+		},
+	}
+}
+
+// Model returns the model name used by this client.
+func (c *AnthropicClient) Model() string {
+	return c.model
 }
 
 // Query implements repl.LLMClient for sub-LLM calls from REPL.
@@ -144,11 +202,11 @@ func (c *AnthropicClient) Query(ctx context.Context, prompt string) (repl.QueryR
 		},
 	}
 
-	text, inputTokens, outputTokens, err := c.doRequest(ctx, reqBody)
+	text, stats, err := c.doRequest(ctx, reqBody)
 	return repl.QueryResponse{
 		Response:         text,
-		PromptTokens:     inputTokens,
-		CompletionTokens: outputTokens,
+		PromptTokens:     stats.inputTokens,
+		CompletionTokens: stats.outputTokens,
 	}, err
 }
 
@@ -174,50 +232,67 @@ func (c *AnthropicClient) QueryBatched(ctx context.Context, prompts []string) ([
 	return results, nil
 }
 
-func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicRequest) (string, int, int, error) {
+type requestStats struct {
+	inputTokens         int
+	outputTokens        int
+	cacheCreationTokens int
+	cacheReadTokens     int
+}
+
+func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicRequest) (string, requestStats, error) {
 	start := time.Now()
+	empty := requestStats{}
 
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("marshal request: %w", err)
+		return "", empty, fmt.Errorf("marshal request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/messages", bytes.NewReader(jsonBody))
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("create request: %w", err)
+		return "", empty, fmt.Errorf("create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", c.apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
+	if c.enablePrefixCaching {
+		req.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("http request: %w", err)
+		return "", empty, fmt.Errorf("http request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("read response: %w", err)
+		return "", empty, fmt.Errorf("read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, 0, fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(body))
+		return "", empty, fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(body))
 	}
 
 	var apiResp anthropicResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return "", 0, 0, fmt.Errorf("unmarshal response: %w", err)
+		return "", empty, fmt.Errorf("unmarshal response: %w", err)
 	}
 
 	if c.verbose {
-		fmt.Printf("  [API] %v, tokens: %d→%d\n",
-			time.Since(start), apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens)
+		if c.enablePrefixCaching && (apiResp.Usage.CacheCreationInputTokens > 0 || apiResp.Usage.CacheReadInputTokens > 0) {
+			fmt.Printf("  [API] %v, tokens: %d→%d (cache: +%d created, %d read)\n",
+				time.Since(start), apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens,
+				apiResp.Usage.CacheCreationInputTokens, apiResp.Usage.CacheReadInputTokens)
+		} else {
+			fmt.Printf("  [API] %v, tokens: %d→%d\n",
+				time.Since(start), apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens)
+		}
 	}
 
 	if apiResp.Error != nil {
-		return "", 0, 0, fmt.Errorf("api error: %s", apiResp.Error.Message)
+		return "", empty, fmt.Errorf("api error: %s", apiResp.Error.Message)
 	}
 
 	var texts []string
@@ -227,7 +302,13 @@ func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicReques
 		}
 	}
 
-	return strings.Join(texts, ""), apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens, nil
+	stats := requestStats{
+		inputTokens:         apiResp.Usage.InputTokens,
+		outputTokens:        apiResp.Usage.OutputTokens,
+		cacheCreationTokens: apiResp.Usage.CacheCreationInputTokens,
+		cacheReadTokens:     apiResp.Usage.CacheReadInputTokens,
+	}
+	return strings.Join(texts, ""), stats, nil
 }
 
 // CompleteStream performs a streaming completion request.
@@ -252,7 +333,7 @@ func (c *AnthropicClient) CompleteStream(ctx context.Context, messages []core.Me
 		Model:     c.model,
 		MaxTokens: c.maxTokens,
 		Messages:  apiMessages,
-		System:    systemPrompt,
+		System:    c.buildSystemPrompt(systemPrompt),
 		Stream:    true,
 	}
 
@@ -275,6 +356,9 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, reqBody anthropic
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", c.apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
+	if c.enablePrefixCaching {
+		req.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -290,6 +374,7 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, reqBody anthropic
 	// Parse SSE stream
 	var fullContent strings.Builder
 	var inputTokens, outputTokens int
+	var cacheCreationTokens, cacheReadTokens int
 
 	scanner := bufio.NewScanner(resp.Body)
 	// Increase buffer size for potentially large events
@@ -323,8 +408,10 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, reqBody anthropic
 
 		switch event.Type {
 		case "message_start":
-			// Initial message with input token count
+			// Initial message with input token count and cache stats
 			inputTokens = event.Message.Usage.InputTokens
+			cacheCreationTokens = event.Message.Usage.CacheCreationInputTokens
+			cacheReadTokens = event.Message.Usage.CacheReadInputTokens
 
 		case "content_block_delta":
 			// Content delta - text chunk
@@ -359,8 +446,13 @@ func (c *AnthropicClient) doStreamRequest(ctx context.Context, reqBody anthropic
 	}
 
 	if c.verbose {
-		fmt.Printf("  [API Stream] %v, tokens: %d→%d\n",
-			time.Since(start), inputTokens, outputTokens)
+		if c.enablePrefixCaching && (cacheCreationTokens > 0 || cacheReadTokens > 0) {
+			fmt.Printf("  [API Stream] %v, tokens: %d→%d (cache: +%d created, %d read)\n",
+				time.Since(start), inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens)
+		} else {
+			fmt.Printf("  [API Stream] %v, tokens: %d→%d\n",
+				time.Since(start), inputTokens, outputTokens)
+		}
 	}
 
 	return core.LLMResponse{

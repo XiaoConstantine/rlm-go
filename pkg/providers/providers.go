@@ -24,6 +24,9 @@ type Client interface {
 // SupportedModels maps model names to their providers.
 var SupportedModels = map[string]Provider{
 	// Gemini models
+	"gemini-2.5-flash":       Gemini,
+	"gemini-2.5-pro":         Gemini,
+	"gemini-2.0-flash":       Gemini,
 	"gemini-3-flash-preview": Gemini,
 	"gemini-3-pro-preview":   Gemini,
 	// OpenAI models

@@ -46,16 +46,20 @@ type Message struct {
 
 // UsageStats tracks token usage.
 type UsageStats struct {
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
+	PromptTokens          int
+	CompletionTokens      int
+	TotalTokens           int
+	CacheCreationTokens   int
+	CacheReadTokens       int
 }
 
 // LLMResponse represents the response from an LLM call with usage metadata.
 type LLMResponse struct {
-	Content          string
-	PromptTokens     int
-	CompletionTokens int
+	Content               string
+	PromptTokens          int
+	CompletionTokens      int
+	CacheCreationTokens   int
+	CacheReadTokens       int
 }
 
 // CompletionResult represents the final result of an RLM completion.
