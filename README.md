@@ -30,6 +30,7 @@ The result is ~100x less latency per sub-LLM call compared to socket IPC.
   - `ANTHROPIC_API_KEY` for Claude models (default)
   - `GEMINI_API_KEY` for Gemini models
   - `OPENAI_API_KEY` for OpenAI models
+- (Optional) Podman or Docker for isolated sandbox execution
 
 ## Supported Models
 
@@ -222,8 +223,35 @@ fmt, strings, regexp
 Query(prompt string) string              // Single sub-LLM call
 QueryBatched(prompts []string) []string  // Concurrent sub-LLM calls
 
+// Multi-depth recursion (when enabled)
+QueryWithRLM(prompt string, depth int) string  // Spawn nested RLM
+CurrentDepth() int                              // Get current recursion depth
+MaxDepth() int                                  // Get max allowed depth
+CanRecurse() bool                               // Check if more recursion allowed
+
 // Your context
 context  // string variable with your data
+```
+
+### Multi-Depth Recursion
+
+Enable sub-LLMs to spawn their own sub-LLMs for complex decomposition tasks:
+
+```go
+r := rlm.New(client, replClient,
+    rlm.WithMaxRecursionDepth(3),  // Allow 3 levels of nesting
+    rlm.WithRecursionCallback(func(depth int, prompt string) {
+        log.Printf("Recursive call at depth %d", depth)
+    }),
+)
+```
+
+In the REPL, use `QueryWithRLM()` to spawn a nested RLM that can itself use `Query()`:
+```go
+// Depth 0 (root)
+result := QueryWithRLM("Analyze each section in detail", 1)
+
+// The sub-RLM (depth 1) can use Query() or QueryWithRLM() up to MaxDepth
 ```
 
 ## Configuration
@@ -235,6 +263,93 @@ rlm.New(client, replClient,
     rlm.WithVerbose(true),          // Enable console logging
     rlm.WithLogger(logger),         // Attach JSONL logger for session recording
 )
+```
+
+## Sandbox Execution (Podman/Docker)
+
+By default, rlm-go executes LLM-generated code in-process using Yaegi for maximum performance. For production environments or when running untrusted code, you can enable isolated sandbox execution using Podman (recommended) or Docker.
+
+### Why Sandbox?
+
+| Mode | Isolation | Latency | Security |
+|------|-----------|---------|----------|
+| Local (default) | None | ~0ms | Trusted code only |
+| Podman/Docker | Full container | 50-200ms | Untrusted code safe |
+
+### Setup
+
+**Podman (Recommended - Open Source, Daemonless)**
+```bash
+# macOS
+brew install podman
+podman machine init
+podman machine start
+
+# Linux (Fedora/RHEL)
+sudo dnf install podman
+
+# Linux (Ubuntu/Debian)
+sudo apt install podman
+```
+
+**Docker (Alternative)**
+```bash
+# macOS
+brew install --cask docker
+# Start Docker Desktop
+
+# Linux
+sudo apt install docker.io
+sudo systemctl start docker
+```
+
+### Usage
+
+```go
+import (
+    "github.com/XiaoConstantine/rlm-go/pkg/rlm"
+    "github.com/XiaoConstantine/rlm-go/pkg/sandbox"
+)
+
+// Auto-detect best available backend (podman > docker > local)
+r := rlm.New(client, replClient, rlm.WithSandbox())
+
+// Use specific backend
+r := rlm.New(client, replClient,
+    rlm.WithSandboxBackend(sandbox.BackendPodman))
+
+// Custom configuration
+cfg := sandbox.Config{
+    Backend:     sandbox.BackendPodman,
+    Image:       "golang:1.23-alpine",  // Container image
+    Memory:      "512m",                // Memory limit
+    CPUs:        1.0,                   // CPU limit
+    Timeout:     60 * time.Second,      // Execution timeout
+    NetworkMode: sandbox.NetworkNone,   // Disable network (secure)
+}
+r := rlm.New(client, replClient, rlm.WithSandboxConfig(cfg))
+```
+
+### Container Behavior
+
+When sandbox mode is enabled:
+- Code runs in an isolated container with resource limits
+- Network is disabled by default (`--network=none`)
+- Containers are auto-removed after execution (`--rm`)
+- `Query()` and `QueryBatched()` work via JSON IPC protocol
+- First execution pulls the Go image (~250MB, cached after)
+
+### Verifying Setup
+
+```bash
+# Check if Podman/Docker is available
+podman --version  # or: docker --version
+
+# Test container execution
+podman run --rm golang:1.23-alpine go version
+
+# Run sandbox tests
+go test ./pkg/sandbox/... -v -run TestContainer
 ```
 
 ## Token Tracking
@@ -325,6 +440,7 @@ rlm-go/
 │   ├── core/      # Core types (Message, CompletionResult, UsageStats)
 │   ├── rlm/       # Main RLM orchestration engine
 │   ├── repl/      # Yaegi-based Go interpreter
+│   ├── sandbox/   # Isolated execution (Podman/Docker)
 │   ├── parsing/   # LLM response parsing utilities
 │   └── logger/    # JSONL session logging
 ├── cmd/

@@ -9,6 +9,7 @@ import (
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
 	"github.com/XiaoConstantine/rlm-go/pkg/repl"
+	"github.com/XiaoConstantine/rlm-go/pkg/sandbox"
 )
 
 // mockLLMClient implements LLMClient for testing the root LLM
@@ -1525,5 +1526,161 @@ func TestCompleteWithAdaptiveIterationAndLargeContext(t *testing.T) {
 	// 10 + 300000/100000 = 13
 	if maxIterationsUsed < 10 {
 		t.Errorf("maxIterationsUsed = %d, expected >= 10", maxIterationsUsed)
+	}
+}
+
+// Sandbox integration tests
+
+func TestWithSandbox(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithSandbox())
+
+	if rlm.config.Sandbox == nil {
+		t.Fatal("expected Sandbox config to be set")
+	}
+	if !rlm.config.Sandbox.Enabled {
+		t.Error("expected Sandbox.Enabled to be true")
+	}
+	if rlm.config.Sandbox.Config == nil {
+		t.Error("expected Sandbox.Config to be set")
+	}
+	if rlm.config.Sandbox.Config.Backend != sandbox.BackendAuto {
+		t.Errorf("expected BackendAuto, got %s", rlm.config.Sandbox.Config.Backend)
+	}
+}
+
+func TestWithSandboxConfig(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	cfg := sandbox.Config{
+		Backend: sandbox.BackendLocal,
+		Memory:  "256m",
+		CPUs:    0.5,
+	}
+
+	rlm := New(client, replClient, WithSandboxConfig(cfg))
+
+	if rlm.config.Sandbox == nil {
+		t.Fatal("expected Sandbox config to be set")
+	}
+	if rlm.config.Sandbox.Config.Backend != sandbox.BackendLocal {
+		t.Errorf("expected BackendLocal, got %s", rlm.config.Sandbox.Config.Backend)
+	}
+	if rlm.config.Sandbox.Config.Memory != "256m" {
+		t.Errorf("expected 256m, got %s", rlm.config.Sandbox.Config.Memory)
+	}
+	if rlm.config.Sandbox.Config.CPUs != 0.5 {
+		t.Errorf("expected 0.5, got %f", rlm.config.Sandbox.Config.CPUs)
+	}
+}
+
+func TestWithSandboxBackend(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithSandboxBackend(sandbox.BackendLocal))
+
+	if rlm.config.Sandbox == nil {
+		t.Fatal("expected Sandbox config to be set")
+	}
+	if rlm.config.Sandbox.Config.Backend != sandbox.BackendLocal {
+		t.Errorf("expected BackendLocal, got %s", rlm.config.Sandbox.Config.Backend)
+	}
+}
+
+func TestCompleteWithSandboxLocal(t *testing.T) {
+	// Test Complete with local sandbox (no container runtime needed)
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{Content: "FINAL(sandbox result)", PromptTokens: 10, CompletionTokens: 5}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithSandboxBackend(sandbox.BackendLocal))
+
+	result, err := rlm.Complete(context.Background(), "test context", "What is the answer?")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+
+	if result.Response != "sandbox result" {
+		t.Errorf("Response = %q, want %q", result.Response, "sandbox result")
+	}
+}
+
+func TestCompleteWithSandboxAndCodeExecution(t *testing.T) {
+	// Test that code execution works in sandbox mode
+	callCount := 0
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			callCount++
+			if callCount == 1 {
+				// First call: return code block
+				return core.LLMResponse{
+					Content: "```go\nfmt.Println(\"Hello from sandbox\")\n```",
+					PromptTokens: 10,
+					CompletionTokens: 20,
+				}, nil
+			}
+			// Second call: return final answer
+			return core.LLMResponse{Content: "FINAL(executed)", PromptTokens: 10, CompletionTokens: 5}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithSandboxBackend(sandbox.BackendLocal))
+
+	result, err := rlm.Complete(context.Background(), "test context", "Run some code")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+
+	if result.Response != "executed" {
+		t.Errorf("Response = %q, want %q", result.Response, "executed")
+	}
+	if result.Iterations != 2 {
+		t.Errorf("Iterations = %d, want 2", result.Iterations)
+	}
+}
+
+func TestCreateExecutionEnvironmentWithSandbox(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	// Test with sandbox enabled
+	rlm := New(client, replClient, WithSandboxBackend(sandbox.BackendLocal))
+
+	env, err := rlm.createExecutionEnvironment()
+	if err != nil {
+		t.Fatalf("createExecutionEnvironment() error: %v", err)
+	}
+	defer env.Close()
+
+	// Verify it's a sandbox adapter
+	if _, ok := env.(*SandboxAdapter); !ok {
+		t.Errorf("expected *SandboxAdapter, got %T", env)
+	}
+}
+
+func TestCreateExecutionEnvironmentWithoutSandbox(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	// Test without sandbox (default behavior)
+	rlm := New(client, replClient)
+
+	env, err := rlm.createExecutionEnvironment()
+	if err != nil {
+		t.Fatalf("createExecutionEnvironment() error: %v", err)
+	}
+	defer env.Close()
+
+	// Verify it's a REPL adapter
+	if _, ok := env.(*REPLAdapter); !ok {
+		t.Errorf("expected *REPLAdapter, got %T", env)
 	}
 }

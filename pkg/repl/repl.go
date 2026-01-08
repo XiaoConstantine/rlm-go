@@ -151,6 +151,8 @@ type REPL struct {
 	usePooling   bool      // Whether to use pooling for this REPL
 	asyncQueries map[string]*AsyncQueryHandle
 	asyncMu      sync.RWMutex
+	execCount    int  // Track number of executions for health monitoring
+	needsReset   bool // Flag indicating interpreter corruption detected
 }
 
 // REPLOption configures a REPL instance.
@@ -636,6 +638,7 @@ func (r *REPL) SetContext(ctx context.Context) {
 }
 
 // Execute runs Go code in the interpreter and returns the result.
+// This function includes panic recovery for Yaegi interpreter crashes.
 func (r *REPL) Execute(ctx context.Context, code string) (*core.ExecutionResult, error) {
 	r.mu.Lock()
 	// Set context for LLM calls
@@ -644,12 +647,26 @@ func (r *REPL) Execute(ctx context.Context, code string) (*core.ExecutionResult,
 	// Reset buffers
 	r.stdout.Reset()
 	r.stderr.Reset()
+
+	// Track execution count for interpreter health
+	r.execCount++
+	execCount := r.execCount
 	r.mu.Unlock() // Release lock before executing code (allows LLM calls to proceed)
 
 	start := time.Now()
 
-	// Execute the code (may call llmQuery which doesn't need lock)
-	_, err := r.interp.Eval(code)
+	// Execute the code with panic recovery (Yaegi can crash on certain patterns)
+	var evalErr error
+	var panicErr error
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				panicErr = fmt.Errorf("interpreter panic (after %d executions): %v", execCount, rec)
+			}
+		}()
+		// Execute the code (may call llmQuery which doesn't need lock)
+		_, evalErr = r.interp.Eval(code)
+	}()
 
 	r.mu.Lock()
 	result := &core.ExecutionResult{
@@ -659,12 +676,25 @@ func (r *REPL) Execute(ctx context.Context, code string) (*core.ExecutionResult,
 	}
 	r.mu.Unlock()
 
-	if err != nil {
+	// Handle panic - interpreter is likely corrupted
+	if panicErr != nil {
+		if result.Stderr != "" {
+			result.Stderr += "\n"
+		}
+		result.Stderr += panicErr.Error()
+		// Mark interpreter as needing reset
+		r.mu.Lock()
+		r.needsReset = true
+		r.mu.Unlock()
+		return result, panicErr
+	}
+
+	if evalErr != nil {
 		// Append error to stderr
 		if result.Stderr != "" {
 			result.Stderr += "\n"
 		}
-		result.Stderr += err.Error()
+		result.Stderr += evalErr.Error()
 	}
 
 	return result, nil // We don't return error - execution errors go to stderr
@@ -696,6 +726,8 @@ func (r *REPL) Reset() error {
 	r.stdout.Reset()
 	r.stderr.Reset()
 	r.llmCalls = nil
+	r.execCount = 0
+	r.needsReset = false
 
 	// Create a fresh interpreter
 	i := interp.New(interp.Options{
@@ -710,6 +742,34 @@ func (r *REPL) Reset() error {
 	r.interp = i
 
 	return r.injectBuiltins()
+}
+
+// NeedsReset returns true if the interpreter has detected corruption.
+func (r *REPL) NeedsReset() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.needsReset
+}
+
+// ExecutionCount returns the number of code executions since last reset.
+func (r *REPL) ExecutionCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.execCount
+}
+
+// ResetIfNeeded resets the interpreter if corruption was detected.
+// Returns true if a reset was performed.
+func (r *REPL) ResetIfNeeded() (bool, error) {
+	r.mu.Lock()
+	needsReset := r.needsReset
+	r.mu.Unlock()
+
+	if !needsReset {
+		return false, nil
+	}
+
+	return true, r.Reset()
 }
 
 // GetLLMCalls returns and clears the recorded LLM calls.

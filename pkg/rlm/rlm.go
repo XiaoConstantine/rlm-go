@@ -10,6 +10,7 @@ import (
 	"github.com/XiaoConstantine/rlm-go/pkg/logger"
 	"github.com/XiaoConstantine/rlm-go/pkg/parsing"
 	"github.com/XiaoConstantine/rlm-go/pkg/repl"
+	"github.com/XiaoConstantine/rlm-go/pkg/sandbox"
 )
 
 // LLMClient defines the interface for the root LLM.
@@ -71,6 +72,21 @@ type Config struct {
 	// Recursion configures multi-depth recursion behavior.
 	// When enabled, sub-LLMs can spawn their own sub-LLMs.
 	Recursion *RecursionConfig
+
+	// Sandbox configures isolated execution for code blocks.
+	// When enabled, code runs in Podman/Docker containers instead of in-process.
+	// This provides better security isolation at the cost of execution speed.
+	Sandbox *SandboxConfig
+}
+
+// SandboxConfig configures sandboxed code execution.
+type SandboxConfig struct {
+	// Enabled turns on sandbox execution (default: false).
+	Enabled bool
+
+	// Config contains the detailed sandbox configuration.
+	// If nil when Enabled is true, DefaultConfig() is used.
+	Config *sandbox.Config
 }
 
 // HistoryCompressionConfig configures how message history is compressed.
@@ -329,6 +345,43 @@ func WithRecursionCallback(callback func(depth int, prompt string)) Option {
 	}
 }
 
+// WithSandbox enables sandboxed code execution using Podman (preferred) or Docker.
+// This provides better security isolation at the cost of execution speed.
+// Uses default sandbox configuration (auto-detect runtime, 512MB memory, 60s timeout).
+func WithSandbox() Option {
+	return func(c *Config) {
+		cfg := sandbox.DefaultConfig()
+		c.Sandbox = &SandboxConfig{
+			Enabled: true,
+			Config:  &cfg,
+		}
+	}
+}
+
+// WithSandboxConfig enables sandboxed code execution with custom configuration.
+// Allows fine-grained control over the sandbox environment.
+func WithSandboxConfig(cfg sandbox.Config) Option {
+	return func(c *Config) {
+		c.Sandbox = &SandboxConfig{
+			Enabled: true,
+			Config:  &cfg,
+		}
+	}
+}
+
+// WithSandboxBackend enables sandboxed execution with a specific backend.
+// Supported backends: sandbox.BackendPodman, sandbox.BackendDocker, sandbox.BackendAuto.
+func WithSandboxBackend(backend sandbox.Backend) Option {
+	return func(c *Config) {
+		cfg := sandbox.DefaultConfig()
+		cfg.Backend = backend
+		c.Sandbox = &SandboxConfig{
+			Enabled: true,
+			Config:  &cfg,
+		}
+	}
+}
+
 // confidencePhrases are phrases that indicate the model is confident in its answer.
 var confidencePhrases = []string{
 	"i'm confident",
@@ -411,32 +464,20 @@ func (r *RLM) shouldTerminateEarly(confidenceSignals, pendingCodeBlocks int) boo
 func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*core.CompletionResult, error) {
 	start := time.Now()
 
-	// Create or acquire REPL environment
-	var replEnv *repl.REPL
-	var returnToPool bool
-	if r.config.REPLPool != nil {
-		replEnv = r.config.REPLPool.Get()
-		returnToPool = true
-	} else {
-		replEnv = repl.New(r.replClient)
+	// Create execution environment (REPL or sandbox based on config)
+	execEnv, err := r.createExecutionEnvironment()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create execution environment: %w", err)
 	}
+	defer execEnv.Close()
 
-	// Ensure REPL is returned to pool on function exit
-	defer func() {
-		if returnToPool && r.config.REPLPool != nil {
-			r.config.REPLPool.Put(replEnv)
-		} else {
-			replEnv.Close()
-		}
-	}()
-
-	// Load context into REPL
-	if err := replEnv.LoadContext(contextPayload); err != nil {
+	// Load context into execution environment
+	if err := execEnv.LoadContext(contextPayload); err != nil {
 		return nil, fmt.Errorf("failed to load context: %w", err)
 	}
 
 	// Build initial message history
-	messages := r.buildInitialMessages(replEnv, query)
+	messages := r.buildInitialMessagesFromEnv(execEnv, query)
 
 	// Track total token usage across iterations
 	var totalPromptTokens, totalCompletionTokens int
@@ -508,7 +549,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 				fmt.Printf("[RLM] Executing code:\n%s\n", truncate(code, 200))
 			}
 
-			result, _ := replEnv.Execute(ctx, code)
+			result, _ := execEnv.Execute(ctx, code)
 			execResults = append(execResults, core.CodeBlock{
 				Code:   code,
 				Result: *result,
@@ -522,23 +563,17 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 			}
 		}
 
-		// Get RLM calls made during code execution and aggregate tokens
-		var rlmCalls []logger.RLMCallEntry
-		for _, call := range replEnv.GetLLMCalls() {
-			rlmCalls = append(rlmCalls, logger.RLMCallEntry{
-				Prompt:           call.Prompt,
-				Response:         call.Response,
-				PromptTokens:     call.PromptTokens,
-				CompletionTokens: call.CompletionTokens,
-				ExecutionTime:    call.Duration,
-			})
+		// Get LLM calls made during code execution and aggregate tokens
+		llmCalls := execEnv.GetLLMCalls()
+		rlmCalls := convertCallsToLoggerEntries(llmCalls)
+		for _, call := range llmCalls {
 			// Aggregate token usage
 			totalPromptTokens += call.PromptTokens
 			totalCompletionTokens += call.CompletionTokens
 		}
 
-		// Get locals from REPL for logging
-		locals := replEnv.GetLocals()
+		// Get locals from execution environment for logging
+		locals := execEnv.GetLocals()
 
 		// Detect confidence signals for adaptive early termination
 		if detectConfidence(response) {
@@ -561,7 +596,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 
 			// Resolve variable if FINAL_VAR
 			if final.Type == core.FinalTypeVariable {
-				resolved, err := replEnv.GetVariable(varName)
+				resolved, err := execEnv.GetVariable(varName)
 				if err != nil {
 					if r.config.Verbose {
 						fmt.Printf("[RLM] Warning: could not resolve variable %q: %v\n", varName, err)
@@ -634,6 +669,17 @@ func (r *RLM) buildInitialMessages(replEnv *repl.REPL, query string) []core.Mess
 	}
 }
 
+// buildInitialMessagesFromEnv creates the initial message history using the ExecutionEnvironment interface.
+func (r *RLM) buildInitialMessagesFromEnv(execEnv ExecutionEnvironment, query string) []core.Message {
+	contextInfo := execEnv.ContextInfo()
+	userPrompt := fmt.Sprintf(UserPromptTemplate, contextInfo, query) + FirstIterationSuffix
+
+	return []core.Message{
+		{Role: "system", Content: r.config.SystemPrompt},
+		{Role: "user", Content: userPrompt},
+	}
+}
+
 // appendIterationPrompt adds the appropriate user prompt for the current iteration.
 func (r *RLM) appendIterationPrompt(messages []core.Message, iteration int, query string) []core.Message {
 	if iteration == 0 {
@@ -661,7 +707,7 @@ func (r *RLM) appendIterationToHistory(messages []core.Message, response string,
 		content := fmt.Sprintf(
 			"Code executed:\n```go\n%s\n```\n\nREPL output:\n%s",
 			block.Code,
-			repl.FormatExecutionResult(&block.Result),
+			sandbox.FormatExecutionResult(&block.Result),
 		)
 		messages = append(messages, core.Message{
 			Role:    "user",
