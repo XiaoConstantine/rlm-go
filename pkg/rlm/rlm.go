@@ -543,13 +543,34 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		// Extract and execute code blocks
 		codeBlocks := parsing.FindCodeBlocks(response)
 		var execResults []core.CodeBlock
+		var interpreterPanic bool
 
 		for _, code := range codeBlocks {
 			if r.config.Verbose {
 				fmt.Printf("[RLM] Executing code:\n%s\n", truncate(code, 200))
 			}
 
-			result, _ := execEnv.Execute(ctx, code)
+			result, execErr := execEnv.Execute(ctx, code)
+			if execErr != nil {
+				// Interpreter panic detected - log and attempt recovery
+				if r.config.Verbose {
+					fmt.Printf("[RLM] Interpreter error: %v\n", execErr)
+				}
+				interpreterPanic = true
+				// Try to reset the interpreter for subsequent code blocks
+				if resetter, ok := execEnv.(interface{ ResetIfNeeded() (bool, error) }); ok {
+					if reset, resetErr := resetter.ResetIfNeeded(); reset {
+						if r.config.Verbose {
+							if resetErr != nil {
+								fmt.Printf("[RLM] Interpreter reset failed: %v\n", resetErr)
+							} else {
+								fmt.Printf("[RLM] Interpreter reset successful\n")
+							}
+						}
+					}
+				}
+			}
+
 			execResults = append(execResults, core.CodeBlock{
 				Code:   code,
 				Result: *result,
@@ -561,6 +582,15 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 			if r.config.Verbose && result.Stderr != "" {
 				fmt.Printf("[RLM] Stderr: %s\n", truncate(result.Stderr, 200))
 			}
+		}
+
+		// If interpreter panic occurred, we may need to reload context
+		if interpreterPanic {
+			if r.config.Verbose {
+				fmt.Printf("[RLM] Reloading context after interpreter reset\n")
+			}
+			// Attempt to reload context (may fail if interpreter is still broken)
+			_ = execEnv.LoadContext(contextPayload)
 		}
 
 		// Get LLM calls made during code execution and aggregate tokens

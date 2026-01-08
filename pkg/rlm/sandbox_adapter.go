@@ -102,6 +102,11 @@ func (a *REPLAdapter) Close() {
 	a.repl.Close()
 }
 
+// ResetIfNeeded resets the interpreter if corruption was detected.
+func (a *REPLAdapter) ResetIfNeeded() (bool, error) {
+	return a.repl.ResetIfNeeded()
+}
+
 // SandboxAdapter adapts a sandbox.Executor to the ExecutionEnvironment interface.
 type SandboxAdapter struct {
 	executor sandbox.Executor
