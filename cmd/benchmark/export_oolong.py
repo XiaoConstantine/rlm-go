@@ -1,18 +1,19 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "datasets",
+# ]
+# ///
 """Export OOLONG dataset to JSON for Go benchmark."""
 
 import json
 import sys
-from pathlib import Path
+
+from datasets import load_dataset  # noqa: E402 - managed by uv
 
 
 def main():
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        print("Error: datasets library not installed")
-        print("Install with: pip install datasets")
-        sys.exit(1)
 
     num_tasks = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     output_file = sys.argv[2] if len(sys.argv) > 2 else "oolong_tasks.json"

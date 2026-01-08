@@ -21,8 +21,8 @@ func TestGeminiClient_Complete_Success(t *testing.T) {
 		if !strings.Contains(r.URL.Path, "/v1beta/models/") {
 			t.Errorf("Expected /v1beta/models/ in path, got %s", r.URL.Path)
 		}
-		if !strings.Contains(r.URL.RawQuery, "key=test-key") {
-			t.Errorf("Expected key=test-key in query, got %s", r.URL.RawQuery)
+		if r.Header.Get("x-goog-api-key") != "test-key" {
+			t.Errorf("Expected x-goog-api-key header to be test-key, got %s", r.Header.Get("x-goog-api-key"))
 		}
 
 		var req geminiRequest

@@ -209,13 +209,14 @@ func (c *GeminiClient) doRequest(ctx context.Context, reqBody geminiRequest) (st
 		return "", empty, fmt.Errorf("marshal request: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent?key=%s", c.baseURL, c.model, c.apiKey)
+	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent", c.baseURL, c.model)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
 	if err != nil {
 		return "", empty, fmt.Errorf("create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", c.apiKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -335,13 +336,14 @@ func (c *GeminiClient) doStreamRequest(ctx context.Context, reqBody geminiReques
 		return core.LLMResponse{}, fmt.Errorf("marshal request: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s", c.baseURL, c.model, c.apiKey)
+	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", c.baseURL, c.model)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
 	if err != nil {
 		return core.LLMResponse{}, fmt.Errorf("create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", c.apiKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -356,6 +358,7 @@ func (c *GeminiClient) doStreamRequest(ctx context.Context, reqBody geminiReques
 
 	var fullContent strings.Builder
 	var promptTokens, completionTokens, cachedContentTokens int
+	var streamCompleted bool
 
 	scanner := bufio.NewScanner(resp.Body)
 	buf := make([]byte, 0, 64*1024)
@@ -410,13 +413,30 @@ func (c *GeminiClient) doStreamRequest(ctx context.Context, reqBody geminiReques
 		if chunk.UsageMetadata.CachedContentTokenCount > 0 {
 			cachedContentTokens = chunk.UsageMetadata.CachedContentTokenCount
 		}
+
+		// Check for stream completion signal from Gemini
+		for _, candidate := range chunk.Candidates {
+			if candidate.FinishReason == "STOP" || candidate.FinishReason == "MAX_TOKENS" ||
+				candidate.FinishReason == "SAFETY" || candidate.FinishReason == "RECITATION" {
+				// Stream complete - signal handler and exit loop
+				streamCompleted = true
+				if handler != nil {
+					if err := handler("", true); err != nil {
+						return core.LLMResponse{}, fmt.Errorf("handler error: %w", err)
+					}
+				}
+				goto streamDone
+			}
+		}
 	}
 
+streamDone:
 	if err := scanner.Err(); err != nil {
 		return core.LLMResponse{}, fmt.Errorf("scanner error: %w", err)
 	}
 
-	if handler != nil {
+	// Only call handler if we didn't already signal completion via finishReason
+	if handler != nil && !streamCompleted {
 		if err := handler("", true); err != nil {
 			return core.LLMResponse{}, fmt.Errorf("handler error: %w", err)
 		}

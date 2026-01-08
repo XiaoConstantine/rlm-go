@@ -4,7 +4,6 @@ package benchmark
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -189,8 +188,8 @@ func TestStreamingVsNonStreaming(t *testing.T) {
 	avgFirstChunk := avgDuration(firstChunkTimes)
 
 	t.Logf("\n=== Streaming vs Non-Streaming ===")
-	t.Logf("Non-streaming avg: %v", avgNonStreaming)
-	t.Logf("Streaming avg:     %v", avgStreaming)
+	t.Logf("Non-streaming avg: %v (tokens: %v)", avgNonStreaming, nonStreamingTokens)
+	t.Logf("Streaming avg:     %v (tokens: %v)", avgStreaming, streamingTokens)
 	t.Logf("First chunk avg:   %v", avgFirstChunk)
 	if avgNonStreaming > 0 {
 		improvement := float64(avgNonStreaming-avgFirstChunk) / float64(avgNonStreaming) * 100
@@ -364,6 +363,7 @@ func TestGeminiImplicitCaching(t *testing.T) {
 	}
 
 	t.Logf("\n=== Gemini Implicit Caching ===")
+	t.Logf("Total tokens across runs: %v", totalTokens)
 	t.Logf("Cache read tokens across runs: %v", cacheReadTokens)
 	t.Logf("Timing across runs: %v", timings)
 
@@ -740,13 +740,13 @@ func TestIdentifyBottlenecks(t *testing.T) {
 	execTimes := make([]time.Duration, 5)
 	for i := 0; i < 5; i++ {
 		start := time.Now()
-		code := fmt.Sprintf(`
+		code := `
 			sum := 0
 			for j := 0; j < 1000; j++ {
 				sum += j
 			}
 			fmt.Println(sum)
-		`)
+		`
 		_, _ = r.Execute(context.Background(), code)
 		execTimes[i] = time.Since(start)
 	}

@@ -198,13 +198,18 @@ func runBaseline(ctx context.Context, task Task, client providers.Client) Benchm
 
 // RLMOptions holds configuration for RLM runs.
 type RLMOptions struct {
-	LogDir        string
-	Verbose       bool
-	Streaming     bool
-	Pool          *repl.REPLPool
-	Compression   bool
-	VerbatimIters int
-	Backend       string
+	LogDir         string
+	Verbose        bool
+	Streaming      bool
+	Pool           *repl.REPLPool
+	Compression    bool
+	VerbatimIters  int
+	Backend        string
+	Adaptive       bool
+	BaseIters      int
+	MaxIters       int
+	EarlyTerminate bool
+	RecursionDepth int
 }
 
 // ModelClient is an interface for clients that expose their model name.
@@ -240,7 +245,7 @@ func runRLM(ctx context.Context, task Task, client providers.Client, opts RLMOpt
 
 	// Build RLM options
 	rlmOpts := []rlm.Option{
-		rlm.WithMaxIterations(30),
+		rlm.WithMaxIterations(opts.MaxIters),
 		rlm.WithVerbose(opts.Verbose),
 		rlm.WithLogger(log),
 	}
@@ -255,6 +260,21 @@ func runRLM(ctx context.Context, task Task, client providers.Client, opts RLMOpt
 
 	if opts.Compression {
 		rlmOpts = append(rlmOpts, rlm.WithHistoryCompression(opts.VerbatimIters, 500))
+	}
+
+	if opts.Adaptive {
+		rlmOpts = append(rlmOpts, rlm.WithAdaptiveIterationConfig(rlm.AdaptiveIterationConfig{
+			Enabled:                true,
+			BaseIterations:         opts.BaseIters,
+			MaxIterations:          opts.MaxIters,
+			ContextScaleFactor:     100000, // 100KB per additional iteration
+			EnableEarlyTermination: opts.EarlyTerminate,
+			ConfidenceThreshold:    1,
+		}))
+	}
+
+	if opts.RecursionDepth > 0 {
+		rlmOpts = append(rlmOpts, rlm.WithMaxRecursionDepth(opts.RecursionDepth))
 	}
 
 	r := rlm.New(client, client, rlmOpts...)
@@ -370,6 +390,11 @@ func main() {
 		verbatimIters       = flag.Int("verbatim-iters", 3, "Keep last N iterations verbatim (requires -compression)")
 		enablePrefixCaching = flag.Bool("prefix-caching", true, "Enable Anthropic prefix caching")
 		enableAsync         = flag.Bool("async", false, "Use async sub-LLM queries where possible")
+		enableAdaptive      = flag.Bool("adaptive", false, "Enable adaptive iteration strategy")
+		baseIters           = flag.Int("base-iters", 10, "Base iterations for adaptive mode")
+		maxIters            = flag.Int("max-iters", 30, "Maximum iterations (used in both adaptive and fixed modes)")
+		enableEarlyTerm     = flag.Bool("early-termination", true, "Enable early termination on confidence (requires -adaptive)")
+		recursionDepth      = flag.Int("recursion-depth", 1, "Max recursion depth for multi-depth RLM (0=disabled, 1=paper default)")
 	)
 	flag.Parse()
 
@@ -410,6 +435,7 @@ func main() {
 	fmt.Printf("Provider: %s\n", provider)
 	fmt.Printf("Model: %s\n", *model)
 	fmt.Printf("Tasks: %d\n", len(tasks))
+	fmt.Printf("Max Iterations: %d\n", *maxIters)
 	if *enableStreaming {
 		fmt.Println("Streaming: enabled")
 	}
@@ -418,6 +444,12 @@ func main() {
 	}
 	if *enableCompression {
 		fmt.Printf("History Compression: enabled (verbatim=%d)\n", *verbatimIters)
+	}
+	if *enableAdaptive {
+		fmt.Printf("Adaptive Iteration: enabled (base=%d, max=%d, early-term=%v)\n", *baseIters, *maxIters, *enableEarlyTerm)
+	}
+	if *recursionDepth > 0 {
+		fmt.Printf("Multi-Depth Recursion: enabled (max-depth=%d)\n", *recursionDepth)
 	}
 	if *enablePrefixCaching && provider == providers.Anthropic {
 		fmt.Println("Prefix Caching: enabled (Anthropic)")
@@ -454,13 +486,18 @@ func main() {
 
 	// Build RLM options
 	rlmOpts := RLMOptions{
-		LogDir:        *logDir,
-		Verbose:       *verbose,
-		Streaming:     *enableStreaming,
-		Pool:          pool,
-		Compression:   *enableCompression,
-		VerbatimIters: *verbatimIters,
-		Backend:       string(provider),
+		LogDir:         *logDir,
+		Verbose:        *verbose,
+		Streaming:      *enableStreaming,
+		Pool:           pool,
+		Compression:    *enableCompression,
+		VerbatimIters:  *verbatimIters,
+		Backend:        string(provider),
+		Adaptive:       *enableAdaptive,
+		BaseIters:      *baseIters,
+		MaxIters:       *maxIters,
+		EarlyTerminate: *enableEarlyTerm,
+		RecursionDepth: *recursionDepth,
 	}
 
 	var baselineResults []BenchmarkResult
@@ -554,6 +591,16 @@ func main() {
 		output := map[string]any{
 			"model":            *model,
 			"prefix_caching":   *enablePrefixCaching,
+			"streaming":        *enableStreaming,
+			"pooling":          *enablePooling,
+			"pool_size":        *poolSize,
+			"compression":      *enableCompression,
+			"verbatim_iters":   *verbatimIters,
+			"adaptive":         *enableAdaptive,
+			"base_iters":       *baseIters,
+			"max_iters":        *maxIters,
+			"early_termination": *enableEarlyTerm,
+			"recursion_depth":  *recursionDepth,
 			"baseline_results": baselineResults,
 			"rlm_results":      rlmResults,
 			"baseline_summary": baselineSummary,

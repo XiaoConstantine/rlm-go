@@ -318,6 +318,7 @@ func TestNewExecutorWithAuto(t *testing.T) {
 	client := NewMockLLMClient()
 	cfg := DefaultConfig()
 	cfg.Backend = BackendAuto
+	cfg.EnableIPC = false // Disable IPC for basic test to avoid network issues in CI
 
 	exec, err := New(client, cfg)
 	if err != nil {
@@ -349,7 +350,7 @@ func TestNewExecutorWithAuto(t *testing.T) {
 	}
 
 	if !strings.Contains(result.Stdout, "Hello from auto backend!") {
-		t.Errorf("Expected greeting in output, got: %s", result.Stdout)
+		t.Errorf("Expected greeting in output, got stdout: %q, stderr: %q", result.Stdout, result.Stderr)
 	}
 }
 
