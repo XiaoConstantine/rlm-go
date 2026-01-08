@@ -1,2 +1,9 @@
 logs/
 /rlm-viewer
+
+# Benchmark artifacts
+/benchmark/
+/benchmark.test
+/benchmark_test/
+*.prof
+PERFORMANCE_REPORT.md
