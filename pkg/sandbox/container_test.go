@@ -329,6 +329,19 @@ func TestNewExecutorWithAuto(t *testing.T) {
 	backend := exec.Backend()
 	t.Logf("Auto-selected backend: %s", backend)
 
+	// If container backend was selected, ensure image exists
+	if backend == BackendPodman || backend == BackendDocker {
+		if containerExec, ok := exec.(*ContainerExecutor); ok {
+			if !containerExec.ImageExists() {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				if err := containerExec.PullImage(ctx); err != nil {
+					t.Skipf("Container backend selected but failed to pull image: %v", err)
+				}
+			}
+		}
+	}
+
 	// Execute basic code
 	result, err := exec.Execute(context.Background(), `fmt.Println("Hello from auto backend!")`)
 	if err != nil {
