@@ -57,7 +57,7 @@ func (s *BenchmarkStats) String() string {
 	defer s.mu.Unlock()
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\n=== Benchmark Results ===\n"))
+	b.WriteString("\n=== Benchmark Results ===\n")
 	b.WriteString(fmt.Sprintf("Total Time:        %v\n", s.TotalTime))
 	b.WriteString(fmt.Sprintf("Total Iterations:  %d\n", s.TotalIterations))
 	b.WriteString(fmt.Sprintf("Max Depth Reached: %d\n", s.MaxDepthReached))
@@ -75,7 +75,7 @@ func (s *BenchmarkStats) String() string {
 		}
 	}
 
-	b.WriteString(fmt.Sprintf("\n[Totals]\n"))
+	b.WriteString("\n[Totals]\n")
 	b.WriteString(fmt.Sprintf("  Total Prompt Tokens:     %d\n", totalPrompt))
 	b.WriteString(fmt.Sprintf("  Total Completion Tokens: %d\n", totalCompletion))
 	b.WriteString(fmt.Sprintf("  Grand Total Tokens:      %d\n", totalPrompt+totalCompletion))

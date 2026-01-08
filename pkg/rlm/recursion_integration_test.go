@@ -5,27 +5,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
-	"github.com/XiaoConstantine/rlm-go/pkg/repl"
 )
-
-// mockRecursiveLLMClient simulates a root LLM for recursive testing.
-// It returns responses that trigger recursive calls based on the iteration.
-type mockRecursiveLLMClient struct {
-	completeFunc func(ctx context.Context, messages []core.Message) (core.LLMResponse, error)
-	calls        [][]core.Message
-	callCount    int32
-}
-
-func (m *mockRecursiveLLMClient) Complete(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
-	m.calls = append(m.calls, messages)
-	atomic.AddInt32(&m.callCount, 1)
-	return m.completeFunc(ctx, messages)
-}
 
 // TestRecursiveComplete_Basic tests basic recursive completion workflow
 func TestRecursiveComplete_Basic(t *testing.T) {
@@ -513,30 +497,6 @@ func TestIntegration_MultiDepthRecursion(t *testing.T) {
 			// Actual implementation would go here with real providers
 		})
 	}
-}
-
-// mockREPLClientForRecursion provides a mock REPL client for recursion testing
-type mockREPLClientForRecursion struct {
-	queryFunc func(ctx context.Context, prompt string) (repl.QueryResponse, error)
-	batchFunc func(ctx context.Context, prompts []string) ([]repl.QueryResponse, error)
-}
-
-func (m *mockREPLClientForRecursion) Query(ctx context.Context, prompt string) (repl.QueryResponse, error) {
-	if m.queryFunc != nil {
-		return m.queryFunc(ctx, prompt)
-	}
-	return repl.QueryResponse{Response: "mock response"}, nil
-}
-
-func (m *mockREPLClientForRecursion) QueryBatched(ctx context.Context, prompts []string) ([]repl.QueryResponse, error) {
-	if m.batchFunc != nil {
-		return m.batchFunc(ctx, prompts)
-	}
-	results := make([]repl.QueryResponse, len(prompts))
-	for i := range prompts {
-		results[i] = repl.QueryResponse{Response: fmt.Sprintf("mock batch response %d", i)}
-	}
-	return results, nil
 }
 
 // TestRecursiveComplete_ContextPropagation tests that context is passed through recursion

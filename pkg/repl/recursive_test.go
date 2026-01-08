@@ -142,7 +142,7 @@ func TestRecursiveREPL_ExecuteBasic(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Reset REPL for each test
-			repl.Reset()
+			_ = repl.Reset()
 
 			result, err := repl.Execute(context.Background(), tt.code)
 			if err != nil {

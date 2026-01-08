@@ -147,7 +147,7 @@ func (s *IPCServer) acceptLoop() {
 
 		// Set a deadline to periodically check for cancellation
 		if tcpListener, ok := s.listener.(*net.TCPListener); ok {
-			tcpListener.SetDeadline(time.Now().Add(1 * time.Second))
+			_ = tcpListener.SetDeadline(time.Now().Add(1 * time.Second))
 		}
 
 		conn, err := s.listener.Accept()
@@ -170,7 +170,7 @@ func (s *IPCServer) acceptLoop() {
 
 // handleConnection processes messages from a single connection.
 func (s *IPCServer) handleConnection(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	encoder := json.NewEncoder(conn)
@@ -183,7 +183,7 @@ func (s *IPCServer) handleConnection(conn net.Conn) {
 		}
 
 		// Set read deadline
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
 		// Read a line (one JSON message per line)
 		line, err := reader.ReadBytes('\n')

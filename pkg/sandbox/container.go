@@ -107,7 +107,7 @@ func (e *ContainerExecutor) Execute(ctx context.Context, code string) (*core.Exe
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	// Generate the full Go program
 	program, err := e.generateProgram(code)

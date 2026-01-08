@@ -73,7 +73,7 @@ func TestLocalExecutorBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create local executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Test basic code execution
 	result, err := exec.Execute(context.Background(), `fmt.Println("Hello, sandbox!")`)
@@ -99,7 +99,7 @@ func TestLocalExecutorWithContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create local executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Load string context
 	err = exec.LoadContext("test context data")
@@ -135,7 +135,7 @@ func TestLocalExecutorWithQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create local executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Execute code that uses Query
 	result, err := exec.Execute(context.Background(), `
@@ -173,7 +173,7 @@ func TestLocalExecutorWithBatchedQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create local executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Execute code that uses QueryBatched
 	result, err := exec.Execute(context.Background(), `
@@ -208,7 +208,7 @@ func TestLocalExecutorTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create local executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Note: Yaegi doesn't support true cancellation, so this test
 	// verifies the timeout configuration is passed correctly.
@@ -234,7 +234,7 @@ func TestLocalExecutorGetVariable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create local executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Execute code that sets a variable
 	_, err = exec.Execute(context.Background(), `
@@ -264,7 +264,7 @@ func TestLocalExecutorGetLocals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create local executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Execute code that sets common variables
 	_, err = exec.Execute(context.Background(), `
@@ -295,7 +295,7 @@ func TestLocalExecutorReset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create local executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Execute some code
 	_, _ = exec.Execute(context.Background(), `
@@ -323,7 +323,7 @@ func TestNewExecutorWithAuto(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Should have created some executor
 	backend := exec.Backend()
@@ -356,7 +356,7 @@ func TestContainerExecutorBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create container executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	t.Logf("Using backend: %s", exec.Backend())
 
@@ -396,7 +396,7 @@ func TestContainerExecutorWithContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create container executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Pull image first if needed
 	if !exec.ImageExists() {
@@ -438,7 +438,7 @@ func TestContainerExecutorResourceLimits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create container executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Pull image first if needed
 	if !exec.ImageExists() {
@@ -475,7 +475,7 @@ func TestContainerExecutorRuntimeInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create container executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	info, err := exec.RuntimeInfo()
 	if err != nil {
@@ -497,7 +497,7 @@ func TestIPCServerBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create IPC server: %v", err)
 	}
-	defer server.Stop()
+	defer func() { _ = server.Stop() }()
 
 	server.Start()
 
@@ -513,7 +513,7 @@ func TestIPCServerBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create IPC client: %v", err)
 	}
-	defer ipcClient.Close()
+	defer func() { _ = ipcClient.Close() }()
 
 	// Test Query
 	response, tokenUsage, err := ipcClient.Query("test prompt")
@@ -545,7 +545,7 @@ func TestIPCServerBatched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create IPC server: %v", err)
 	}
-	defer server.Stop()
+	defer func() { _ = server.Stop() }()
 
 	server.Start()
 
@@ -554,7 +554,7 @@ func TestIPCServerBatched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create IPC client: %v", err)
 	}
-	defer ipcClient.Close()
+	defer func() { _ = ipcClient.Close() }()
 
 	// Test QueryBatched
 	responses, usages, err := ipcClient.QueryBatched([]string{"p1", "p2"})
@@ -633,7 +633,7 @@ func TestLocalExecutorMinMaxHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create local executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Test min/max helper functions
 	result, err := exec.Execute(context.Background(), `
@@ -659,7 +659,7 @@ func TestLocalExecutorMapContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create local executor: %v", err)
 	}
-	defer exec.Close()
+	defer func() { _ = exec.Close() }()
 
 	// Load map context (stored as JSON string)
 	err = exec.LoadContext(map[string]any{
