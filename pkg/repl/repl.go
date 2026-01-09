@@ -370,7 +370,11 @@ func (r *REPL) llmQuery(prompt string) string {
 
 // buildPromptWithContext retrieves the context variable and prepends it to the prompt.
 // This ensures sub-LLM queries have access to the loaded context data.
+// Thread-safe: acquires mutex before accessing interpreter.
 func (r *REPL) buildPromptWithContext(prompt string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	// Try to get the context variable from the interpreter
 	v, err := r.interp.Eval("context")
 	if err != nil || !v.IsValid() {
@@ -691,6 +695,7 @@ func (r *REPL) LoadContext(payload any) error {
 }
 
 // loadStructuredContext handles map and slice context types.
+// Note: encoding/json is already imported by injectBuiltins, so we don't import it here.
 func (r *REPL) loadStructuredContext(v any, typeDecl string) error {
 	jsonBytes, err := json.Marshal(v)
 	if err != nil {
@@ -698,7 +703,6 @@ func (r *REPL) loadStructuredContext(v any, typeDecl string) error {
 	}
 
 	code := fmt.Sprintf(`
-import "encoding/json"
 var context %s
 func init() {
 	json.Unmarshal([]byte(%s), &context)
