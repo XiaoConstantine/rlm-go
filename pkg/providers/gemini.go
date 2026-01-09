@@ -101,8 +101,8 @@ type geminiResponse struct {
 	} `json:"error,omitempty"`
 }
 
-// Complete implements rlm.LLMClient for root LLM orchestration.
-func (c *GeminiClient) Complete(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+// prepareMessages extracts system instruction and converts messages to API format.
+func (c *GeminiClient) prepareMessages(messages []core.Message) (*geminiContent, []geminiContent) {
 	var systemContent *geminiContent
 	var contents []geminiContent
 
@@ -122,6 +122,12 @@ func (c *GeminiClient) Complete(ctx context.Context, messages []core.Message) (c
 			})
 		}
 	}
+	return systemContent, contents
+}
+
+// Complete implements rlm.LLMClient for root LLM orchestration.
+func (c *GeminiClient) Complete(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+	systemContent, contents := c.prepareMessages(messages)
 
 	reqBody := geminiRequest{
 		Contents:          contents,
@@ -299,25 +305,7 @@ type geminiStreamChunk struct {
 // The handler is called for each chunk of content as it arrives.
 // Returns the complete response with token usage after stream completes.
 func (c *GeminiClient) CompleteStream(ctx context.Context, messages []core.Message, handler StreamHandler) (core.LLMResponse, error) {
-	var systemContent *geminiContent
-	var contents []geminiContent
-
-	for _, msg := range messages {
-		if msg.Role == "system" {
-			systemContent = &geminiContent{
-				Parts: []geminiPart{{Text: msg.Content}},
-			}
-		} else {
-			role := msg.Role
-			if role == "assistant" {
-				role = "model"
-			}
-			contents = append(contents, geminiContent{
-				Role:  role,
-				Parts: []geminiPart{{Text: msg.Content}},
-			})
-		}
-	}
+	systemContent, contents := c.prepareMessages(messages)
 
 	reqBody := geminiRequest{
 		Contents:          contents,

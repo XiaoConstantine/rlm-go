@@ -126,10 +126,16 @@ func (e *DepthExceededError) Error() string {
 		e.CurrentDepth, e.MaxDepth, truncatePrompt(e.Prompt, 50))
 }
 
-// truncatePrompt truncates a prompt for error messages.
-func truncatePrompt(s string, maxLen int) string {
+// Truncate shortens a string to maxLen characters, adding "..." suffix if truncated.
+// This is a utility function used for logging and error messages.
+func Truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// truncatePrompt truncates a prompt for error messages (internal alias for Truncate).
+func truncatePrompt(s string, maxLen int) string {
+	return Truncate(s, maxLen)
 }

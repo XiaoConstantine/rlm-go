@@ -373,12 +373,9 @@ func loadTasks(path string) ([]Task, error) {
 	return tasks, nil
 }
 
-// truncate truncates a string to maxLen characters.
+// truncate truncates a string to maxLen characters (uses core.Truncate).
 func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
+	return core.Truncate(s, maxLen)
 }
 
 func main() {

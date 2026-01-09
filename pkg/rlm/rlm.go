@@ -198,6 +198,42 @@ type RLM struct {
 	config     Config
 }
 
+// logf is a conditional logging helper that only prints when verbose mode is enabled.
+func (r *RLM) logf(format string, args ...any) {
+	if r.config.Verbose {
+		fmt.Printf("[RLM] "+format+"\n", args...)
+	}
+}
+
+// logCacheStats logs cache statistics if there are any.
+func (r *RLM) logCacheStats(llmResp core.LLMResponse, state *iterationState) {
+	if llmResp.CacheCreationTokens > 0 || llmResp.CacheReadTokens > 0 {
+		r.logf("Cache stats this iteration: created=%d, read=%d (totals: created=%d, read=%d)",
+			llmResp.CacheCreationTokens, llmResp.CacheReadTokens,
+			state.totalCacheCreationTokens, state.totalCacheReadTokens)
+	}
+}
+
+// forceDefaultAnswerWithState wraps forceDefaultAnswer using iteration state.
+func (r *RLM) forceDefaultAnswerWithState(ctx context.Context, messages []core.Message, state *iterationState) (*core.CompletionResult, error) {
+	return r.forceDefaultAnswer(ctx, messages, state.start,
+		state.totalPromptTokens, state.totalCompletionTokens,
+		state.totalCacheCreationTokens, state.totalCacheReadTokens)
+}
+
+// tryResetInterpreter attempts to reset the interpreter if it supports the ResetIfNeeded interface.
+func (r *RLM) tryResetInterpreter(execEnv ExecutionEnvironment) {
+	if resetter, ok := execEnv.(interface{ ResetIfNeeded() (bool, error) }); ok {
+		if reset, resetErr := resetter.ResetIfNeeded(); reset {
+			if resetErr != nil {
+				r.logf("Interpreter reset failed: %v", resetErr)
+			} else {
+				r.logf("Interpreter reset successful")
+			}
+		}
+	}
+}
+
 // New creates a new RLM instance.
 // client is used for the root LLM orchestration.
 // replClient is used for sub-LLM calls from within the REPL.
@@ -510,8 +546,6 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		return r.CompleteWithCompactHistory(ctx, contextPayload, query)
 	}
 
-	start := time.Now()
-
 	// Create execution environment (REPL or sandbox based on config)
 	execEnv, err := r.createExecutionEnvironment()
 	if err != nil {
@@ -527,16 +561,10 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 	// Build initial message history
 	messages := r.buildInitialMessagesFromEnv(execEnv, query)
 
-	// Track total token usage across iterations
-	var totalPromptTokens, totalCompletionTokens int
-	var totalCacheCreationTokens, totalCacheReadTokens int
-
-	// Compute max iterations (adaptive or fixed)
+	// Initialize iteration state
 	contextSize := getContextSize(contextPayload)
 	maxIterations := r.computeMaxIterations(contextSize)
-
-	// Track confidence signals for early termination
-	var confidenceSignals int
+	state := newIterationState(contextSize, maxIterations)
 
 	// Iteration loop
 	for i := 0; i < maxIterations; i++ {
@@ -553,15 +581,13 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 			r.config.OnProgress(IterationProgress{
 				CurrentIteration:  i + 1,
 				MaxIterations:     maxIterations,
-				ConfidenceSignals: confidenceSignals,
+				ConfidenceSignals: state.confidenceSignals,
 				HasFinalAttempt:   false,
 				ContextSize:       contextSize,
 			})
 		}
 
-		if r.config.Verbose {
-			fmt.Printf("[RLM] Iteration %d/%d\n", i+1, maxIterations)
-		}
+		r.logf("Iteration %d/%d", i+1, maxIterations)
 
 		// Add iteration-specific user prompt
 		currentMessages := r.appendIterationPrompt(messages, i, query)
@@ -573,158 +599,56 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		}
 		response := llmResp.Content
 
-		// Aggregate root LLM tokens
-		totalPromptTokens += llmResp.PromptTokens
-		totalCompletionTokens += llmResp.CompletionTokens
-		totalCacheCreationTokens += llmResp.CacheCreationTokens
-		totalCacheReadTokens += llmResp.CacheReadTokens
-
-		if r.config.Verbose {
-			if llmResp.CacheCreationTokens > 0 || llmResp.CacheReadTokens > 0 {
-				fmt.Printf("[RLM] Cache stats this iteration: created=%d, read=%d (totals: created=%d, read=%d)\n",
-					llmResp.CacheCreationTokens, llmResp.CacheReadTokens,
-					totalCacheCreationTokens, totalCacheReadTokens)
-			}
-			fmt.Printf("[RLM] Response: %s\n", truncate(response, 200))
-		}
+		// Aggregate tokens
+		state.aggregateTokens(llmResp)
+		r.logCacheStats(llmResp, state)
+		r.logf("Response: %s", truncate(response, truncateLenShort))
 
 		// Extract and execute code blocks
 		codeBlocks := parsing.FindCodeBlocks(response)
-		var execResults []core.CodeBlock
-		var interpreterPanic bool
-
-		for _, code := range codeBlocks {
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Executing code:\n%s\n", truncate(code, 200))
-			}
-
-			result, execErr := execEnv.Execute(ctx, code)
-			if execErr != nil {
-				// Interpreter panic detected - log and attempt recovery
-				if r.config.Verbose {
-					fmt.Printf("[RLM] Interpreter error: %v\n", execErr)
-				}
-				interpreterPanic = true
-				// Try to reset the interpreter for subsequent code blocks
-				if resetter, ok := execEnv.(interface{ ResetIfNeeded() (bool, error) }); ok {
-					if reset, resetErr := resetter.ResetIfNeeded(); reset {
-						if r.config.Verbose {
-							if resetErr != nil {
-								fmt.Printf("[RLM] Interpreter reset failed: %v\n", resetErr)
-							} else {
-								fmt.Printf("[RLM] Interpreter reset successful\n")
-							}
-						}
-					}
-				}
-			}
-
-			execResults = append(execResults, core.CodeBlock{
-				Code:   code,
-				Result: *result,
-			})
-
-			if r.config.Verbose && result.Stdout != "" {
-				fmt.Printf("[RLM] Output: %s\n", truncate(result.Stdout, 200))
-			}
-			if r.config.Verbose && result.Stderr != "" {
-				fmt.Printf("[RLM] Stderr: %s\n", truncate(result.Stderr, 200))
-			}
-		}
-
-		// If interpreter panic occurred, we may need to reload context
-		if interpreterPanic {
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Reloading context after interpreter reset\n")
-			}
-			// Attempt to reload context (may fail if interpreter is still broken)
-			_ = execEnv.LoadContext(contextPayload)
-		}
+		execResult := r.executeCodeBlocks(ctx, execEnv, codeBlocks, contextPayload)
 
 		// Get LLM calls made during code execution and aggregate tokens
 		llmCalls := execEnv.GetLLMCalls()
 		rlmCalls := convertCallsToLoggerEntries(llmCalls)
-		for _, call := range llmCalls {
-			// Aggregate token usage
-			totalPromptTokens += call.PromptTokens
-			totalCompletionTokens += call.CompletionTokens
-		}
+		state.aggregateLLMCallTokens(llmCalls)
 
 		// Get locals from execution environment for logging
 		locals := execEnv.GetLocals()
 
 		// Detect confidence signals for adaptive early termination
 		if detectConfidence(response) {
-			confidenceSignals++
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Confidence signal detected (total: %d)\n", confidenceSignals)
-			}
+			state.confidenceSignals++
+			r.logf("Confidence signal detected (total: %d)", state.confidenceSignals)
 		}
 
 		// Check for final answer - BUT only if there were NO code blocks in this response.
-		// If there are code blocks, we need to wait for the next iteration so the model
-		// can see the execution results before providing a final answer.
-		var finalAnswer any // nil, string, or []string{varname, value}
-		var resultResponse string
-		if len(codeBlocks) == 0 && parsing.FindFinalAnswer(response) != nil {
-			// No code blocks and has final answer - process it
-			final := parsing.FindFinalAnswer(response)
-			varName := final.Content
-			varValue := varName // Default to content itself
+		if len(codeBlocks) == 0 {
+			if final := parsing.FindFinalAnswer(response); final != nil {
+				finalAnswer, resultResponse, _ := r.processFinalAnswer(final, execEnv)
 
-			// Resolve variable if FINAL_VAR
-			if final.Type == core.FinalTypeVariable {
-				resolved, err := execEnv.GetVariable(varName)
-				if err != nil {
-					if r.config.Verbose {
-						fmt.Printf("[RLM] Warning: could not resolve variable %q: %v\n", varName, err)
-					}
-				} else {
-					varValue = resolved
+				// Log iteration before returning
+				if r.config.Logger != nil {
+					_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResult.execResults, rlmCalls, locals, finalAnswer, time.Since(iterStart))
 				}
-				// FINAL_VAR: output as [varname, value] tuple
-				finalAnswer = []string{varName, varValue}
-			} else {
-				// FINAL: output as string directly
-				finalAnswer = varValue
-			}
-			resultResponse = varValue
 
-			// Log iteration before returning
-			if r.config.Logger != nil {
-				_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, locals, finalAnswer, time.Since(iterStart))
+				return state.buildResult(resultResponse, i+1), nil
 			}
-
-			return &core.CompletionResult{
-				Response:   resultResponse,
-				Iterations: i + 1,
-				Duration:   time.Since(start),
-				Usage: core.UsageStats{
-					PromptTokens:        totalPromptTokens,
-					CompletionTokens:    totalCompletionTokens,
-					TotalTokens:         totalPromptTokens + totalCompletionTokens,
-					CacheCreationTokens: totalCacheCreationTokens,
-					CacheReadTokens:     totalCacheReadTokens,
-				},
-			}, nil
 		}
 
 		// Log iteration (no final answer)
 		if r.config.Logger != nil {
-			_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, locals, nil, time.Since(iterStart))
+			_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResult.execResults, rlmCalls, locals, nil, time.Since(iterStart))
 		}
 
 		// Check for early termination based on confidence signals
-		if r.shouldTerminateEarly(confidenceSignals, len(codeBlocks)) {
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Early termination triggered (confidence signals: %d)\n", confidenceSignals)
-			}
-			// Force immediate final answer due to high confidence
-			return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens, totalCacheCreationTokens, totalCacheReadTokens)
+		if r.shouldTerminateEarly(state.confidenceSignals, len(codeBlocks)) {
+			r.logf("Early termination triggered (confidence signals: %d)", state.confidenceSignals)
+			return r.forceDefaultAnswerWithState(ctx, messages, state)
 		}
 
 		// Append iteration results to history
-		messages = r.appendIterationToHistory(messages, response, execResults)
+		messages = r.appendIterationToHistory(messages, response, execResult.execResults)
 
 		// Apply history compression if enabled and we have enough iterations
 		if r.config.HistoryCompression != nil && r.config.HistoryCompression.Enabled {
@@ -733,7 +657,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 	}
 
 	// Max iterations exhausted - force final answer
-	return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens, totalCacheCreationTokens, totalCacheReadTokens)
+	return r.forceDefaultAnswerWithState(ctx, messages, state)
 }
 
 // buildInitialMessages creates the initial message history.
@@ -860,10 +784,8 @@ func (r *RLM) compressHistory(messages []core.Message, currentIteration int) []c
 	// Append verbatim recent messages
 	result = append(result, messages[splitIdx:]...)
 
-	if r.config.Verbose {
-		fmt.Printf("[RLM] Compressed history: %d -> %d messages (summarized %d iteration messages)\n",
-			len(messages), len(result), len(toCompress))
-	}
+	r.logf("Compressed history: %d -> %d messages (summarized %d iteration messages)",
+		len(messages), len(result), len(toCompress))
 
 	return result
 }
@@ -908,8 +830,8 @@ func (r *RLM) summarizeIterations(messages []core.Message, maxTokens int) string
 					}
 					if strings.TrimSpace(line) != "" && !strings.HasPrefix(line, "Code executed:") && !strings.HasPrefix(line, "```") {
 						outputPreview := line
-						if len(outputPreview) > 80 {
-							outputPreview = outputPreview[:80] + "..."
+						if len(outputPreview) > summaryPreviewLen {
+							outputPreview = outputPreview[:summaryPreviewLen] + "..."
 						}
 						summary.WriteString(fmt.Sprintf("  -> output: %s\n", outputPreview))
 						break
@@ -976,23 +898,21 @@ func (r *RLM) completeWithOptionalStreaming(ctx context.Context, messages []core
 			return streamClient.CompleteStream(ctx, messages, r.config.OnStreamChunk)
 		}
 		// Fall back to non-streaming if client doesn't support it
-		if r.config.Verbose {
-			fmt.Println("[RLM] Streaming requested but client doesn't support it, falling back to non-streaming")
-		}
+		r.logf("Streaming requested but client doesn't support it, falling back to non-streaming")
 	}
 	return r.client.Complete(ctx, messages)
 }
 
-// truncate shortens a string for logging.
+// truncate shortens a string for logging (uses core.Truncate).
 func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
+	return core.Truncate(s, maxLen)
 }
 
-// truncateString shortens a string with a suffix indicator.
+// truncateString shortens a string with a suffix indicator for message content.
 func truncateString(s string, maxLen int) string {
+	if maxLen <= 0 {
+		maxLen = truncateLenLong // Default to long truncation
+	}
 	if len(s) <= maxLen {
 		return s
 	}
@@ -1107,13 +1027,11 @@ func (r *RLM) CompleteWithRecursion(
 			_ = depth // Used for potential future logging
 		}
 
-		if r.config.Verbose {
-			depth := 0
-			if recursionCtx != nil {
-				depth = recursionCtx.CurrentDepth
-			}
-			fmt.Printf("[RLM] Depth %d, Iteration %d/%d\n", depth, i+1, maxIterations)
+		depth := 0
+		if recursionCtx != nil {
+			depth = recursionCtx.CurrentDepth
 		}
+		r.logf("Depth %d, Iteration %d/%d", depth, i+1, maxIterations)
 
 		// Add iteration-specific user prompt
 		currentMessages := r.appendIterationPrompt(messages, i, query)
@@ -1136,22 +1054,18 @@ func (r *RLM) CompleteWithRecursion(
 			tokenStats.Add(recursionCtx.CurrentDepth, llmResp.PromptTokens, llmResp.CompletionTokens)
 		}
 
-		if r.config.Verbose {
-			if llmResp.CacheCreationTokens > 0 || llmResp.CacheReadTokens > 0 {
-				fmt.Printf("[RLM] Cache stats this iteration: created=%d, read=%d\n",
-					llmResp.CacheCreationTokens, llmResp.CacheReadTokens)
-			}
-			fmt.Printf("[RLM] Response: %s\n", truncate(response, 200))
+		if llmResp.CacheCreationTokens > 0 || llmResp.CacheReadTokens > 0 {
+			r.logf("Cache stats this iteration: created=%d, read=%d",
+				llmResp.CacheCreationTokens, llmResp.CacheReadTokens)
 		}
+		r.logf("Response: %s", truncate(response, 200))
 
 		// Extract and execute code blocks
 		codeBlocks := parsing.FindCodeBlocks(response)
 		var execResults []core.CodeBlock
 
 		for _, code := range codeBlocks {
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Executing code:\n%s\n", truncate(code, 200))
-			}
+			r.logf("Executing code:\n%s", truncate(code, 200))
 
 			result, _ := replEnv.Execute(ctx, code)
 			execResults = append(execResults, core.CodeBlock{
@@ -1159,11 +1073,11 @@ func (r *RLM) CompleteWithRecursion(
 				Result: *result,
 			})
 
-			if r.config.Verbose && result.Stdout != "" {
-				fmt.Printf("[RLM] Output: %s\n", truncate(result.Stdout, 200))
+			if result.Stdout != "" {
+				r.logf("Output: %s", truncate(result.Stdout, 200))
 			}
-			if r.config.Verbose && result.Stderr != "" {
-				fmt.Printf("[RLM] Stderr: %s\n", truncate(result.Stderr, 200))
+			if result.Stderr != "" {
+				r.logf("Stderr: %s", truncate(result.Stderr, 200))
 			}
 		}
 
@@ -1190,9 +1104,7 @@ func (r *RLM) CompleteWithRecursion(
 		// Detect confidence signals for adaptive early termination
 		if detectConfidence(response) {
 			confidenceSignals++
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Confidence signal detected (total: %d)\n", confidenceSignals)
-			}
+			r.logf("Confidence signal detected (total: %d)", confidenceSignals)
 		}
 
 		// Check for final answer
@@ -1204,9 +1116,7 @@ func (r *RLM) CompleteWithRecursion(
 			if final.Type == core.FinalTypeVariable {
 				resolved, err := replEnv.GetVariable(varName)
 				if err != nil {
-					if r.config.Verbose {
-						fmt.Printf("[RLM] Warning: could not resolve variable %q: %v\n", varName, err)
-					}
+					r.logf("Warning: could not resolve variable %q: %v", varName, err)
 				} else {
 					varValue = resolved
 				}
@@ -1228,9 +1138,7 @@ func (r *RLM) CompleteWithRecursion(
 
 		// Check for early termination based on confidence signals
 		if r.shouldTerminateEarly(confidenceSignals, len(codeBlocks)) {
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Early termination triggered (confidence signals: %d)\n", confidenceSignals)
-			}
+			r.logf("Early termination triggered (confidence signals: %d)", confidenceSignals)
 			return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens, totalCacheCreationTokens, totalCacheReadTokens)
 		}
 
@@ -1315,10 +1223,147 @@ type RecursiveCompletionResult struct {
 	MaxDepthReached int
 }
 
-// Constants for compact history formatting.
+// iterationState holds all shared state during an iteration loop.
+type iterationState struct {
+	// Token tracking
+	totalPromptTokens        int
+	totalCompletionTokens    int
+	totalCacheCreationTokens int
+	totalCacheReadTokens     int
+
+	// Iteration tracking
+	confidenceSignals int
+	maxIterations     int
+	contextSize       int
+
+	// Timing
+	start time.Time
+}
+
+// newIterationState creates a new iteration state.
+func newIterationState(contextSize, maxIterations int) *iterationState {
+	return &iterationState{
+		start:         time.Now(),
+		contextSize:   contextSize,
+		maxIterations: maxIterations,
+	}
+}
+
+// aggregateTokens adds token usage from an LLM response.
+func (s *iterationState) aggregateTokens(resp core.LLMResponse) {
+	s.totalPromptTokens += resp.PromptTokens
+	s.totalCompletionTokens += resp.CompletionTokens
+	s.totalCacheCreationTokens += resp.CacheCreationTokens
+	s.totalCacheReadTokens += resp.CacheReadTokens
+}
+
+// aggregateLLMCallTokens adds token usage from LLM calls made during code execution.
+func (s *iterationState) aggregateLLMCallTokens(calls []LLMCallRecord) {
+	for _, call := range calls {
+		s.totalPromptTokens += call.PromptTokens
+		s.totalCompletionTokens += call.CompletionTokens
+	}
+}
+
+// buildResult creates a CompletionResult from the current state.
+func (s *iterationState) buildResult(response string, iterations int) *core.CompletionResult {
+	return &core.CompletionResult{
+		Response:   response,
+		Iterations: iterations,
+		Duration:   time.Since(s.start),
+		Usage: core.UsageStats{
+			PromptTokens:        s.totalPromptTokens,
+			CompletionTokens:    s.totalCompletionTokens,
+			TotalTokens:         s.totalPromptTokens + s.totalCompletionTokens,
+			CacheCreationTokens: s.totalCacheCreationTokens,
+			CacheReadTokens:     s.totalCacheReadTokens,
+		},
+	}
+}
+
+// codeExecutionResult holds the results of executing code blocks.
+type codeExecutionResult struct {
+	execResults      []core.CodeBlock
+	allOutput        strings.Builder // For compact history mode
+	interpreterPanic bool
+}
+
+// executeCodeBlocks executes all code blocks and returns the results.
+func (r *RLM) executeCodeBlocks(ctx context.Context, execEnv ExecutionEnvironment, codeBlocks []string, contextPayload any) *codeExecutionResult {
+	result := &codeExecutionResult{}
+
+	for _, code := range codeBlocks {
+		r.logf("Executing code:\n%s", truncate(code, truncateLenShort))
+
+		execResult, execErr := execEnv.Execute(ctx, code)
+		if execErr != nil {
+			r.logf("Interpreter error: %v", execErr)
+			result.interpreterPanic = true
+			r.tryResetInterpreter(execEnv)
+		}
+
+		result.execResults = append(result.execResults, core.CodeBlock{
+			Code:   code,
+			Result: *execResult,
+		})
+
+		// Collect output for compact history mode
+		if execResult.Stdout != "" {
+			result.allOutput.WriteString(execResult.Stdout)
+			r.logf("Output: %s", truncate(execResult.Stdout, truncateLenShort))
+		}
+		if execResult.Stderr != "" {
+			result.allOutput.WriteString("Error: ")
+			result.allOutput.WriteString(execResult.Stderr)
+			r.logf("Stderr: %s", truncate(execResult.Stderr, truncateLenShort))
+		}
+	}
+
+	// Reload context if interpreter panicked
+	if result.interpreterPanic {
+		r.logf("Reloading context after interpreter reset")
+		_ = execEnv.LoadContext(contextPayload)
+	}
+
+	return result
+}
+
+// processFinalAnswer processes a FINAL/FINAL_VAR signal and returns the resolved value.
+// Returns (finalAnswer, resultResponse, found).
+func (r *RLM) processFinalAnswer(final *core.FinalAnswer, execEnv ExecutionEnvironment) (any, string, bool) {
+	if final == nil {
+		return nil, "", false
+	}
+
+	varName := final.Content
+	varValue := varName
+
+	if final.Type == core.FinalTypeVariable {
+		resolved, err := execEnv.GetVariable(varName)
+		if err != nil {
+			r.logf("Warning: could not resolve variable %q: %v", varName, err)
+		} else {
+			varValue = resolved
+		}
+		return []string{varName, varValue}, varValue, true
+	}
+
+	return varValue, varValue, true
+}
+
+// Constants for logging and history management.
 const (
-	truncateLenShort = 200
-	truncateLenLong  = 500
+	// Truncation lengths for different contexts
+	truncateLenShort   = 200   // For logging responses, code, output
+	truncateLenMedium  = 500   // For history output in compact mode
+	truncateLenLong    = 20000 // For message content truncation
+	truncateLenPreview = 100   // For short previews (e.g., FINAL output)
+
+	// History limits
+	defaultMaxHistoryLen = 10000 // Default max length for compact history string
+
+	// Summary output preview limit
+	summaryPreviewLen = 80
 )
 
 // appendIterationHistory appends a formatted iteration entry to the compact history string.
@@ -1332,7 +1377,7 @@ func appendIterationHistory(history *strings.Builder, iteration int, action, rea
 	if code != "" {
 		fmt.Fprintf(history, "Code:\n```go\n%s\n```\n", code)
 		if output != "" {
-			fmt.Fprintf(history, "Output:\n%s\n", truncate(output, truncateLenLong))
+			fmt.Fprintf(history, "Output:\n%s\n", truncate(output, truncateLenMedium))
 		}
 	}
 }
@@ -1403,8 +1448,6 @@ func trimHistoryIfNeeded(history string, maxLen int) string {
 // CompleteWithCompactHistory runs an RLM completion using compact string-based history.
 // This is an alternative to the standard Complete method that uses less tokens for history.
 func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any, query string) (*core.CompletionResult, error) {
-	start := time.Now()
-
 	// Create execution environment (REPL or sandbox based on config)
 	execEnv, err := r.createExecutionEnvironment()
 	if err != nil {
@@ -1417,23 +1460,17 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 		return nil, fmt.Errorf("failed to load context: %w", err)
 	}
 
-	// Track total token usage across iterations
-	var totalPromptTokens, totalCompletionTokens int
-	var totalCacheCreationTokens, totalCacheReadTokens int
-
-	// Compute max iterations (adaptive or fixed)
+	// Initialize iteration state
 	contextSize := getContextSize(contextPayload)
 	maxIterations := r.computeMaxIterations(contextSize)
-
-	// Track confidence signals for early termination
-	var confidenceSignals int
+	state := newIterationState(contextSize, maxIterations)
 
 	// Build compact history string
 	var history strings.Builder
 	contextInfo := execEnv.ContextInfo()
 
 	// Get max history length from config
-	maxHistoryLen := 10000
+	maxHistoryLen := defaultMaxHistoryLen
 	if r.config.CompactHistory != nil && r.config.CompactHistory.MaxHistoryLength > 0 {
 		maxHistoryLen = r.config.CompactHistory.MaxHistoryLength
 	}
@@ -1453,15 +1490,13 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 			r.config.OnProgress(IterationProgress{
 				CurrentIteration:  i + 1,
 				MaxIterations:     maxIterations,
-				ConfidenceSignals: confidenceSignals,
+				ConfidenceSignals: state.confidenceSignals,
 				HasFinalAttempt:   false,
 				ContextSize:       contextSize,
 			})
 		}
 
-		if r.config.Verbose {
-			fmt.Printf("[RLM] Iteration %d/%d (compact history)\n", i+1, maxIterations)
-		}
+		r.logf("Iteration %d/%d (compact history)", i+1, maxIterations)
 
 		// Trim history if needed
 		historyStr := trimHistoryIfNeeded(history.String(), maxHistoryLen)
@@ -1480,102 +1515,26 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 		}
 		response := llmResp.Content
 
-		// Aggregate root LLM tokens
-		totalPromptTokens += llmResp.PromptTokens
-		totalCompletionTokens += llmResp.CompletionTokens
-		totalCacheCreationTokens += llmResp.CacheCreationTokens
-		totalCacheReadTokens += llmResp.CacheReadTokens
-
-		if r.config.Verbose {
-			if llmResp.CacheCreationTokens > 0 || llmResp.CacheReadTokens > 0 {
-				fmt.Printf("[RLM] Cache stats this iteration: created=%d, read=%d (totals: created=%d, read=%d)\n",
-					llmResp.CacheCreationTokens, llmResp.CacheReadTokens,
-					totalCacheCreationTokens, totalCacheReadTokens)
-			}
-			fmt.Printf("[RLM] Response: %s\n", truncate(response, 200))
-		}
+		// Aggregate tokens
+		state.aggregateTokens(llmResp)
+		r.logCacheStats(llmResp, state)
+		r.logf("Response: %s", truncate(response, truncateLenShort))
 
 		// Extract and execute code blocks
 		codeBlocks := parsing.FindCodeBlocks(response)
-		var execResults []core.CodeBlock
-		var allOutput strings.Builder
-		var interpreterPanic bool
-
-		for _, code := range codeBlocks {
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Executing code:\n%s\n", truncate(code, 200))
-			}
-
-			result, execErr := execEnv.Execute(ctx, code)
-			if execErr != nil {
-				// Interpreter panic detected - log and attempt recovery
-				if r.config.Verbose {
-					fmt.Printf("[RLM] Interpreter error: %v\n", execErr)
-				}
-				interpreterPanic = true
-				// Try to reset the interpreter for subsequent code blocks
-				if resetter, ok := execEnv.(interface{ ResetIfNeeded() (bool, error) }); ok {
-					if reset, resetErr := resetter.ResetIfNeeded(); reset {
-						if r.config.Verbose {
-							if resetErr != nil {
-								fmt.Printf("[RLM] Interpreter reset failed: %v\n", resetErr)
-							} else {
-								fmt.Printf("[RLM] Interpreter reset successful\n")
-							}
-						}
-					}
-				}
-			}
-
-			execResults = append(execResults, core.CodeBlock{
-				Code:   code,
-				Result: *result,
-			})
-
-			// Collect output for history
-			if result.Stdout != "" {
-				allOutput.WriteString(result.Stdout)
-			}
-			if result.Stderr != "" {
-				allOutput.WriteString("Error: ")
-				allOutput.WriteString(result.Stderr)
-			}
-
-			if r.config.Verbose && result.Stdout != "" {
-				fmt.Printf("[RLM] Output: %s\n", truncate(result.Stdout, 200))
-			}
-			if r.config.Verbose && result.Stderr != "" {
-				fmt.Printf("[RLM] Stderr: %s\n", truncate(result.Stderr, 200))
-			}
-		}
-
-		// If interpreter panic occurred, we may need to reload context
-		if interpreterPanic {
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Reloading context after interpreter reset\n")
-			}
-			// Attempt to reload context (may fail if interpreter is still broken)
-			_ = execEnv.LoadContext(contextPayload)
-		}
+		execResult := r.executeCodeBlocks(ctx, execEnv, codeBlocks, contextPayload)
 
 		// Get LLM calls made during code execution and aggregate tokens
 		llmCalls := execEnv.GetLLMCalls()
 		rlmCalls := convertCallsToLoggerEntries(llmCalls)
+		state.aggregateLLMCallTokens(llmCalls)
+
+		// CRITICAL FIX: Add Query results to output so the LLM can see them in subsequent iterations.
 		for _, call := range llmCalls {
-			// Aggregate token usage
-			totalPromptTokens += call.PromptTokens
-			totalCompletionTokens += call.CompletionTokens
-
-			// CRITICAL FIX: Add Query results to history so the LLM can see them in subsequent iterations.
-			// Without this, Query() return values assigned to variables are invisible in compact history mode,
-			// causing the LLM to guess/hallucinate the answer in later iterations.
-			allOutput.WriteString(fmt.Sprintf("\n[Query] %s\n[Result] %s\n",
-				truncate(call.Prompt, 200),
+			execResult.allOutput.WriteString(fmt.Sprintf("\n[Query] %s\n[Result] %s\n",
+				truncate(call.Prompt, truncateLenShort),
 				call.Response))
-
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Query result: %s\n", truncate(call.Response, 200))
-			}
+			r.logf("Query result: %s", truncate(call.Response, truncateLenShort))
 		}
 
 		// Get locals from execution environment for logging
@@ -1583,117 +1542,49 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 
 		// Detect confidence signals for adaptive early termination
 		if detectConfidence(response) {
-			confidenceSignals++
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Confidence signal detected (total: %d)\n", confidenceSignals)
-			}
+			state.confidenceSignals++
+			r.logf("Confidence signal detected (total: %d)", state.confidenceSignals)
 		}
 
 		// Determine action type for history
-		action := "explore"
-		if len(codeBlocks) == 0 {
-			action = "thinking"
-		} else if strings.Contains(response, "Query(") || strings.Contains(response, "QueryBatched(") {
-			action = "query"
-		}
+		action := determineActionType(codeBlocks, response)
 
 		// Check for final answer in BOTH the LLM response AND the execution output.
-		// FINAL/FINAL_VAR can appear in:
-		// 1. LLM response text (outside code blocks) - traditional usage
-		// 2. Execution output (stdout) - when FINAL/FINAL_VAR is called from code
-		var finalAnswer any
-		var resultResponse string
+		outputStr := execResult.allOutput.String()
 
 		// First check execution output for FINAL (from code-called FINAL/FINAL_VAR functions)
-		outputStr := allOutput.String()
 		if final := parsing.FindFinalAnswer(outputStr); final != nil {
-			// Found FINAL in execution output - the value is already resolved
-			resultResponse = final.Content
-			finalAnswer = resultResponse
+			resultResponse := final.Content
+			r.logf("Found FINAL in execution output: %s", truncate(resultResponse, truncateLenPreview))
 
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Found FINAL in execution output: %s\n", truncate(resultResponse, 100))
-			}
-
-			// Log iteration before returning
 			if r.config.Logger != nil {
-				_ = r.config.Logger.LogIteration(i+1, messages, response, execResults, rlmCalls, locals, finalAnswer, time.Since(iterStart))
+				_ = r.config.Logger.LogIteration(i+1, messages, response, execResult.execResults, rlmCalls, locals, resultResponse, time.Since(iterStart))
 			}
-
-			return &core.CompletionResult{
-				Response:   resultResponse,
-				Iterations: i + 1,
-				Duration:   time.Since(start),
-				Usage: core.UsageStats{
-					PromptTokens:        totalPromptTokens,
-					CompletionTokens:    totalCompletionTokens,
-					TotalTokens:         totalPromptTokens + totalCompletionTokens,
-					CacheCreationTokens: totalCacheCreationTokens,
-					CacheReadTokens:     totalCacheReadTokens,
-				},
-			}, nil
+			return state.buildResult(resultResponse, i+1), nil
 		}
 
-		// Then check LLM response (only if no code blocks, to avoid false positives from code examples)
-		if len(codeBlocks) == 0 && parsing.FindFinalAnswer(response) != nil {
-			// No code blocks and has final answer in response text - process it
-			final := parsing.FindFinalAnswer(response)
-			varName := final.Content
-			varValue := varName // Default to content itself
+		// Then check LLM response (only if no code blocks)
+		if len(codeBlocks) == 0 {
+			if final := parsing.FindFinalAnswer(response); final != nil {
+				finalAnswer, resultResponse, _ := r.processFinalAnswer(final, execEnv)
 
-			// Resolve variable if FINAL_VAR
-			if final.Type == core.FinalTypeVariable {
-				resolved, err := execEnv.GetVariable(varName)
-				if err != nil {
-					if r.config.Verbose {
-						fmt.Printf("[RLM] Warning: could not resolve variable %q: %v\n", varName, err)
-					}
-				} else {
-					varValue = resolved
+				if r.config.Logger != nil {
+					_ = r.config.Logger.LogIteration(i+1, messages, response, execResult.execResults, rlmCalls, locals, finalAnswer, time.Since(iterStart))
 				}
-				// FINAL_VAR: output as [varname, value] tuple
-				finalAnswer = []string{varName, varValue}
-			} else {
-				// FINAL: output as string directly
-				finalAnswer = varValue
+				return state.buildResult(resultResponse, i+1), nil
 			}
-			resultResponse = varValue
-
-			// Log iteration before returning
-			if r.config.Logger != nil {
-				_ = r.config.Logger.LogIteration(i+1, messages, response, execResults, rlmCalls, locals, finalAnswer, time.Since(iterStart))
-			}
-
-			return &core.CompletionResult{
-				Response:   resultResponse,
-				Iterations: i + 1,
-				Duration:   time.Since(start),
-				Usage: core.UsageStats{
-					PromptTokens:        totalPromptTokens,
-					CompletionTokens:    totalCompletionTokens,
-					TotalTokens:         totalPromptTokens + totalCompletionTokens,
-					CacheCreationTokens: totalCacheCreationTokens,
-					CacheReadTokens:     totalCacheReadTokens,
-				},
-			}, nil
 		}
 
 		// Log iteration (no final answer)
 		if r.config.Logger != nil {
-			_ = r.config.Logger.LogIteration(i+1, messages, response, execResults, rlmCalls, locals, nil, time.Since(iterStart))
+			_ = r.config.Logger.LogIteration(i+1, messages, response, execResult.execResults, rlmCalls, locals, nil, time.Since(iterStart))
 		}
 
 		// Check for early termination based on confidence signals
-		if r.shouldTerminateEarly(confidenceSignals, len(codeBlocks)) {
-			if r.config.Verbose {
-				fmt.Printf("[RLM] Early termination triggered (confidence signals: %d)\n", confidenceSignals)
-			}
-			// Build final messages for forced answer
-			finalMessages := []core.Message{
-				{Role: "system", Content: r.config.SystemPrompt},
-				{Role: "user", Content: r.buildCompactHistoryPrompt(contextInfo, query, history.String(), i)},
-			}
-			return r.forceDefaultAnswer(ctx, finalMessages, start, totalPromptTokens, totalCompletionTokens, totalCacheCreationTokens, totalCacheReadTokens)
+		if r.shouldTerminateEarly(state.confidenceSignals, len(codeBlocks)) {
+			r.logf("Early termination triggered (confidence signals: %d)", state.confidenceSignals)
+			finalMessages := r.buildCompactHistoryMessages(contextInfo, query, history.String(), i)
+			return r.forceDefaultAnswerWithState(ctx, finalMessages, state)
 		}
 
 		// Append to compact history
@@ -1701,13 +1592,29 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 		if len(codeBlocks) > 0 {
 			codeStr = codeBlocks[0] // Just include first code block for brevity
 		}
-		appendIterationHistory(&history, i+1, action, "", codeStr, allOutput.String())
+		appendIterationHistory(&history, i+1, action, "", codeStr, outputStr)
 	}
 
 	// Max iterations exhausted - force final answer
-	finalMessages := []core.Message{
-		{Role: "system", Content: r.config.SystemPrompt},
-		{Role: "user", Content: r.buildCompactHistoryPrompt(contextInfo, query, history.String(), maxIterations-1)},
+	finalMessages := r.buildCompactHistoryMessages(contextInfo, query, history.String(), maxIterations-1)
+	return r.forceDefaultAnswerWithState(ctx, finalMessages, state)
+}
+
+// determineActionType returns the action type string for compact history.
+func determineActionType(codeBlocks []string, response string) string {
+	if len(codeBlocks) == 0 {
+		return "thinking"
 	}
-	return r.forceDefaultAnswer(ctx, finalMessages, start, totalPromptTokens, totalCompletionTokens, totalCacheCreationTokens, totalCacheReadTokens)
+	if strings.Contains(response, "Query(") || strings.Contains(response, "QueryBatched(") {
+		return "query"
+	}
+	return "explore"
+}
+
+// buildCompactHistoryMessages builds the messages array for compact history mode.
+func (r *RLM) buildCompactHistoryMessages(contextInfo, query, historyStr string, iteration int) []core.Message {
+	return []core.Message{
+		{Role: "system", Content: r.config.SystemPrompt},
+		{Role: "user", Content: r.buildCompactHistoryPrompt(contextInfo, query, historyStr, iteration)},
+	}
 }

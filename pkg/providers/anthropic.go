@@ -132,8 +132,8 @@ type streamEvent struct {
 	} `json:"usage,omitempty"`
 }
 
-// Complete implements rlm.LLMClient for root LLM orchestration.
-func (c *AnthropicClient) Complete(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+// prepareMessages extracts system prompt and converts messages to API format.
+func (c *AnthropicClient) prepareMessages(messages []core.Message) (string, []anthropicMessage) {
 	var systemPrompt string
 	var apiMessages []anthropicMessage
 
@@ -147,6 +147,12 @@ func (c *AnthropicClient) Complete(ctx context.Context, messages []core.Message)
 			})
 		}
 	}
+	return systemPrompt, apiMessages
+}
+
+// Complete implements rlm.LLMClient for root LLM orchestration.
+func (c *AnthropicClient) Complete(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+	systemPrompt, apiMessages := c.prepareMessages(messages)
 
 	reqBody := anthropicRequest{
 		Model:     c.model,
@@ -315,19 +321,7 @@ func (c *AnthropicClient) doRequest(ctx context.Context, reqBody anthropicReques
 // The handler is called for each chunk of content as it arrives.
 // Returns the complete response with token usage after stream completes.
 func (c *AnthropicClient) CompleteStream(ctx context.Context, messages []core.Message, handler StreamHandler) (core.LLMResponse, error) {
-	var systemPrompt string
-	var apiMessages []anthropicMessage
-
-	for _, msg := range messages {
-		if msg.Role == "system" {
-			systemPrompt = msg.Content
-		} else {
-			apiMessages = append(apiMessages, anthropicMessage{
-				Role:    msg.Role,
-				Content: msg.Content,
-			})
-		}
-	}
+	systemPrompt, apiMessages := c.prepareMessages(messages)
 
 	reqBody := anthropicRequest{
 		Model:     c.model,

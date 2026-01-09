@@ -94,26 +94,9 @@ func (p *REPLPool) Stats() (poolSize, totalCreated int) {
 	return len(p.pool), p.created
 }
 
-// interpreterPool is a simple sync.Pool for basic interpreter reuse.
-// Note: Due to Yaegi limitations, interpreters can't be fully reset,
-// so this primarily helps with pre-warming the GC and memory allocation.
-var interpreterPool = sync.Pool{
-	New: func() interface{} {
-		stdout := new(bytes.Buffer)
-		stderr := new(bytes.Buffer)
-
-		i := interp.New(interp.Options{
-			Stdout: stdout,
-			Stderr: stderr,
-		})
-
-		if err := i.Use(stdlib.Symbols); err != nil {
-			panic(fmt.Sprintf("failed to load stdlib: %v", err))
-		}
-
-		return i
-	},
-}
+// Note: Yaegi interpreters cannot be reset to a clean state, so traditional
+// pooling (reusing the same interpreter across requests) is not possible.
+// See REPLPool for a pre-creation approach that helps with startup latency.
 
 // QueryResponse contains the LLM response with usage metadata.
 type QueryResponse struct {
@@ -205,49 +188,13 @@ func New(client LLMClient, opts ...REPLOption) *REPL {
 	return r
 }
 
-// NewPooled creates a new REPL instance using the interpreter pool.
-// This eliminates the 10-50ms startup overhead per REPL instance.
-// Call Close() when done to return the interpreter to the pool.
+// NewPooled creates a new REPL instance with pooling flags set.
+// Note: Due to Yaegi interpreter limitations (can't be reset to clean state),
+// this function simply creates a fresh REPL each time. The pooling flags are
+// preserved for compatibility, but actual interpreter reuse is not possible.
+// Consider using REPLPool for pre-created REPL instances if startup time matters.
 func NewPooled(client LLMClient) *REPL {
-	stdout := new(bytes.Buffer)
-	stderr := new(bytes.Buffer)
-
-	// Get interpreter from pool (will be created if pool is empty)
-	pooledInterp := interpreterPool.Get().(*interp.Interpreter)
-
-	// Create a new interpreter with fresh buffers
-	// Note: We can't reuse the pooled interpreter's buffers as they may contain stale data
-	// and we can't safely redirect them. Instead, we create a fresh interpreter.
-	i := interp.New(interp.Options{
-		Stdout: stdout,
-		Stderr: stderr,
-	})
-
-	// Load standard library
-	if err := i.Use(stdlib.Symbols); err != nil {
-		panic(fmt.Sprintf("failed to load stdlib: %v", err))
-	}
-
-	// Return the pooled interpreter since we can't fully reuse it
-	interpreterPool.Put(pooledInterp)
-
-	r := &REPL{
-		interp:       i,
-		stdout:       stdout,
-		stderr:       stderr,
-		llmClient:    client,
-		ctx:          context.Background(),
-		fromPool:     true,
-		usePooling:   true,
-		asyncQueries: make(map[string]*AsyncQueryHandle),
-	}
-
-	// Inject RLM functions
-	if err := r.injectBuiltins(); err != nil {
-		panic(fmt.Sprintf("failed to inject builtins: %v", err))
-	}
-
-	return r
+	return New(client, WithPooling(true))
 }
 
 // Close releases resources and returns the interpreter to the pool if applicable.
