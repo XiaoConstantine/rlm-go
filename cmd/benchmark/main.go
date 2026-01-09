@@ -210,6 +210,8 @@ type RLMOptions struct {
 	MaxIters       int
 	EarlyTerminate bool
 	RecursionDepth int
+	CompactHistory bool
+	FewShot        bool
 }
 
 // ModelClient is an interface for clients that expose their model name.
@@ -275,6 +277,10 @@ func runRLM(ctx context.Context, task Task, client providers.Client, opts RLMOpt
 
 	if opts.RecursionDepth > 0 {
 		rlmOpts = append(rlmOpts, rlm.WithMaxRecursionDepth(opts.RecursionDepth))
+	}
+
+	if opts.CompactHistory {
+		rlmOpts = append(rlmOpts, rlm.WithCompactHistory(opts.FewShot))
 	}
 
 	r := rlm.New(client, client, rlmOpts...)
@@ -395,6 +401,8 @@ func main() {
 		maxIters            = flag.Int("max-iters", 30, "Maximum iterations (used in both adaptive and fixed modes)")
 		enableEarlyTerm     = flag.Bool("early-termination", true, "Enable early termination on confidence (requires -adaptive)")
 		recursionDepth      = flag.Int("recursion-depth", 1, "Max recursion depth for multi-depth RLM (0=disabled, 1=paper default)")
+		enableCompactHist   = flag.Bool("compact-history", false, "Enable compact string-based history (reduces tokens)")
+		enableFewShot       = flag.Bool("few-shot", true, "Include few-shot examples (requires -compact-history)")
 	)
 	flag.Parse()
 
@@ -451,6 +459,9 @@ func main() {
 	if *recursionDepth > 0 {
 		fmt.Printf("Multi-Depth Recursion: enabled (max-depth=%d)\n", *recursionDepth)
 	}
+	if *enableCompactHist {
+		fmt.Printf("Compact History: enabled (few-shot=%v)\n", *enableFewShot)
+	}
 	if *enablePrefixCaching && provider == providers.Anthropic {
 		fmt.Println("Prefix Caching: enabled (Anthropic)")
 	} else if provider == providers.Anthropic {
@@ -498,6 +509,8 @@ func main() {
 		MaxIters:       *maxIters,
 		EarlyTerminate: *enableEarlyTerm,
 		RecursionDepth: *recursionDepth,
+		CompactHistory: *enableCompactHist,
+		FewShot:        *enableFewShot,
 	}
 
 	var baselineResults []BenchmarkResult

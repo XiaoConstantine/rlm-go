@@ -14,6 +14,7 @@ import (
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
 	"github.com/XiaoConstantine/rlm-go/pkg/repl"
+	"github.com/XiaoConstantine/rlm-go/pkg/rlm"
 )
 
 // AnthropicClient implements Client for Anthropic's Claude API.
@@ -103,9 +104,8 @@ type anthropicResponse struct {
 	} `json:"error,omitempty"`
 }
 
-// StreamHandler is called for each chunk of streamed content.
-// chunk contains the new text delta, done indicates stream completion.
-type StreamHandler func(chunk string, done bool) error
+// StreamHandler is an alias for rlm.StreamHandler to ensure interface compatibility.
+type StreamHandler = rlm.StreamHandler
 
 // streamEvent represents a Server-Sent Event from Anthropic's streaming API.
 type streamEvent struct {

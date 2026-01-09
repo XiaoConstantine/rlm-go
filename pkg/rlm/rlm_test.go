@@ -1684,3 +1684,289 @@ func TestCreateExecutionEnvironmentWithoutSandbox(t *testing.T) {
 		t.Errorf("expected *REPLAdapter, got %T", env)
 	}
 }
+
+// Tests for Compact History
+
+func TestWithCompactHistory(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithCompactHistory(true))
+
+	if rlm.config.CompactHistory == nil {
+		t.Fatal("CompactHistory should be set")
+	}
+	if !rlm.config.CompactHistory.Enabled {
+		t.Error("CompactHistory should be enabled")
+	}
+	if !rlm.config.CompactHistory.IncludeFewShot {
+		t.Error("IncludeFewShot should be true")
+	}
+	if rlm.config.CompactHistory.MaxHistoryLength != 10000 {
+		t.Errorf("MaxHistoryLength = %d, want 10000", rlm.config.CompactHistory.MaxHistoryLength)
+	}
+}
+
+func TestWithCompactHistoryConfig(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	cfg := CompactHistoryConfig{
+		MaxHistoryLength: 5000,
+		IncludeFewShot:   false,
+	}
+
+	rlm := New(client, replClient, WithCompactHistoryConfig(cfg))
+
+	if rlm.config.CompactHistory == nil {
+		t.Fatal("CompactHistory should be set")
+	}
+	if !rlm.config.CompactHistory.Enabled {
+		t.Error("CompactHistory should be enabled")
+	}
+	if rlm.config.CompactHistory.IncludeFewShot {
+		t.Error("IncludeFewShot should be false")
+	}
+	if rlm.config.CompactHistory.MaxHistoryLength != 5000 {
+		t.Errorf("MaxHistoryLength = %d, want 5000", rlm.config.CompactHistory.MaxHistoryLength)
+	}
+}
+
+func TestWithCompactHistoryConfigDefaults(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	// Test with zero MaxHistoryLength - should use default
+	cfg := CompactHistoryConfig{
+		MaxHistoryLength: 0,
+		IncludeFewShot:   true,
+	}
+
+	rlm := New(client, replClient, WithCompactHistoryConfig(cfg))
+
+	if rlm.config.CompactHistory.MaxHistoryLength != 10000 {
+		t.Errorf("MaxHistoryLength = %d, want 10000 (default)", rlm.config.CompactHistory.MaxHistoryLength)
+	}
+}
+
+func TestCompleteWithCompactHistory(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{Content: "FINAL(42)", PromptTokens: 10, CompletionTokens: 5}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient,
+		WithCompactHistory(true),
+		WithMaxIterations(5),
+	)
+
+	result, err := rlm.Complete(context.Background(), "test context", "What is the answer?")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+
+	if result.Response != "42" {
+		t.Errorf("Response = %q, want %q", result.Response, "42")
+	}
+	if result.Iterations != 1 {
+		t.Errorf("Iterations = %d, want 1", result.Iterations)
+	}
+}
+
+func TestCompleteWithCompactHistoryMultipleIterations(t *testing.T) {
+	callCount := 0
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			callCount++
+			if callCount < 3 {
+				return core.LLMResponse{Content: "```go\nfmt.Println(\"thinking...\")\n```", PromptTokens: 10, CompletionTokens: 15}, nil
+			}
+			return core.LLMResponse{Content: "FINAL(done after 3 iterations)", PromptTokens: 10, CompletionTokens: 10}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient,
+		WithCompactHistory(false), // Without few-shot for cleaner test
+		WithMaxIterations(10),
+	)
+
+	result, err := rlm.Complete(context.Background(), "test context", "Think hard")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+
+	if result.Response != "done after 3 iterations" {
+		t.Errorf("Response = %q, want %q", result.Response, "done after 3 iterations")
+	}
+	if result.Iterations != 3 {
+		t.Errorf("Iterations = %d, want 3", result.Iterations)
+	}
+}
+
+func TestTrimHistoryIfNeeded(t *testing.T) {
+	tests := []struct {
+		name    string
+		history string
+		maxLen  int
+		check   func(result string) bool
+	}{
+		{
+			name:    "short history not trimmed",
+			history: "short",
+			maxLen:  100,
+			check:   func(result string) bool { return result == "short" },
+		},
+		{
+			name:    "long history trimmed",
+			history: strings.Repeat("a", 1000),
+			maxLen:  100,
+			check:   func(result string) bool { return len(result) < 1000 && strings.Contains(result, "[...earlier iterations truncated...]") },
+		},
+		{
+			name:    "preserves iteration markers",
+			history: "old content\n--- Iteration 1 ---\nmore content\n--- Iteration 2 ---\nrecent content",
+			maxLen:  50,
+			check:   func(result string) bool { return strings.Contains(result, "--- Iteration") },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := trimHistoryIfNeeded(tt.history, tt.maxLen)
+			if !tt.check(result) {
+				t.Errorf("trimHistoryIfNeeded() = %q, unexpected result", result)
+			}
+		})
+	}
+}
+
+func TestAppendIterationHistory(t *testing.T) {
+	var history strings.Builder
+
+	appendIterationHistory(&history, 1, "explore", "thinking about it", "fmt.Println(1)", "1\n")
+
+	result := history.String()
+
+	if !strings.Contains(result, "--- Iteration 1 ---") {
+		t.Error("should contain iteration marker")
+	}
+	if !strings.Contains(result, "Action: explore") {
+		t.Error("should contain action")
+	}
+	if !strings.Contains(result, "```go") {
+		t.Error("should contain code block")
+	}
+	if !strings.Contains(result, "Output:") {
+		t.Error("should contain output")
+	}
+}
+
+func TestBuildCompactHistoryPrompt(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithCompactHistory(true))
+
+	// Test first iteration
+	prompt := rlm.buildCompactHistoryPrompt("string, 100 chars", "What is the answer?", "", 0)
+
+	if !strings.Contains(prompt, "Context: string, 100 chars") {
+		t.Error("should contain context info")
+	}
+	if !strings.Contains(prompt, "Query: What is the answer?") {
+		t.Error("should contain query")
+	}
+	if !strings.Contains(prompt, "You have not explored the context yet") {
+		t.Error("first iteration should have exploration prompt")
+	}
+	if !strings.Contains(prompt, "FEW-SHOT EXAMPLES") {
+		t.Error("should include few-shot examples when enabled")
+	}
+}
+
+func TestBuildCompactHistoryPromptWithHistory(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithCompactHistory(false)) // No few-shot for cleaner test
+
+	history := "--- Iteration 1 ---\nAction: explore\nOutput: hello"
+	prompt := rlm.buildCompactHistoryPrompt("string, 100 chars", "What is the answer?", history, 1)
+
+	if !strings.Contains(prompt, "=== PREVIOUS ITERATIONS ===") {
+		t.Error("should contain history section header")
+	}
+	if !strings.Contains(prompt, history) {
+		t.Error("should contain the history")
+	}
+	if !strings.Contains(prompt, "Based on your previous exploration") {
+		t.Error("subsequent iteration should have continuation prompt")
+	}
+}
+
+// Tests for Few-Shot Examples
+
+func TestIterationDemos(t *testing.T) {
+	demos := IterationDemos()
+
+	if len(demos) == 0 {
+		t.Fatal("expected at least one demo example")
+	}
+
+	// Verify first demo has expected structure
+	first := demos[0]
+	if first.ContextInfo == "" {
+		t.Error("first demo should have context info")
+	}
+	if first.Query == "" {
+		t.Error("first demo should have query")
+	}
+	if first.Reasoning == "" {
+		t.Error("first demo should have reasoning")
+	}
+	if first.Action == "" {
+		t.Error("first demo should have action")
+	}
+}
+
+func TestFormatFewShotExamples(t *testing.T) {
+	result := FormatFewShotExamples()
+
+	if !strings.Contains(result, "FEW-SHOT EXAMPLES") {
+		t.Error("should contain header")
+	}
+	if !strings.Contains(result, "EXAMPLE 1:") {
+		t.Error("should contain example 1")
+	}
+	if !strings.Contains(result, "My reasoning:") {
+		t.Error("should contain reasoning")
+	}
+	if !strings.Contains(result, "```go") {
+		t.Error("should contain code blocks")
+	}
+	if !strings.Contains(result, "FINAL(") {
+		t.Error("should contain FINAL example")
+	}
+}
+
+func TestFewShotExampleStructure(t *testing.T) {
+	demos := IterationDemos()
+
+	// Find the final answer example
+	var hasFinalExample bool
+	for _, demo := range demos {
+		if demo.Answer != "" {
+			hasFinalExample = true
+			if demo.Action != "final" {
+				t.Errorf("example with answer should have action 'final', got %q", demo.Action)
+			}
+		}
+	}
+
+	if !hasFinalExample {
+		t.Error("should have at least one example showing FINAL answer")
+	}
+}
