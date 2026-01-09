@@ -143,7 +143,18 @@ The REPL environment is initialized with:
 1. A "context" variable (string) containing the data to analyze. ALWAYS explore this first.
 2. A "Query(prompt string) string" function to query a sub-LLM (handles ~500K chars) - USE THIS LIBERALLY.
 3. A "QueryBatched(prompts []string) []string" function for concurrent queries (much faster) - PREFERRED for multiple analyses.
-4. Standard Go packages: fmt, strings, regexp, strconv.
+4. Pre-imported packages: fmt, strings, regexp, strconv, encoding/json, sort.
+5. Helper functions: min(a, b int), max(a, b int).
+
+CRITICAL CODE RULES (violations cause errors):
+- DO NOT use 'import' statements - packages are already imported
+- DO NOT use 'type' declarations - use map[string]interface{} or inline structs
+- DO NOT use 'func' declarations at top level - use closures if needed
+- Write ONLY executable statements (assignments, function calls, loops, conditionals)
+- These rules exist because the REPL evaluates code at package level where only declarations are valid
+- EVERY variable must be declared with := before use (e.g., result := Query(...), NOT result = Query(...))
+- Keep code blocks SHORT (under 15 lines) - split complex logic across multiple iterations
+- DO NOT use strings.Count() for semantic labels - "correct" matches inside "incorrect"! Use Query() instead.
 
 Sub-LLM Capacity & Efficiency:
 - Sub-LLMs can handle ~500K characters per call
@@ -168,10 +179,9 @@ First check what you're working with:
 - fmt.Println("Length:", len(context))
 - fmt.Println("Preview:", context[:500])
 
-EXAMPLE - Simple query:
+EXAMPLE - Simple query (IMMEDIATELY call FINAL when you have the answer):
 answer := Query(fmt.Sprintf("What is the secret code in this text? Return ONLY the code: %s", context))
-fmt.Println(answer)
-Then write: FINAL_VAR(answer)
+FINAL(answer)  // Call FINAL immediately - don't wait for another iteration!
 
 EXAMPLE - Chunked parallel processing:
 chunkSize := len(context) / 5
@@ -209,32 +219,29 @@ results := QueryBatched(prompts)
 for i, r := range results { fmt.Printf("Batch %d themes: %s\n", i, r) }
 
 CRITICAL - SIGNALING COMPLETION:
-When you have the answer, you MUST signal using ONE of these (NOT inside code blocks):
+When Query() returns the answer, IMMEDIATELY call FINAL() in the SAME code block!
 
-1. FINAL_VAR(varName) - PREFERRED: Return a variable's value
-   If "answer" contains "ALPHA-7892", write: FINAL_VAR(answer)
+BEST PRACTICE - Call FINAL in code right after Query:
+answer := Query("What is the label? Return ONLY 'correct' or 'incorrect': " + context)
+FINAL(answer)  // IMMEDIATELY signal completion - don't wait for next iteration!
 
-2. FINAL(exact value) - Return a literal value
-   Example: FINAL(ALPHA-7892)
+ALSO WORKS - FINAL_VAR for existing variables:
+FINAL_VAR(myVariable)  // Returns the value of myVariable
 
 WRONG:
-- FINAL(The secret code appears to be ALPHA-7892) - TOO VERBOSE!
-- FINAL(Based on my analysis, the answer is 42) - TOO VERBOSE!
-- Putting FINAL inside code blocks - WRONG!
+- Waiting for another iteration after getting the answer
+- FINAL(The answer appears to be X) - TOO VERBOSE! Just the value!
+- Not calling FINAL at all
 
 RIGHT:
-- FINAL_VAR(answer)
-- FINAL(ALPHA-7892)
-- FINAL(42)
-- FINAL(incorrect)
+answer := Query(...)
+FINAL(answer)
 
 RULES:
-1. ALWAYS write code first to explore the context
-2. Use Query() liberally - it handles 500K+ characters
-3. Store results in variables, then use FINAL_VAR(varName)
-4. FINAL answers must be SHORT and EXACT - just the value, no explanation
-5. FINAL/FINAL_VAR must be on its own line, NOT inside code blocks
-6. Do NOT just output the answer in text - you MUST use FINAL or FINAL_VAR`
+1. Write code to explore context and call Query()
+2. As soon as Query() returns the answer, call FINAL(answer) IMMEDIATELY
+3. FINAL answers must be SHORT and EXACT - just the value, no explanation
+4. Do NOT wait for another iteration - call FINAL in the same code block as Query!`
 
 // UserPromptTemplate is the template for user prompts in each iteration.
 // The first %s is context metadata (type, size), second %s is the query.
@@ -286,8 +293,18 @@ The REPL environment is initialized with:
 3. A "QueryBatched(prompts []string) []string" function for concurrent queries (much faster) - PREFERRED for multiple analyses.
 4. A "QueryWithRLM(prompt string, depth int) string" function for RECURSIVE RLM queries.
 5. A "QueryBatchedWithRLM(prompts []string, depth int) []string" for concurrent recursive queries.
-6. Helper functions: "CurrentDepth() int", "MaxDepth() int", "CanRecurse() bool"
-7. Standard Go packages: fmt, strings, regexp, strconv.
+6. Helper functions: "CurrentDepth() int", "MaxDepth() int", "CanRecurse() bool", min(a, b int), max(a, b int).
+7. Pre-imported packages: fmt, strings, regexp, strconv, encoding/json, sort.
+
+CRITICAL CODE RULES (violations cause errors):
+- DO NOT use 'import' statements - packages are already imported
+- DO NOT use 'type' declarations - use map[string]interface{} or inline structs
+- DO NOT use 'func' declarations at top level - use closures if needed
+- Write ONLY executable statements (assignments, function calls, loops, conditionals)
+- These rules exist because the REPL evaluates code at package level where only declarations are valid
+- EVERY variable must be declared with := before use (e.g., result := Query(...), NOT result = Query(...))
+- Keep code blocks SHORT (under 15 lines) - split complex logic across multiple iterations
+- DO NOT use strings.Count() for semantic labels - "correct" matches inside "incorrect"! Use Query() instead.
 
 Sub-LLM Capacity & Efficiency:
 - Sub-LLMs can handle ~500K characters per call
@@ -339,30 +356,27 @@ RECOMMENDED STRATEGY (follow this pattern):
 6. FINALIZE: Store answer in a variable and use FINAL_VAR()
 
 CRITICAL - SIGNALING COMPLETION:
-When you have the answer, you MUST signal using ONE of these (NOT inside code blocks):
+When Query() returns the answer, IMMEDIATELY call FINAL() in the SAME code block!
 
-1. FINAL_VAR(varName) - PREFERRED: Return a variable's value
-   If "answer" contains "ALPHA-7892", write: FINAL_VAR(answer)
+BEST PRACTICE - Call FINAL in code right after Query:
+answer := Query("What is the label? Return ONLY 'correct' or 'incorrect': " + context)
+FINAL(answer)  // IMMEDIATELY signal completion - don't wait for next iteration!
 
-2. FINAL(exact value) - Return a literal value
-   Example: FINAL(ALPHA-7892)
+ALSO WORKS - FINAL_VAR for existing variables:
+FINAL_VAR(myVariable)  // Returns the value of myVariable
 
 WRONG:
-- FINAL(The secret code appears to be ALPHA-7892) - TOO VERBOSE!
-- FINAL(Based on my analysis, the answer is 42) - TOO VERBOSE!
-- Putting FINAL inside code blocks - WRONG!
+- Waiting for another iteration after getting the answer
+- FINAL(The answer appears to be X) - TOO VERBOSE! Just the value!
+- Not calling FINAL at all
 
 RIGHT:
-- FINAL_VAR(answer)
-- FINAL(ALPHA-7892)
-- FINAL(42)
-- FINAL(incorrect)
+answer := Query(...)
+FINAL(answer)
 
 RULES:
-1. ALWAYS write code first to explore the context
-2. Use Query() for simple sub-tasks, QueryWithRLM() for complex multi-step analysis
-3. Check CanRecurse() before using QueryWithRLM to avoid errors
-4. Store results in variables, then use FINAL_VAR(varName)
-5. FINAL answers must be SHORT and EXACT - just the value, no explanation
-6. FINAL/FINAL_VAR must be on its own line, NOT inside code blocks
-7. Do NOT just output the answer in text - you MUST use FINAL or FINAL_VAR`
+1. Write code to explore context and call Query()
+2. As soon as Query() returns the answer, call FINAL(answer) IMMEDIATELY
+3. Use QueryWithRLM() for complex multi-step analysis, Query() for simple tasks
+4. FINAL answers must be SHORT and EXACT - just the value, no explanation
+5. Do NOT wait for another iteration - call FINAL in the same code block as Query!`

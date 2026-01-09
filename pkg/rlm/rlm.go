@@ -1565,6 +1565,17 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 			// Aggregate token usage
 			totalPromptTokens += call.PromptTokens
 			totalCompletionTokens += call.CompletionTokens
+
+			// CRITICAL FIX: Add Query results to history so the LLM can see them in subsequent iterations.
+			// Without this, Query() return values assigned to variables are invisible in compact history mode,
+			// causing the LLM to guess/hallucinate the answer in later iterations.
+			allOutput.WriteString(fmt.Sprintf("\n[Query] %s\n[Result] %s\n",
+				truncate(call.Prompt, 200),
+				call.Response))
+
+			if r.config.Verbose {
+				fmt.Printf("[RLM] Query result: %s\n", truncate(call.Response, 200))
+			}
 		}
 
 		// Get locals from execution environment for logging
@@ -1586,11 +1597,46 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 			action = "query"
 		}
 
-		// Check for final answer - BUT only if there were NO code blocks in this response.
+		// Check for final answer in BOTH the LLM response AND the execution output.
+		// FINAL/FINAL_VAR can appear in:
+		// 1. LLM response text (outside code blocks) - traditional usage
+		// 2. Execution output (stdout) - when FINAL/FINAL_VAR is called from code
 		var finalAnswer any
 		var resultResponse string
+
+		// First check execution output for FINAL (from code-called FINAL/FINAL_VAR functions)
+		outputStr := allOutput.String()
+		if final := parsing.FindFinalAnswer(outputStr); final != nil {
+			// Found FINAL in execution output - the value is already resolved
+			resultResponse = final.Content
+			finalAnswer = resultResponse
+
+			if r.config.Verbose {
+				fmt.Printf("[RLM] Found FINAL in execution output: %s\n", truncate(resultResponse, 100))
+			}
+
+			// Log iteration before returning
+			if r.config.Logger != nil {
+				_ = r.config.Logger.LogIteration(i+1, messages, response, execResults, rlmCalls, locals, finalAnswer, time.Since(iterStart))
+			}
+
+			return &core.CompletionResult{
+				Response:   resultResponse,
+				Iterations: i + 1,
+				Duration:   time.Since(start),
+				Usage: core.UsageStats{
+					PromptTokens:        totalPromptTokens,
+					CompletionTokens:    totalCompletionTokens,
+					TotalTokens:         totalPromptTokens + totalCompletionTokens,
+					CacheCreationTokens: totalCacheCreationTokens,
+					CacheReadTokens:     totalCacheReadTokens,
+				},
+			}, nil
+		}
+
+		// Then check LLM response (only if no code blocks, to avoid false positives from code examples)
 		if len(codeBlocks) == 0 && parsing.FindFinalAnswer(response) != nil {
-			// No code blocks and has final answer - process it
+			// No code blocks and has final answer in response text - process it
 			final := parsing.FindFinalAnswer(response)
 			varName := final.Content
 			varValue := varName // Default to content itself
