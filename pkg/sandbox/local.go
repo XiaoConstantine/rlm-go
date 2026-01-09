@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
+	"github.com/XiaoConstantine/rlm-go/pkg/interpreter"
 	"github.com/traefik/yaegi/interp"
 	"github.com/traefik/yaegi/stdlib"
 )
@@ -74,31 +74,8 @@ func (e *LocalExecutor) injectBuiltins() error {
 		return fmt.Errorf("failed to inject rlm symbols: %w", err)
 	}
 
-	// Pre-import common packages and RLM functions
-	setupCode := `
-import "fmt"
-import "strings"
-import "regexp"
-import . "rlm/rlm"
-
-// min returns the smaller of two integers (Go 1.21 builtin not supported in Yaegi)
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// max returns the larger of two integers (Go 1.21 builtin not supported in Yaegi)
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-`
-	_, err := e.interp.Eval(setupCode)
-	return err
+	// Use the shared setup code for basic imports
+	return interpreter.RunSetup(e.interp, interpreter.SetupCode)
 }
 
 // llmQuery makes a single LLM query.
@@ -234,10 +211,10 @@ func (e *LocalExecutor) LoadContext(payload any) error {
 		return err
 
 	case map[string]any:
-		return e.loadStructuredContext(v, "map[string]interface{}")
+		return e.loadStructuredContext(v)
 
 	case []any:
-		return e.loadStructuredContext(v, "[]interface{}")
+		return e.loadStructuredContext(v)
 
 	default:
 		jsonBytes, err := json.Marshal(v)
@@ -250,7 +227,7 @@ func (e *LocalExecutor) LoadContext(payload any) error {
 
 // loadStructuredContext handles map and slice context types.
 // It marshals the data to JSON and stores it as a string, which can be parsed by user code.
-func (e *LocalExecutor) loadStructuredContext(v any, _ string) error {
+func (e *LocalExecutor) loadStructuredContext(v any) error {
 	jsonBytes, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("marshal context: %w", err)
@@ -294,13 +271,7 @@ func (e *LocalExecutor) GetLocals() map[string]any {
 
 	locals := make(map[string]any)
 
-	varNames := []string{
-		"context", "result", "answer", "data", "output", "response",
-		"analysis", "summary", "final_answer", "count", "total",
-		"items", "records", "values", "results", "findings",
-	}
-
-	for _, name := range varNames {
+	for _, name := range core.CommonVarNames {
 		v, err := e.interp.Eval(name)
 		if err != nil || !v.IsValid() {
 			continue
@@ -376,19 +347,7 @@ func (e *LocalExecutor) Backend() Backend {
 }
 
 // FormatExecutionResult formats an execution result for display.
+// This is a convenience wrapper around core.FormatExecutionResult.
 func FormatExecutionResult(result *core.ExecutionResult) string {
-	var parts []string
-
-	if result.Stdout != "" {
-		parts = append(parts, result.Stdout)
-	}
-	if result.Stderr != "" {
-		parts = append(parts, result.Stderr)
-	}
-
-	if len(parts) == 0 {
-		return "No output"
-	}
-
-	return strings.Join(parts, "\n\n")
+	return core.FormatExecutionResult(result)
 }

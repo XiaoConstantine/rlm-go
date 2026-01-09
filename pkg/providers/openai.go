@@ -7,11 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
-	"github.com/XiaoConstantine/rlm-go/pkg/repl"
 )
 
 // OpenAIClient implements Client for OpenAI's API.
@@ -96,8 +94,8 @@ func (c *OpenAIClient) Complete(ctx context.Context, messages []core.Message) (c
 	}, nil
 }
 
-// Query implements repl.LLMClient for sub-LLM calls from REPL.
-func (c *OpenAIClient) Query(ctx context.Context, prompt string) (repl.QueryResponse, error) {
+// Query implements LLMClient for sub-LLM calls from REPL.
+func (c *OpenAIClient) Query(ctx context.Context, prompt string) (core.QueryResponse, error) {
 	reqBody := openaiRequest{
 		Model: c.model,
 		Messages: []openaiMessage{
@@ -106,33 +104,16 @@ func (c *OpenAIClient) Query(ctx context.Context, prompt string) (repl.QueryResp
 	}
 
 	text, promptTokens, completionTokens, err := c.doRequest(ctx, reqBody)
-	return repl.QueryResponse{
+	return core.QueryResponse{
 		Response:         text,
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
 	}, err
 }
 
-// QueryBatched implements repl.LLMClient for concurrent sub-LLM calls.
-func (c *OpenAIClient) QueryBatched(ctx context.Context, prompts []string) ([]repl.QueryResponse, error) {
-	results := make([]repl.QueryResponse, len(prompts))
-	var wg sync.WaitGroup
-
-	for i, prompt := range prompts {
-		wg.Add(1)
-		go func(idx int, p string) {
-			defer wg.Done()
-			result, err := c.Query(ctx, p)
-			if err != nil {
-				results[idx] = repl.QueryResponse{Response: fmt.Sprintf("Error: %v", err)}
-			} else {
-				results[idx] = result
-			}
-		}(i, prompt)
-	}
-
-	wg.Wait()
-	return results, nil
+// QueryBatched implements LLMClient for concurrent sub-LLM calls.
+func (c *OpenAIClient) QueryBatched(ctx context.Context, prompts []string) ([]core.QueryResponse, error) {
+	return QueryBatchedConcurrent(ctx, prompts, c.Query)
 }
 
 func (c *OpenAIClient) doRequest(ctx context.Context, reqBody openaiRequest) (string, int, int, error) {

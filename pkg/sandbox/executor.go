@@ -107,26 +107,15 @@ func DefaultConfig() Config {
 // LLMClient defines the interface for making LLM calls from within the sandbox.
 // This mirrors repl.LLMClient for compatibility.
 type LLMClient interface {
-	Query(ctx context.Context, prompt string) (QueryResponse, error)
-	QueryBatched(ctx context.Context, prompts []string) ([]QueryResponse, error)
+	Query(ctx context.Context, prompt string) (core.QueryResponse, error)
+	QueryBatched(ctx context.Context, prompts []string) ([]core.QueryResponse, error)
 }
 
-// QueryResponse contains the LLM response with usage metadata.
-type QueryResponse struct {
-	Response         string
-	PromptTokens     int
-	CompletionTokens int
-}
+// QueryResponse is an alias for core.QueryResponse for backward compatibility.
+type QueryResponse = core.QueryResponse
 
-// LLMCall represents a sub-LLM call made from within the sandbox.
-type LLMCall struct {
-	Prompt           string  `json:"prompt"`
-	Response         string  `json:"response"`
-	Duration         float64 `json:"duration"`
-	PromptTokens     int     `json:"prompt_tokens"`
-	CompletionTokens int     `json:"completion_tokens"`
-	Async            bool    `json:"async,omitempty"`
-}
+// LLMCall is an alias for core.LLMCall for backward compatibility.
+type LLMCall = core.LLMCall
 
 // Executor defines the interface for sandbox execution.
 // All sandbox backends (local, podman, docker) implement this interface.

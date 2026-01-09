@@ -9,11 +9,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
-	"github.com/XiaoConstantine/rlm-go/pkg/repl"
 	"github.com/XiaoConstantine/rlm-go/pkg/rlm"
 )
 
@@ -198,8 +196,8 @@ func (c *AnthropicClient) Model() string {
 	return c.model
 }
 
-// Query implements repl.LLMClient for sub-LLM calls from REPL.
-func (c *AnthropicClient) Query(ctx context.Context, prompt string) (repl.QueryResponse, error) {
+// Query implements LLMClient for sub-LLM calls from REPL.
+func (c *AnthropicClient) Query(ctx context.Context, prompt string) (core.QueryResponse, error) {
 	reqBody := anthropicRequest{
 		Model:     c.model,
 		MaxTokens: c.maxTokens,
@@ -209,33 +207,16 @@ func (c *AnthropicClient) Query(ctx context.Context, prompt string) (repl.QueryR
 	}
 
 	text, stats, err := c.doRequest(ctx, reqBody)
-	return repl.QueryResponse{
+	return core.QueryResponse{
 		Response:         text,
 		PromptTokens:     stats.inputTokens,
 		CompletionTokens: stats.outputTokens,
 	}, err
 }
 
-// QueryBatched implements repl.LLMClient for concurrent sub-LLM calls.
-func (c *AnthropicClient) QueryBatched(ctx context.Context, prompts []string) ([]repl.QueryResponse, error) {
-	results := make([]repl.QueryResponse, len(prompts))
-	var wg sync.WaitGroup
-
-	for i, prompt := range prompts {
-		wg.Add(1)
-		go func(idx int, p string) {
-			defer wg.Done()
-			result, err := c.Query(ctx, p)
-			if err != nil {
-				results[idx] = repl.QueryResponse{Response: fmt.Sprintf("Error: %v", err)}
-			} else {
-				results[idx] = result
-			}
-		}(i, prompt)
-	}
-
-	wg.Wait()
-	return results, nil
+// QueryBatched implements LLMClient for concurrent sub-LLM calls.
+func (c *AnthropicClient) QueryBatched(ctx context.Context, prompts []string) ([]core.QueryResponse, error) {
+	return QueryBatchedConcurrent(ctx, prompts, c.Query)
 }
 
 type requestStats struct {

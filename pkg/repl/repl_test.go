@@ -808,11 +808,17 @@ func TestNewPooled(t *testing.T) {
 	}
 }
 
-func TestWithPoolingOption(t *testing.T) {
+func TestNewPooledDeprecated(t *testing.T) {
 	client := newMockClient()
-	repl := New(client, WithPooling(true))
+	// NewPooled is deprecated but should still work, returning a standard REPL
+	repl := NewPooled(client)
 
-	if !repl.usePooling {
-		t.Error("expected usePooling to be true")
+	// Verify the REPL works correctly
+	result, err := repl.Execute(context.Background(), `fmt.Println("test")`)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "test") {
+		t.Errorf("expected 'test' in stdout, got %q", result.Stdout)
 	}
 }

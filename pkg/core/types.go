@@ -3,6 +3,7 @@ package core
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -123,7 +124,7 @@ type DepthExceededError struct {
 // Error implements the error interface.
 func (e *DepthExceededError) Error() string {
 	return fmt.Sprintf("recursion depth exceeded: current=%d, max=%d, prompt=%q",
-		e.CurrentDepth, e.MaxDepth, truncatePrompt(e.Prompt, 50))
+		e.CurrentDepth, e.MaxDepth, Truncate(e.Prompt, 50))
 }
 
 // Truncate shortens a string to maxLen characters, adding "..." suffix if truncated.
@@ -135,7 +136,46 @@ func Truncate(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-// truncatePrompt truncates a prompt for error messages (internal alias for Truncate).
-func truncatePrompt(s string, maxLen int) string {
-	return Truncate(s, maxLen)
+// QueryResponse contains the LLM response with usage metadata.
+// This is used for sub-LLM calls from REPL/sandbox execution.
+type QueryResponse struct {
+	Response         string
+	PromptTokens     int
+	CompletionTokens int
+}
+
+// LLMCall represents a sub-LLM call made during code execution.
+type LLMCall struct {
+	Prompt           string  `json:"prompt"`
+	Response         string  `json:"response"`
+	Duration         float64 `json:"duration"`
+	PromptTokens     int     `json:"prompt_tokens"`
+	CompletionTokens int     `json:"completion_tokens"`
+	Async            bool    `json:"async,omitempty"`
+}
+
+// CommonVarNames is the list of commonly used variable names in RLM code.
+// Used by GetLocals implementations to extract user-defined variables.
+var CommonVarNames = []string{
+	"context", "result", "answer", "data", "output", "response",
+	"analysis", "summary", "final_answer", "count", "total",
+	"items", "records", "values", "results", "findings",
+}
+
+// FormatExecutionResult formats an execution result for display to the LLM.
+func FormatExecutionResult(result *ExecutionResult) string {
+	var parts []string
+
+	if result.Stdout != "" {
+		parts = append(parts, result.Stdout)
+	}
+	if result.Stderr != "" {
+		parts = append(parts, result.Stderr)
+	}
+
+	if len(parts) == 0 {
+		return "No output"
+	}
+
+	return strings.Join(parts, "\n\n")
 }

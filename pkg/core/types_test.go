@@ -615,7 +615,7 @@ func TestDepthExceededError_Implements_Error(t *testing.T) {
 	}
 }
 
-func TestTruncatePrompt(t *testing.T) {
+func TestTruncate(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    string
@@ -650,9 +650,9 @@ func TestTruncatePrompt(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := truncatePrompt(tt.input, tt.maxLen)
+			result := Truncate(tt.input, tt.maxLen)
 			if result != tt.expected {
-				t.Errorf("truncatePrompt() = %q, want %q", result, tt.expected)
+				t.Errorf("Truncate() = %q, want %q", result, tt.expected)
 			}
 		})
 	}

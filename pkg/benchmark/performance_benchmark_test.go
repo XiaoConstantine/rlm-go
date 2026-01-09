@@ -1,5 +1,7 @@
+//go:build benchmark
+
 // Package benchmark provides comprehensive performance benchmarks for rlm-go.
-// Run with: GOOGLE_API_KEY=$GOOGLE_API_KEY go test -v -timeout 20m ./pkg/benchmark/... -count=1
+// Run with: GOOGLE_API_KEY=$GOOGLE_API_KEY go test -v -timeout 20m -tags=benchmark ./pkg/benchmark/... -count=1
 package benchmark
 
 import (

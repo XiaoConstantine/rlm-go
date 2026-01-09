@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
+	"github.com/XiaoConstantine/rlm-go/pkg/interpreter"
 	"github.com/traefik/yaegi/interp"
 	"github.com/traefik/yaegi/stdlib"
 )
@@ -98,28 +98,17 @@ func (p *REPLPool) Stats() (poolSize, totalCreated int) {
 // pooling (reusing the same interpreter across requests) is not possible.
 // See REPLPool for a pre-creation approach that helps with startup latency.
 
-// QueryResponse contains the LLM response with usage metadata.
-type QueryResponse struct {
-	Response         string
-	PromptTokens     int
-	CompletionTokens int
-}
+// QueryResponse is an alias for core.QueryResponse for backward compatibility.
+type QueryResponse = core.QueryResponse
 
 // LLMClient defines the interface for making LLM calls from within the REPL.
 type LLMClient interface {
-	Query(ctx context.Context, prompt string) (QueryResponse, error)
-	QueryBatched(ctx context.Context, prompts []string) ([]QueryResponse, error)
+	Query(ctx context.Context, prompt string) (core.QueryResponse, error)
+	QueryBatched(ctx context.Context, prompts []string) ([]core.QueryResponse, error)
 }
 
-// LLMCall represents a sub-LLM call made from within the REPL.
-type LLMCall struct {
-	Prompt           string  `json:"prompt"`
-	Response         string  `json:"response"`
-	Duration         float64 `json:"duration"`
-	PromptTokens     int     `json:"prompt_tokens"`
-	CompletionTokens int     `json:"completion_tokens"`
-	Async            bool    `json:"async,omitempty"`
-}
+// LLMCall is an alias for core.LLMCall for backward compatibility.
+type LLMCall = core.LLMCall
 
 // REPL represents a Yaegi-based Go interpreter with RLM capabilities.
 type REPL struct {
@@ -130,8 +119,6 @@ type REPL struct {
 	ctx          context.Context
 	mu           sync.Mutex
 	llmCalls     []LLMCall // Track LLM calls made during execution
-	fromPool     bool      // Whether the interpreter came from the pool
-	usePooling   bool      // Whether to use pooling for this REPL
 	asyncQueries map[string]*AsyncQueryHandle
 	asyncMu      sync.RWMutex
 	execCount    int  // Track number of executions for health monitoring
@@ -140,14 +127,6 @@ type REPL struct {
 
 // REPLOption configures a REPL instance.
 type REPLOption func(*REPL)
-
-// WithPooling enables interpreter pooling for this REPL.
-// When enabled, the interpreter is returned to the pool on Close().
-func WithPooling(enabled bool) REPLOption {
-	return func(r *REPL) {
-		r.usePooling = enabled
-	}
-}
 
 // New creates a new REPL instance.
 func New(client LLMClient, opts ...REPLOption) *REPL {
@@ -170,8 +149,6 @@ func New(client LLMClient, opts ...REPLOption) *REPL {
 		stderr:       stderr,
 		llmClient:    client,
 		ctx:          context.Background(),
-		fromPool:     false,
-		usePooling:   false,
 		asyncQueries: make(map[string]*AsyncQueryHandle),
 	}
 
@@ -188,13 +165,13 @@ func New(client LLMClient, opts ...REPLOption) *REPL {
 	return r
 }
 
-// NewPooled creates a new REPL instance with pooling flags set.
+// NewPooled creates a new REPL instance.
 // Note: Due to Yaegi interpreter limitations (can't be reset to clean state),
-// this function simply creates a fresh REPL each time. The pooling flags are
-// preserved for compatibility, but actual interpreter reuse is not possible.
+// this function simply creates a fresh REPL each time.
 // Consider using REPLPool for pre-created REPL instances if startup time matters.
+// Deprecated: Use New() directly instead.
 func NewPooled(client LLMClient) *REPL {
-	return New(client, WithPooling(true))
+	return New(client)
 }
 
 // Close releases resources and returns the interpreter to the pool if applicable.
@@ -254,37 +231,8 @@ func (r *REPL) injectBuiltins() error {
 		return fmt.Errorf("failed to inject rlm symbols: %w", err)
 	}
 
-	// Pre-import common packages and RLM functions so they're available without qualification
-	// Also define min/max helper functions since Yaegi doesn't support Go 1.21 builtins
-	// NOTE: All common packages are pre-imported so LLM code should NOT use import statements
-	// (mixing imports with statements causes Yaegi to treat code as package-level where statements are invalid)
-	setupCode := `
-import "fmt"
-import "strings"
-import "regexp"
-import "strconv"
-import "encoding/json"
-import "sort"
-import . "rlm/rlm"
-
-// min returns the smaller of two integers (Go 1.21 builtin not supported in Yaegi)
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// max returns the larger of two integers (Go 1.21 builtin not supported in Yaegi)
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-`
-	_, err := r.interp.Eval(setupCode)
-	return err
+	// Use the shared extended setup code which includes all common imports
+	return interpreter.RunSetup(r.interp, interpreter.SetupCodeExtended)
 }
 
 // llmQuery makes a single LLM query. This is called from interpreted code.
@@ -826,14 +774,7 @@ func (r *REPL) GetLocals() map[string]any {
 
 	locals := make(map[string]any)
 
-	// Check for commonly used variable names in RLM code
-	varNames := []string{
-		"context", "result", "answer", "data", "output", "response",
-		"analysis", "summary", "final_answer", "count", "total",
-		"items", "records", "values", "results", "findings",
-	}
-
-	for _, name := range varNames {
+	for _, name := range core.CommonVarNames {
 		v, err := r.interp.Eval(name)
 		if err != nil || !v.IsValid() {
 			continue
@@ -868,19 +809,7 @@ func (r *REPL) ContextInfo() string {
 }
 
 // FormatExecutionResult formats an execution result for display to the LLM.
+// This is a convenience wrapper around core.FormatExecutionResult.
 func FormatExecutionResult(result *core.ExecutionResult) string {
-	var parts []string
-
-	if result.Stdout != "" {
-		parts = append(parts, result.Stdout)
-	}
-	if result.Stderr != "" {
-		parts = append(parts, result.Stderr)
-	}
-
-	if len(parts) == 0 {
-		return "No output"
-	}
-
-	return strings.Join(parts, "\n\n")
+	return core.FormatExecutionResult(result)
 }
