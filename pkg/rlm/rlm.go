@@ -193,9 +193,9 @@ func DefaultConfig() Config {
 
 // RLM is the main Recursive Language Model implementation.
 type RLM struct {
-	client    LLMClient
+	client     LLMClient
 	replClient repl.LLMClient
-	config    Config
+	config     Config
 }
 
 // New creates a new RLM instance.
@@ -700,11 +700,11 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 				Iterations: i + 1,
 				Duration:   time.Since(start),
 				Usage: core.UsageStats{
-					PromptTokens:          totalPromptTokens,
-					CompletionTokens:      totalCompletionTokens,
-					TotalTokens:           totalPromptTokens + totalCompletionTokens,
-					CacheCreationTokens:   totalCacheCreationTokens,
-					CacheReadTokens:       totalCacheReadTokens,
+					PromptTokens:        totalPromptTokens,
+					CompletionTokens:    totalCompletionTokens,
+					TotalTokens:         totalPromptTokens + totalCompletionTokens,
+					CacheCreationTokens: totalCacheCreationTokens,
+					CacheReadTokens:     totalCacheReadTokens,
 				},
 			}, nil
 		}
@@ -959,11 +959,11 @@ func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, s
 		Iterations: r.config.MaxIterations,
 		Duration:   time.Since(start),
 		Usage: core.UsageStats{
-			PromptTokens:          promptTokens,
-			CompletionTokens:      completionTokens,
-			TotalTokens:           promptTokens + completionTokens,
-			CacheCreationTokens:   cacheCreationTokens,
-			CacheReadTokens:       cacheReadTokens,
+			PromptTokens:        promptTokens,
+			CompletionTokens:    completionTokens,
+			TotalTokens:         promptTokens + completionTokens,
+			CacheCreationTokens: cacheCreationTokens,
+			CacheReadTokens:     cacheReadTokens,
 		},
 	}, nil
 }
@@ -1367,7 +1367,7 @@ func (r *RLM) buildCompactHistoryPrompt(contextInfo, query, history string, iter
 		prompt.WriteString("3. Use Query() to analyze it\n\n")
 		prompt.WriteString("Write your code now in a go code block:")
 	} else {
-		prompt.WriteString(fmt.Sprintf("\nBased on your previous exploration, continue working toward the answer.\n\n"))
+		prompt.WriteString("\nBased on your previous exploration, continue working toward the answer.\n\n")
 		prompt.WriteString("If you have found the answer and stored it in a variable:\n")
 		prompt.WriteString("- Write FINAL_VAR(varName) on its own line (not in code)\n\n")
 		prompt.WriteString("If you need more analysis:\n")
@@ -1623,11 +1623,11 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 				Iterations: i + 1,
 				Duration:   time.Since(start),
 				Usage: core.UsageStats{
-					PromptTokens:          totalPromptTokens,
-					CompletionTokens:      totalCompletionTokens,
-					TotalTokens:           totalPromptTokens + totalCompletionTokens,
-					CacheCreationTokens:   totalCacheCreationTokens,
-					CacheReadTokens:       totalCacheReadTokens,
+					PromptTokens:        totalPromptTokens,
+					CompletionTokens:    totalCompletionTokens,
+					TotalTokens:         totalPromptTokens + totalCompletionTokens,
+					CacheCreationTokens: totalCacheCreationTokens,
+					CacheReadTokens:     totalCacheReadTokens,
 				},
 			}, nil
 		}
