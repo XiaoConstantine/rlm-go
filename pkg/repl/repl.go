@@ -21,12 +21,12 @@ import (
 // Note: Since Yaegi interpreters accumulate state and can't be reset,
 // this pool pre-creates REPL instances for faster acquisition.
 type REPLPool struct {
-	pool      chan *REPL
-	client    LLMClient
-	maxSize   int
-	preWarm   bool
-	mu        sync.Mutex
-	created   int
+	pool    chan *REPL
+	client  LLMClient
+	maxSize int
+	preWarm bool
+	mu      sync.Mutex
+	created int
 }
 
 // NewREPLPool creates a new REPL pool with the specified size.
@@ -233,6 +233,56 @@ func (r *REPL) injectBuiltins() error {
 
 	// Use the shared extended setup code which includes all common imports
 	return interpreter.RunSetup(r.interp, interpreter.SetupCodeExtended)
+}
+
+// InjectSymbols merges external symbols into the REPL's "rlm/rlm" namespace.
+// Call this after REPL creation and context loading, before Execute().
+func (r *REPL) InjectSymbols(symbols map[string]reflect.Value) error {
+	if len(symbols) == 0 {
+		return nil
+	}
+
+	for name := range symbols {
+		if isBuiltinName(name) {
+			return fmt.Errorf("inject symbols: %q collides with existing RLM builtin", name)
+		}
+	}
+
+	exports := interp.Exports{
+		"rlm/rlm": make(map[string]reflect.Value, len(symbols)),
+	}
+	for name, val := range symbols {
+		exports["rlm/rlm"][name] = val
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err := r.interp.Use(exports); err != nil {
+		return fmt.Errorf("inject symbols: failed to merge symbols: %w", err)
+	}
+
+	// Refresh dot-imported names so newly injected symbols are available as unqualified identifiers.
+	if _, err := r.interp.Eval(`import . "rlm/rlm"`); err != nil {
+		return fmt.Errorf("inject symbols: failed to refresh imports: %w", err)
+	}
+
+	return nil
+}
+
+func isBuiltinName(name string) bool {
+	builtins := []string{
+		"Query", "QueryBatched", "QueryRaw", "QueryWith", "QueryBatchedRaw",
+		"QueryAsync", "QueryBatchedAsync", "WaitAsync", "AsyncReady", "AsyncResult",
+		"FINAL", "FINAL_VAR", "SUBMIT",
+		"FindRelevant", "GetChunk", "GetContext", "ChunkCount", "LineCount",
+	}
+	for _, builtin := range builtins {
+		if name == builtin {
+			return true
+		}
+	}
+	return false
 }
 
 // llmQuery makes a single LLM query. This is called from interpreted code.

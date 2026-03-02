@@ -65,9 +65,13 @@ type Config struct {
 	// When enabled, max iterations are dynamically calculated based on context size.
 	AdaptiveIteration *AdaptiveIterationConfig
 
-	// OnProgress is called at the start of each iteration with progress info.
+	// OnProgress is emitted after each root LLM call with progress info.
 	// Can be used to display progress to users or implement custom termination logic.
 	OnProgress func(progress IterationProgress)
+
+	// REPLSetup is called after REPL creation and context loading, but before
+	// the iteration loop starts. Use this to inject additional REPL symbols.
+	REPLSetup func(replEnv *repl.REPL) error
 
 	// Recursion configures multi-depth recursion behavior.
 	// When enabled, sub-LLMs can spawn their own sub-LLMs.
@@ -181,6 +185,10 @@ type IterationProgress struct {
 
 	// ContextSize is the size of the input context in bytes.
 	ContextSize int
+
+	// RootPromptTokens is the prompt token count for this iteration's root LLM call.
+	// This is the per-call value (not cumulative).
+	RootPromptTokens int
 }
 
 // DefaultConfig returns the default RLM configuration.
@@ -364,6 +372,14 @@ func WithAdaptiveIterationConfig(cfg AdaptiveIterationConfig) Option {
 func WithProgressHandler(handler func(IterationProgress)) Option {
 	return func(c *Config) {
 		c.OnProgress = handler
+	}
+}
+
+// WithREPLSetup sets a callback that runs after REPL creation + context load
+// and before the iteration loop begins.
+func WithREPLSetup(fn func(replEnv *repl.REPL) error) Option {
+	return func(c *Config) {
+		c.REPLSetup = fn
 	}
 }
 
@@ -557,6 +573,9 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 	if err := execEnv.LoadContext(contextPayload); err != nil {
 		return nil, fmt.Errorf("failed to load context: %w", err)
 	}
+	if err := r.runREPLSetup(execEnv); err != nil {
+		return nil, err
+	}
 
 	// Build initial message history
 	messages := r.buildInitialMessagesFromEnv(execEnv, query)
@@ -576,17 +595,6 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		default:
 		}
 
-		// Report progress if handler is set
-		if r.config.OnProgress != nil {
-			r.config.OnProgress(IterationProgress{
-				CurrentIteration:  i + 1,
-				MaxIterations:     maxIterations,
-				ConfidenceSignals: state.confidenceSignals,
-				HasFinalAttempt:   false,
-				ContextSize:       contextSize,
-			})
-		}
-
 		r.logf("Iteration %d/%d", i+1, maxIterations)
 
 		// Add iteration-specific user prompt
@@ -598,6 +606,18 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 			return nil, fmt.Errorf("iteration %d: llm completion failed: %w", i, err)
 		}
 		response := llmResp.Content
+
+		// Report progress after the root LLM call so per-iteration tokens are available.
+		if r.config.OnProgress != nil {
+			r.config.OnProgress(IterationProgress{
+				CurrentIteration:  i + 1,
+				MaxIterations:     maxIterations,
+				ConfidenceSignals: state.confidenceSignals,
+				HasFinalAttempt:   false,
+				ContextSize:       contextSize,
+				RootPromptTokens:  llmResp.PromptTokens,
+			})
+		}
 
 		// Aggregate tokens
 		state.aggregateTokens(llmResp)
@@ -852,6 +872,22 @@ func (r *RLM) summarizeIterations(messages []core.Message, maxTokens int) string
 	return result
 }
 
+func (r *RLM) runREPLSetup(execEnv ExecutionEnvironment) error {
+	if r.config.REPLSetup == nil {
+		return nil
+	}
+
+	replAdapter, ok := execEnv.(*REPLAdapter)
+	if !ok || replAdapter == nil || replAdapter.repl == nil {
+		return fmt.Errorf("REPL setup hook requires standard REPL execution environment")
+	}
+
+	if err := r.config.REPLSetup(replAdapter.repl); err != nil {
+		return fmt.Errorf("REPL setup hook failed: %w", err)
+	}
+	return nil
+}
+
 // forceDefaultAnswer forces the LLM to provide a final answer.
 func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, start time.Time, promptTokens, completionTokens, cacheCreationTokens, cacheReadTokens int) (*core.CompletionResult, error) {
 	messages = append(messages, core.Message{
@@ -980,6 +1016,15 @@ func (r *RLM) CompleteWithRecursion(
 	if err := replEnv.LoadContext(contextPayload); err != nil {
 		return nil, fmt.Errorf("failed to load context: %w", err)
 	}
+	if r.config.REPLSetup != nil {
+		if baseREPL, ok := replEnv.(*repl.REPL); ok {
+			if err := r.config.REPLSetup(baseREPL); err != nil {
+				return nil, fmt.Errorf("REPL setup hook failed: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("REPL setup hook requires standard REPL execution environment")
+		}
+	}
 
 	// Build initial message history with appropriate system prompt
 	contextInfo := replEnv.ContextInfo()
@@ -1011,22 +1056,6 @@ func (r *RLM) CompleteWithRecursion(
 		default:
 		}
 
-		// Report progress if handler is set
-		if r.config.OnProgress != nil {
-			depth := 0
-			if recursionCtx != nil {
-				depth = recursionCtx.CurrentDepth
-			}
-			r.config.OnProgress(IterationProgress{
-				CurrentIteration:  i + 1,
-				MaxIterations:     maxIterations,
-				ConfidenceSignals: confidenceSignals,
-				HasFinalAttempt:   false,
-				ContextSize:       contextSize,
-			})
-			_ = depth // Used for potential future logging
-		}
-
 		depth := 0
 		if recursionCtx != nil {
 			depth = recursionCtx.CurrentDepth
@@ -1042,6 +1071,18 @@ func (r *RLM) CompleteWithRecursion(
 			return nil, fmt.Errorf("iteration %d: llm completion failed: %w", i, err)
 		}
 		response := llmResp.Content
+
+		// Report progress after the root LLM call so per-iteration tokens are available.
+		if r.config.OnProgress != nil {
+			r.config.OnProgress(IterationProgress{
+				CurrentIteration:  i + 1,
+				MaxIterations:     maxIterations,
+				ConfidenceSignals: confidenceSignals,
+				HasFinalAttempt:   false,
+				ContextSize:       contextSize,
+				RootPromptTokens:  llmResp.PromptTokens,
+			})
+		}
 
 		// Aggregate root LLM tokens
 		totalPromptTokens += llmResp.PromptTokens
@@ -1459,6 +1500,9 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 	if err := execEnv.LoadContext(contextPayload); err != nil {
 		return nil, fmt.Errorf("failed to load context: %w", err)
 	}
+	if err := r.runREPLSetup(execEnv); err != nil {
+		return nil, err
+	}
 
 	// Initialize iteration state
 	contextSize := getContextSize(contextPayload)
@@ -1485,17 +1529,6 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 		default:
 		}
 
-		// Report progress if handler is set
-		if r.config.OnProgress != nil {
-			r.config.OnProgress(IterationProgress{
-				CurrentIteration:  i + 1,
-				MaxIterations:     maxIterations,
-				ConfidenceSignals: state.confidenceSignals,
-				HasFinalAttempt:   false,
-				ContextSize:       contextSize,
-			})
-		}
-
 		r.logf("Iteration %d/%d (compact history)", i+1, maxIterations)
 
 		// Trim history if needed
@@ -1514,6 +1547,18 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 			return nil, fmt.Errorf("iteration %d: llm completion failed: %w", i, err)
 		}
 		response := llmResp.Content
+
+		// Report progress after the root LLM call so per-iteration tokens are available.
+		if r.config.OnProgress != nil {
+			r.config.OnProgress(IterationProgress{
+				CurrentIteration:  i + 1,
+				MaxIterations:     maxIterations,
+				ConfidenceSignals: state.confidenceSignals,
+				HasFinalAttempt:   false,
+				ContextSize:       contextSize,
+				RootPromptTokens:  llmResp.PromptTokens,
+			})
+		}
 
 		// Aggregate tokens
 		state.aggregateTokens(llmResp)

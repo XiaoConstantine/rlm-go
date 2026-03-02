@@ -3,6 +3,7 @@ package rlm
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1177,6 +1178,30 @@ func TestWithProgressHandler(t *testing.T) {
 	}
 }
 
+func TestWithREPLSetup(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	var setupCalled bool
+	rlm := New(client, replClient, WithREPLSetup(func(replEnv *repl.REPL) error {
+		setupCalled = true
+		if replEnv == nil {
+			t.Fatal("expected non-nil repl")
+		}
+		return nil
+	}))
+
+	if rlm.config.REPLSetup == nil {
+		t.Fatal("REPLSetup should be set")
+	}
+	if err := rlm.config.REPLSetup(repl.New(replClient)); err != nil {
+		t.Fatalf("REPLSetup() error: %v", err)
+	}
+	if !setupCalled {
+		t.Fatal("expected setup callback to be called")
+	}
+}
+
 func TestComputeMaxIterations(t *testing.T) {
 	replClient := &mockREPLClient{}
 	client := &mockLLMClient{}
@@ -1489,6 +1514,68 @@ func TestCompleteWithProgressHandler(t *testing.T) {
 		if progressUpdates[0].MaxIterations != 10 {
 			t.Errorf("first update MaxIterations = %d, want 10", progressUpdates[0].MaxIterations)
 		}
+		if progressUpdates[0].RootPromptTokens != 10 {
+			t.Errorf("first update RootPromptTokens = %d, want 10", progressUpdates[0].RootPromptTokens)
+		}
+	}
+	if len(progressUpdates) > 1 {
+		if progressUpdates[1].RootPromptTokens != 10 {
+			t.Errorf("second update RootPromptTokens = %d, want 10", progressUpdates[1].RootPromptTokens)
+		}
+	}
+}
+
+func TestCompleteWithREPLSetupHook(t *testing.T) {
+	callCount := 0
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			callCount++
+			if callCount == 1 {
+				return core.LLMResponse{Content: "```go\nanswer := Echo(\"hello\")\n```", PromptTokens: 10, CompletionTokens: 15}, nil
+			}
+			return core.LLMResponse{Content: "FINAL_VAR(answer)", PromptTokens: 10, CompletionTokens: 5}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	var setupCalled bool
+	rlm := New(client, replClient, WithREPLSetup(func(replEnv *repl.REPL) error {
+		setupCalled = true
+		return replEnv.InjectSymbols(map[string]reflect.Value{
+			"Echo": reflect.ValueOf(func(s string) string { return "echo:" + s }),
+		})
+	}))
+
+	result, err := rlm.Complete(context.Background(), "test context", "query")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+	if result.Response != "echo:hello" {
+		t.Errorf("Response = %q, want %q", result.Response, "echo:hello")
+	}
+	if !setupCalled {
+		t.Fatal("expected REPL setup hook to be called")
+	}
+}
+
+func TestCompleteWithREPLSetupHookError(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{Content: "FINAL(done)", PromptTokens: 10, CompletionTokens: 5}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithREPLSetup(func(_ *repl.REPL) error {
+		return errors.New("setup failed")
+	}))
+
+	_, err := rlm.Complete(context.Background(), "test context", "query")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "REPL setup hook failed") {
+		t.Fatalf("expected REPL setup error, got: %v", err)
 	}
 }
 
@@ -1621,8 +1708,8 @@ func TestCompleteWithSandboxAndCodeExecution(t *testing.T) {
 			if callCount == 1 {
 				// First call: return code block
 				return core.LLMResponse{
-					Content: "```go\nfmt.Println(\"Hello from sandbox\")\n```",
-					PromptTokens: 10,
+					Content:          "```go\nfmt.Println(\"Hello from sandbox\")\n```",
+					PromptTokens:     10,
 					CompletionTokens: 20,
 				}, nil
 			}
@@ -1823,7 +1910,9 @@ func TestTrimHistoryIfNeeded(t *testing.T) {
 			name:    "long history trimmed",
 			history: strings.Repeat("a", 1000),
 			maxLen:  100,
-			check:   func(result string) bool { return len(result) < 1000 && strings.Contains(result, "[...earlier iterations truncated...]") },
+			check: func(result string) bool {
+				return len(result) < 1000 && strings.Contains(result, "[...earlier iterations truncated...]")
+			},
 		},
 		{
 			name:    "preserves iteration markers",

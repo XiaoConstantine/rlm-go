@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -14,11 +15,11 @@ import (
 
 // mockLLMClient implements LLMClient for testing
 type mockLLMClient struct {
-	mu            sync.Mutex
-	queryFunc     func(ctx context.Context, prompt string) (QueryResponse, error)
-	batchFunc     func(ctx context.Context, prompts []string) ([]QueryResponse, error)
-	queryCalls    []string
-	batchCalls    [][]string
+	mu         sync.Mutex
+	queryFunc  func(ctx context.Context, prompt string) (QueryResponse, error)
+	batchFunc  func(ctx context.Context, prompts []string) ([]QueryResponse, error)
+	queryCalls []string
+	batchCalls [][]string
 }
 
 func newMockClient() *mockLLMClient {
@@ -217,6 +218,41 @@ func TestLoadContextSlice(t *testing.T) {
 	// The info might show the slice type
 	if info == "context not loaded" {
 		t.Error("expected context to be loaded")
+	}
+}
+
+func TestInjectSymbols(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+
+	err := repl.InjectSymbols(map[string]reflect.Value{
+		"Echo": reflect.ValueOf(func(s string) string { return "echo:" + s }),
+	})
+	if err != nil {
+		t.Fatalf("InjectSymbols() error: %v", err)
+	}
+
+	v, err := repl.interp.Eval(`Echo("hello")`)
+	if err != nil {
+		t.Fatalf("Eval() error: %v", err)
+	}
+	if got := fmt.Sprintf("%v", v.Interface()); got != "echo:hello" {
+		t.Errorf("Echo() = %q, want %q", got, "echo:hello")
+	}
+}
+
+func TestInjectSymbolsBuiltinCollision(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+
+	err := repl.InjectSymbols(map[string]reflect.Value{
+		"Query": reflect.ValueOf(func(_ string) string { return "x" }),
+	})
+	if err == nil {
+		t.Fatal("expected InjectSymbols() collision error, got nil")
+	}
+	if !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("expected collision error, got: %v", err)
 	}
 }
 
