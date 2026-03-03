@@ -9,44 +9,23 @@ import (
 	"github.com/traefik/yaegi/stdlib"
 )
 
-// SetupCode is the common initialization code for all Yaegi interpreters.
-// It pre-imports common packages and defines min/max helpers since
-// Yaegi doesn't support Go 1.21 builtins.
-const SetupCode = `
+// Base imports shared by all Yaegi interpreters.
+const baseImports = `
 import "fmt"
 import "strings"
 import "regexp"
 import . "rlm/rlm"
-
-// min returns the smaller of two integers (Go 1.21 builtin not supported in Yaegi)
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// max returns the larger of two integers (Go 1.21 builtin not supported in Yaegi)
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
 `
 
-// SetupCodeExtended includes additional imports (strconv, encoding/json, sort).
-// Used by REPL which needs these for context loading.
-const SetupCodeExtended = `
-import "fmt"
-import "strings"
-import "regexp"
+// Additional imports needed by REPL for context loading.
+const extendedImports = `
 import "strconv"
 import "encoding/json"
 import "sort"
-import . "rlm/rlm"
+`
 
-// min returns the smaller of two integers (Go 1.21 builtin not supported in Yaegi)
+// MinMaxHelpers defines min/max since Yaegi doesn't support Go 1.21 builtins.
+const MinMaxHelpers = `
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -54,7 +33,6 @@ func min(a, b int) int {
 	return b
 }
 
-// max returns the larger of two integers (Go 1.21 builtin not supported in Yaegi)
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -62,6 +40,14 @@ func max(a, b int) int {
 	return b
 }
 `
+
+// SetupCode is the common initialization code for all Yaegi interpreters.
+// It pre-imports common packages and defines min/max helpers.
+const SetupCode = baseImports + MinMaxHelpers
+
+// SetupCodeExtended includes additional imports (strconv, encoding/json, sort).
+// Used by REPL which needs these for context loading.
+const SetupCodeExtended = baseImports + extendedImports + MinMaxHelpers
 
 // Config holds configuration for creating a new interpreter.
 type Config struct {

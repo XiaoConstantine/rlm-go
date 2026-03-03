@@ -112,17 +112,18 @@ type LLMCall = core.LLMCall
 
 // REPL represents a Yaegi-based Go interpreter with RLM capabilities.
 type REPL struct {
-	interp       *interp.Interpreter
-	stdout       *bytes.Buffer
-	stderr       *bytes.Buffer
-	llmClient    LLMClient
-	ctx          context.Context
-	mu           sync.Mutex
-	llmCalls     []LLMCall // Track LLM calls made during execution
-	asyncQueries map[string]*AsyncQueryHandle
-	asyncMu      sync.RWMutex
-	execCount    int  // Track number of executions for health monitoring
-	needsReset   bool // Flag indicating interpreter corruption detected
+	interp        *interp.Interpreter
+	stdout        *bytes.Buffer
+	stderr        *bytes.Buffer
+	llmClient     LLMClient
+	ctx           context.Context
+	mu            sync.Mutex
+	llmCalls      []LLMCall // Track LLM calls made during execution
+	asyncQueries  map[string]*AsyncQueryHandle
+	asyncMu       sync.RWMutex
+	execCount     int  // Track number of executions for health monitoring
+	needsReset    bool // Flag indicating interpreter corruption detected
+	injectedNames map[string]struct{}
 }
 
 // REPLOption configures a REPL instance.
@@ -212,23 +213,30 @@ func (r *REPL) resetState() {
 
 // injectBuiltins registers llmQuery and llmQueryBatched functions in the interpreter.
 func (r *REPL) injectBuiltins() error {
-	symbols := interp.Exports{
-		"rlm/rlm": {
-			"Query":             reflect.ValueOf(r.llmQuery),
-			"QueryBatched":      reflect.ValueOf(r.llmQueryBatched),
-			"QueryAsync":        reflect.ValueOf(r.llmQueryAsync),
-			"QueryBatchedAsync": reflect.ValueOf(r.llmQueryBatchedAsync),
-			"WaitAsync":         reflect.ValueOf(r.waitAsync),
-			"AsyncReady":        reflect.ValueOf(r.asyncReady),
-			"AsyncResult":       reflect.ValueOf(r.asyncResult),
-			// FINAL and FINAL_VAR allow LLMs to signal completion from within code blocks
-			"FINAL":     reflect.ValueOf(r.finalAnswer),
-			"FINAL_VAR": reflect.ValueOf(r.finalVarAnswer),
-		},
+	rlmSymbols := map[string]reflect.Value{
+		"Query":             reflect.ValueOf(r.llmQuery),
+		"QueryBatched":      reflect.ValueOf(r.llmQueryBatched),
+		"QueryAsync":        reflect.ValueOf(r.llmQueryAsync),
+		"QueryBatchedAsync": reflect.ValueOf(r.llmQueryBatchedAsync),
+		"WaitAsync":         reflect.ValueOf(r.waitAsync),
+		"AsyncReady":        reflect.ValueOf(r.asyncReady),
+		"AsyncResult":       reflect.ValueOf(r.asyncResult),
+		// FINAL and FINAL_VAR allow LLMs to signal completion from within code blocks
+		"FINAL":     reflect.ValueOf(r.finalAnswer),
+		"FINAL_VAR": reflect.ValueOf(r.finalVarAnswer),
 	}
+
+	symbols := interp.Exports{"rlm/rlm": rlmSymbols}
 
 	if err := r.interp.Use(symbols); err != nil {
 		return fmt.Errorf("failed to inject rlm symbols: %w", err)
+	}
+
+	// Record the names so InjectSymbols can guard against collisions
+	// with exactly the builtins this instance actually registered.
+	r.injectedNames = make(map[string]struct{}, len(rlmSymbols))
+	for name := range rlmSymbols {
+		r.injectedNames[name] = struct{}{}
 	}
 
 	// Use the shared extended setup code which includes all common imports
@@ -243,7 +251,7 @@ func (r *REPL) InjectSymbols(symbols map[string]reflect.Value) error {
 	}
 
 	for name := range symbols {
-		if isBuiltinName(name) {
+		if _, collision := r.injectedNames[name]; collision {
 			return fmt.Errorf("inject symbols: %q collides with existing RLM builtin", name)
 		}
 	}
@@ -268,21 +276,6 @@ func (r *REPL) InjectSymbols(symbols map[string]reflect.Value) error {
 	}
 
 	return nil
-}
-
-func isBuiltinName(name string) bool {
-	builtins := []string{
-		"Query", "QueryBatched", "QueryRaw", "QueryWith", "QueryBatchedRaw",
-		"QueryAsync", "QueryBatchedAsync", "WaitAsync", "AsyncReady", "AsyncResult",
-		"FINAL", "FINAL_VAR", "SUBMIT",
-		"FindRelevant", "GetChunk", "GetContext", "ChunkCount", "LineCount",
-	}
-	for _, builtin := range builtins {
-		if name == builtin {
-			return true
-		}
-	}
-	return false
 }
 
 // llmQuery makes a single LLM query. This is called from interpreted code.

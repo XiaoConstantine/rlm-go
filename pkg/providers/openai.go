@@ -92,8 +92,7 @@ type openaiStreamEvent struct {
 
 // Complete implements rlm.LLMClient for root LLM orchestration.
 func (c *OpenAIClient) Complete(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
-	var apiMessages []openaiMessage
-
+	apiMessages := make([]openaiMessage, 0, len(messages))
 	for _, msg := range messages {
 		apiMessages = append(apiMessages, openaiMessage{
 			Role:    msg.Role,
@@ -195,7 +194,7 @@ func (c *OpenAIClient) doRequest(ctx context.Context, reqBody openaiRequest) (st
 // The handler is called for each chunk of content as it arrives.
 // Returns the complete response with token usage after stream completes.
 func (c *OpenAIClient) CompleteStream(ctx context.Context, messages []core.Message, handler rlm.StreamHandler) (core.LLMResponse, error) {
-	var apiMessages []openaiMessage
+	apiMessages := make([]openaiMessage, 0, len(messages))
 	for _, msg := range messages {
 		apiMessages = append(apiMessages, openaiMessage{
 			Role:    msg.Role,
@@ -247,14 +246,13 @@ func (c *OpenAIClient) doStreamRequest(ctx context.Context, reqBody openaiReques
 	var promptTokens, completionTokens int
 
 	scanner := bufio.NewScanner(resp.Body)
-	buf := make([]byte, 0, 64*1024)
+	buf := make([]byte, 0, 4*1024)
 	scanner.Buffer(buf, 1024*1024)
 
 	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
+		// Check for cancellation before processing buffered lines.
+		if ctx.Err() != nil {
 			return core.LLMResponse{}, ctx.Err()
-		default:
 		}
 
 		line := scanner.Text()
@@ -302,6 +300,10 @@ func (c *OpenAIClient) doStreamRequest(ctx context.Context, reqBody openaiReques
 	}
 
 	if err := scanner.Err(); err != nil {
+		// Context cancellation closes the connection, surfacing as a read error.
+		if ctx.Err() != nil {
+			return core.LLMResponse{}, ctx.Err()
+		}
 		return core.LLMResponse{}, fmt.Errorf("scanner error: %w", err)
 	}
 

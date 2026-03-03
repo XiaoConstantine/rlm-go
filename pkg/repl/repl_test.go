@@ -256,6 +256,20 @@ func TestInjectSymbolsBuiltinCollision(t *testing.T) {
 	}
 }
 
+func TestInjectSymbolsRecursiveNameAllowedInStandardREPL(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+
+	// QueryWithRLM is only a builtin in RecursiveREPL, not in standard REPL,
+	// so injecting it should succeed.
+	err := repl.InjectSymbols(map[string]reflect.Value{
+		"QueryWithRLM": reflect.ValueOf(func(s string) string { return "custom:" + s }),
+	})
+	if err != nil {
+		t.Fatalf("InjectSymbols() should allow recursive-only names in standard REPL, got: %v", err)
+	}
+}
+
 func TestGetVariable(t *testing.T) {
 	client := newMockClient()
 	repl := New(client)

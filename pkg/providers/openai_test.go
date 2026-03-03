@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
 )
@@ -418,6 +419,42 @@ func TestOpenAIClient_CompleteStream_NilHandler(t *testing.T) {
 	}
 	if resp.Content != "Hello!" {
 		t.Errorf("Expected 'Hello!', got %s", resp.Content)
+	}
+}
+
+func TestOpenAIClient_CompleteStream_ContextCancel(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		// Write one chunk then stall so the client has time to cancel
+		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"Hello"}}]}` + "\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		// Block until the client disconnects
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	client := NewOpenAIClient("test-key", "gpt-5", false)
+	client.baseURL = server.URL
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel after a short delay so the stream is mid-flight
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err := client.CompleteStream(ctx, []core.Message{{Role: "user", Content: "Hi"}}, nil)
+	if err == nil {
+		t.Fatal("Expected error from cancelled context, got nil")
+	}
+	if err != context.Canceled {
+		t.Errorf("Expected context.Canceled, got: %v", err)
 	}
 }
 
