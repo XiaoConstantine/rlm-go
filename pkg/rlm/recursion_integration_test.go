@@ -2,6 +2,7 @@ package rlm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -241,6 +242,42 @@ func TestRecursiveComplete_PerDepthMaxIterations(t *testing.T) {
 				t.Errorf("computeMaxIterationsForDepth() = %d, want %d", result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestRecursiveCompleteTokenLimitExceeded(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{
+				Content:          "still thinking",
+				PromptTokens:     80,
+				CompletionTokens: 40,
+			}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	r := New(client, replClient,
+		WithMaxRecursionDepth(2),
+		WithMaxTokens(100),
+	)
+
+	_, err := r.RecursiveComplete(context.Background(), "test context", "test query")
+	if err == nil {
+		t.Fatal("expected token limit error")
+	}
+
+	var limitErr *TokenLimitExceededError
+	if !errors.As(err, &limitErr) {
+		t.Fatalf("expected TokenLimitExceededError, got %T (%v)", err, err)
+	}
+	var partialErr PartialResultError
+	if !errors.As(err, &partialErr) {
+		t.Fatalf("expected PartialResultError, got %T", err)
+	}
+	partial := partialErr.PartialResult()
+	if partial == nil || partial.Response != "still thinking" {
+		t.Fatalf("expected partial response 'still thinking', got %+v", partial)
 	}
 }
 

@@ -2,6 +2,7 @@ package rlm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -31,10 +32,34 @@ type StreamingLLMClient interface {
 	CompleteStream(ctx context.Context, messages []core.Message, handler StreamHandler) (core.LLMResponse, error)
 }
 
+// CostEstimator estimates total USD cost for the current usage.
+// It is used to enforce MaxBudgetUSD when configured.
+type CostEstimator func(usage core.UsageStats) (float64, error)
+
 // Config holds RLM configuration.
 type Config struct {
 	// MaxIterations is the maximum number of iteration loops (default: 30).
 	MaxIterations int
+
+	// MaxBudgetUSD is the maximum allowed total cost in USD for one completion.
+	// Disabled when <= 0.
+	MaxBudgetUSD float64
+
+	// MaxTimeout is the maximum wall-clock duration for one completion.
+	// Disabled when <= 0.
+	MaxTimeout time.Duration
+
+	// MaxTokens is the maximum allowed total tokens (prompt + completion).
+	// Disabled when <= 0.
+	MaxTokens int
+
+	// MaxErrors is the maximum allowed consecutive code execution errors.
+	// Disabled when <= 0.
+	MaxErrors int
+
+	// CostEstimator estimates total USD cost from cumulative usage.
+	// Required when MaxBudgetUSD is enabled.
+	CostEstimator CostEstimator
 
 	// SystemPrompt overrides the default system prompt.
 	SystemPrompt string
@@ -201,9 +226,10 @@ func DefaultConfig() Config {
 
 // RLM is the main Recursive Language Model implementation.
 type RLM struct {
-	client     LLMClient
-	replClient repl.LLMClient
-	config     Config
+	client         LLMClient
+	replClient     repl.LLMClient
+	config         Config
+	limitConfigErr error
 }
 
 // logf is a conditional logging helper that only prints when verbose mode is enabled.
@@ -222,11 +248,143 @@ func (r *RLM) logCacheStats(llmResp core.LLMResponse, state *iterationState) {
 	}
 }
 
-// forceDefaultAnswerWithState wraps forceDefaultAnswer using iteration state.
-func (r *RLM) forceDefaultAnswerWithState(ctx context.Context, messages []core.Message, state *iterationState) (*core.CompletionResult, error) {
-	return r.forceDefaultAnswer(ctx, messages, state.start,
-		state.totalPromptTokens, state.totalCompletionTokens,
-		state.totalCacheCreationTokens, state.totalCacheReadTokens)
+func validateLimitConfig(cfg Config) error {
+	if cfg.MaxBudgetUSD > 0 && cfg.CostEstimator == nil {
+		return &BudgetEstimatorNotConfiguredError{
+			BudgetUSD: cfg.MaxBudgetUSD,
+		}
+	}
+	return nil
+}
+
+func (r *RLM) checkCancellation(ctx context.Context, state *iterationState) error {
+	select {
+	case <-ctx.Done():
+		return &CancellationError{
+			Cause:   ctx.Err(),
+			partial: state.buildPartialResult(),
+		}
+	default:
+		return nil
+	}
+}
+
+func (r *RLM) checkTimeout(state *iterationState, completedIterations int) error {
+	if r.config.MaxTimeout <= 0 {
+		return nil
+	}
+	elapsed := time.Since(state.start)
+	if elapsed <= r.config.MaxTimeout {
+		return nil
+	}
+	return &TimeoutExceededError{
+		CompletedIterations: completedIterations,
+		Elapsed:             elapsed,
+		Timeout:             r.config.MaxTimeout,
+		partial:             state.buildPartialResult(),
+		cause:               context.DeadlineExceeded,
+	}
+}
+
+func (r *RLM) withRemainingTimeout(ctx context.Context, state *iterationState, completedIterations int) (context.Context, context.CancelFunc, error) {
+	if r.config.MaxTimeout <= 0 {
+		return ctx, func() {}, nil
+	}
+	remaining := r.config.MaxTimeout - time.Since(state.start)
+	if remaining <= 0 {
+		return nil, nil, &TimeoutExceededError{
+			CompletedIterations: completedIterations,
+			Elapsed:             time.Since(state.start),
+			Timeout:             r.config.MaxTimeout,
+			partial:             state.buildPartialResult(),
+			cause:               context.DeadlineExceeded,
+		}
+	}
+	callCtx, cancel := context.WithTimeout(ctx, remaining)
+	return callCtx, cancel, nil
+}
+
+func (r *RLM) wrapCallError(err error, state *iterationState, completedIterations int) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) && r.config.MaxTimeout > 0 {
+		return &TimeoutExceededError{
+			CompletedIterations: completedIterations,
+			Elapsed:             time.Since(state.start),
+			Timeout:             r.config.MaxTimeout,
+			partial:             state.buildPartialResult(),
+			cause:               err,
+		}
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return &CancellationError{
+			Cause:   err,
+			partial: state.buildPartialResult(),
+		}
+	}
+	return err
+}
+
+func (r *RLM) updateIterationStateAndCheckLimits(state *iterationState, execResults []core.CodeBlock, iteration int) error {
+	if r.config.MaxErrors > 0 {
+		iterationHadError := false
+		for _, codeBlock := range execResults {
+			if strings.TrimSpace(codeBlock.Result.Stderr) != "" {
+				iterationHadError = true
+				state.lastError = codeBlock.Result.Stderr
+				break
+			}
+		}
+
+		if iterationHadError {
+			state.consecutiveErrors++
+		} else {
+			state.consecutiveErrors = 0
+			state.lastError = ""
+		}
+
+		if state.consecutiveErrors >= r.config.MaxErrors {
+			return &ErrorThresholdExceededError{
+				Iteration:  iteration,
+				ErrorCount: state.consecutiveErrors,
+				Threshold:  r.config.MaxErrors,
+				LastError:  state.lastError,
+				partial:    state.buildPartialResult(),
+			}
+		}
+	}
+
+	if r.config.MaxTokens > 0 {
+		totalTokens := state.totalPromptTokens + state.totalCompletionTokens
+		if totalTokens > r.config.MaxTokens {
+			return &TokenLimitExceededError{
+				Iteration:  iteration,
+				TokensUsed: totalTokens,
+				TokenLimit: r.config.MaxTokens,
+				partial:    state.buildPartialResult(),
+			}
+		}
+	}
+
+	if r.config.MaxBudgetUSD > 0 {
+		totalCostUSD, err := r.config.CostEstimator(state.usageStats())
+		if err != nil {
+			return fmt.Errorf("iteration %d: cost estimation failed: %w", iteration, err)
+		}
+		state.totalCostUSD = totalCostUSD
+
+		if totalCostUSD > r.config.MaxBudgetUSD {
+			return &BudgetExceededError{
+				Iteration: iteration,
+				SpentUSD:  totalCostUSD,
+				BudgetUSD: r.config.MaxBudgetUSD,
+				partial:   state.buildPartialResult(),
+			}
+		}
+	}
+
+	return nil
 }
 
 // tryResetInterpreter attempts to reset the interpreter if it supports the ResetIfNeeded interface.
@@ -252,9 +410,10 @@ func New(client LLMClient, replClient repl.LLMClient, opts ...Option) *RLM {
 	}
 
 	return &RLM{
-		client:     client,
-		replClient: replClient,
-		config:     cfg,
+		client:         client,
+		replClient:     replClient,
+		config:         cfg,
+		limitConfigErr: validateLimitConfig(cfg),
 	}
 }
 
@@ -265,6 +424,53 @@ type Option func(*Config)
 func WithMaxIterations(n int) Option {
 	return func(c *Config) {
 		c.MaxIterations = n
+	}
+}
+
+// WithMaxBudgetUSD sets the maximum allowed budget in USD.
+func WithMaxBudgetUSD(budget float64) Option {
+	return func(c *Config) {
+		if budget <= 0 {
+			budget = 0
+		}
+		c.MaxBudgetUSD = budget
+	}
+}
+
+// WithMaxTimeout sets the maximum wall-clock completion duration.
+func WithMaxTimeout(timeout time.Duration) Option {
+	return func(c *Config) {
+		if timeout <= 0 {
+			timeout = 0
+		}
+		c.MaxTimeout = timeout
+	}
+}
+
+// WithMaxTokens sets the maximum total tokens (prompt + completion).
+func WithMaxTokens(tokens int) Option {
+	return func(c *Config) {
+		if tokens <= 0 {
+			tokens = 0
+		}
+		c.MaxTokens = tokens
+	}
+}
+
+// WithMaxErrors sets the maximum consecutive code execution errors.
+func WithMaxErrors(maxErrors int) Option {
+	return func(c *Config) {
+		if maxErrors <= 0 {
+			maxErrors = 0
+		}
+		c.MaxErrors = maxErrors
+	}
+}
+
+// WithCostEstimator sets the estimator used for budget enforcement.
+func WithCostEstimator(estimator CostEstimator) Option {
+	return func(c *Config) {
+		c.CostEstimator = estimator
 	}
 }
 
@@ -584,15 +790,19 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 	contextSize := getContextSize(contextPayload)
 	maxIterations := r.computeMaxIterations(contextSize)
 	state := newIterationState(contextSize, maxIterations)
+	if r.limitConfigErr != nil {
+		return nil, r.limitConfigErr
+	}
 
 	// Iteration loop
 	for i := 0; i < maxIterations; i++ {
 		iterStart := time.Now()
 
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		if err := r.checkCancellation(ctx, state); err != nil {
+			return nil, err
+		}
+		if err := r.checkTimeout(state, i); err != nil {
+			return nil, err
 		}
 
 		r.logf("Iteration %d/%d", i+1, maxIterations)
@@ -600,9 +810,19 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		// Add iteration-specific user prompt
 		currentMessages := r.appendIterationPrompt(messages, i, query)
 
-		// Get LLM response (streaming or non-streaming)
-		llmResp, err := r.completeWithOptionalStreaming(ctx, currentMessages)
+		callCtx, cancelCall, err := r.withRemainingTimeout(ctx, state, i)
 		if err != nil {
+			return nil, err
+		}
+
+		// Get LLM response (streaming or non-streaming)
+		llmResp, err := r.completeWithOptionalStreaming(callCtx, currentMessages)
+		cancelCall()
+		if err != nil {
+			wrappedErr := r.wrapCallError(err, state, i)
+			if wrappedErr != err {
+				return nil, wrappedErr
+			}
 			return nil, fmt.Errorf("iteration %d: llm completion failed: %w", i, err)
 		}
 		response := llmResp.Content
@@ -621,6 +841,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 
 		// Aggregate tokens
 		state.aggregateTokens(llmResp)
+		state.recordLatestPartial(response, i+1)
 		r.logCacheStats(llmResp, state)
 		r.logf("Response: %s", truncate(response, truncateLenShort))
 
@@ -632,6 +853,10 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		llmCalls := execEnv.GetLLMCalls()
 		rlmCalls := convertCallsToLoggerEntries(llmCalls)
 		state.aggregateLLMCallTokens(llmCalls)
+
+		if err := r.updateIterationStateAndCheckLimits(state, execResult.execResults, i+1); err != nil {
+			return nil, err
+		}
 
 		// Get locals from execution environment for logging
 		locals := execEnv.GetLocals()
@@ -664,7 +889,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		// Check for early termination based on confidence signals
 		if r.shouldTerminateEarly(state.confidenceSignals, len(codeBlocks)) {
 			r.logf("Early termination triggered (confidence signals: %d)", state.confidenceSignals)
-			return r.forceDefaultAnswerWithState(ctx, messages, state)
+			return r.forceDefaultAnswer(ctx, messages, state, i+1)
 		}
 
 		// Append iteration results to history
@@ -677,7 +902,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 	}
 
 	// Max iterations exhausted - force final answer
-	return r.forceDefaultAnswerWithState(ctx, messages, state)
+	return r.forceDefaultAnswer(ctx, messages, state, maxIterations)
 }
 
 // buildInitialMessages creates the initial message history.
@@ -889,7 +1114,7 @@ func (r *RLM) runREPLSetup(execEnv ExecutionEnvironment) error {
 }
 
 // forceDefaultAnswer forces the LLM to provide a final answer.
-func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, start time.Time, promptTokens, completionTokens, cacheCreationTokens, cacheReadTokens int) (*core.CompletionResult, error) {
+func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, state *iterationState, iterations int) (*core.CompletionResult, error) {
 	messages = append(messages, core.Message{
 		Role:    "user",
 		Content: DefaultAnswerPrompt,
@@ -897,33 +1122,20 @@ func (r *RLM) forceDefaultAnswer(ctx context.Context, messages []core.Message, s
 
 	llmResp, err := r.client.Complete(ctx, messages)
 	if err != nil {
-		return nil, fmt.Errorf("default answer: llm completion failed: %w", err)
+		return nil, r.wrapCallError(fmt.Errorf("default answer: llm completion failed: %w", err), state, iterations)
 	}
 
 	// Add tokens from this final call
-	promptTokens += llmResp.PromptTokens
-	completionTokens += llmResp.CompletionTokens
-	cacheCreationTokens += llmResp.CacheCreationTokens
-	cacheReadTokens += llmResp.CacheReadTokens
+	state.aggregateTokens(llmResp)
 
 	// Try to extract FINAL from response
 	answer := llmResp.Content
 	if final := parsing.FindFinalAnswer(llmResp.Content); final != nil {
 		answer = final.Content
 	}
+	state.recordLatestPartial(answer, iterations)
 
-	return &core.CompletionResult{
-		Response:   answer,
-		Iterations: r.config.MaxIterations,
-		Duration:   time.Since(start),
-		Usage: core.UsageStats{
-			PromptTokens:        promptTokens,
-			CompletionTokens:    completionTokens,
-			TotalTokens:         promptTokens + completionTokens,
-			CacheCreationTokens: cacheCreationTokens,
-			CacheReadTokens:     cacheReadTokens,
-		},
-	}, nil
+	return state.buildResult(answer, iterations), nil
 }
 
 // completeWithOptionalStreaming calls the LLM with streaming if enabled and supported.
@@ -978,8 +1190,6 @@ func (r *RLM) CompleteWithRecursion(
 	recursionCtx *core.RecursionContext,
 	tokenStats *RecursiveTokenStats,
 ) (*core.CompletionResult, error) {
-	start := time.Now()
-
 	// Select system prompt based on recursion capability
 	systemPrompt := r.config.SystemPrompt
 	if recursionCtx != nil && recursionCtx.MaxDepth > 0 && recursionCtx.CanRecurse() {
@@ -998,21 +1208,17 @@ func (r *RLM) CompleteWithRecursion(
 	}
 
 	if recursionCtx != nil && recursionCtx.MaxDepth > 0 {
-		// Create recursive adapter
 		adapter := NewRecursiveClientAdapter(r, recursionCtx, tokenStats, contextPayload)
 		replEnv = repl.NewRecursiveREPL(adapter, recursionCtx)
 	} else {
-		// Standard REPL
 		if r.config.REPLPool != nil {
 			replEnv = r.config.REPLPool.Get()
 		} else {
 			replEnv = repl.New(r.replClient)
 		}
 	}
-
 	defer replEnv.Close()
 
-	// Load context into REPL
 	if err := replEnv.LoadContext(contextPayload); err != nil {
 		return nil, fmt.Errorf("failed to load context: %w", err)
 	}
@@ -1026,34 +1232,28 @@ func (r *RLM) CompleteWithRecursion(
 		}
 	}
 
-	// Build initial message history with appropriate system prompt
 	contextInfo := replEnv.ContextInfo()
 	userPrompt := fmt.Sprintf(UserPromptTemplate, contextInfo, query) + FirstIterationSuffix
-
 	messages := []core.Message{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: userPrompt},
 	}
 
-	// Track total token usage across iterations
-	var totalPromptTokens, totalCompletionTokens int
-	var totalCacheCreationTokens, totalCacheReadTokens int
-
-	// Compute max iterations (may differ by depth)
 	contextSize := getContextSize(contextPayload)
 	maxIterations := r.computeMaxIterationsForDepth(contextSize, recursionCtx)
+	state := newIterationState(contextSize, maxIterations)
+	if r.limitConfigErr != nil {
+		return nil, r.limitConfigErr
+	}
 
-	// Track confidence signals for early termination
-	var confidenceSignals int
-
-	// Iteration loop
 	for i := 0; i < maxIterations; i++ {
 		iterStart := time.Now()
 
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		if err := r.checkCancellation(ctx, state); err != nil {
+			return nil, err
+		}
+		if err := r.checkTimeout(state, i); err != nil {
+			return nil, err
 		}
 
 		depth := 0
@@ -1062,58 +1262,52 @@ func (r *RLM) CompleteWithRecursion(
 		}
 		r.logf("Depth %d, Iteration %d/%d", depth, i+1, maxIterations)
 
-		// Add iteration-specific user prompt
 		currentMessages := r.appendIterationPrompt(messages, i, query)
-
-		// Get LLM response (streaming or non-streaming)
-		llmResp, err := r.completeWithOptionalStreaming(ctx, currentMessages)
+		callCtx, cancelCall, err := r.withRemainingTimeout(ctx, state, i)
 		if err != nil {
+			return nil, err
+		}
+		llmResp, err := r.completeWithOptionalStreaming(callCtx, currentMessages)
+		cancelCall()
+		if err != nil {
+			wrappedErr := r.wrapCallError(err, state, i)
+			if wrappedErr != err {
+				return nil, wrappedErr
+			}
 			return nil, fmt.Errorf("iteration %d: llm completion failed: %w", i, err)
 		}
 		response := llmResp.Content
 
-		// Report progress after the root LLM call so per-iteration tokens are available.
 		if r.config.OnProgress != nil {
 			r.config.OnProgress(IterationProgress{
 				CurrentIteration:  i + 1,
 				MaxIterations:     maxIterations,
-				ConfidenceSignals: confidenceSignals,
+				ConfidenceSignals: state.confidenceSignals,
 				HasFinalAttempt:   false,
 				ContextSize:       contextSize,
 				RootPromptTokens:  llmResp.PromptTokens,
 			})
 		}
 
-		// Aggregate root LLM tokens
-		totalPromptTokens += llmResp.PromptTokens
-		totalCompletionTokens += llmResp.CompletionTokens
-		totalCacheCreationTokens += llmResp.CacheCreationTokens
-		totalCacheReadTokens += llmResp.CacheReadTokens
+		state.aggregateTokens(llmResp)
+		state.recordLatestPartial(response, i+1)
 
-		// Track in token stats if provided
 		if tokenStats != nil && recursionCtx != nil {
 			tokenStats.Add(recursionCtx.CurrentDepth, llmResp.PromptTokens, llmResp.CompletionTokens)
 		}
 
-		if llmResp.CacheCreationTokens > 0 || llmResp.CacheReadTokens > 0 {
-			r.logf("Cache stats this iteration: created=%d, read=%d",
-				llmResp.CacheCreationTokens, llmResp.CacheReadTokens)
-		}
+		r.logCacheStats(llmResp, state)
 		r.logf("Response: %s", truncate(response, 200))
 
-		// Extract and execute code blocks
 		codeBlocks := parsing.FindCodeBlocks(response)
 		var execResults []core.CodeBlock
-
 		for _, code := range codeBlocks {
 			r.logf("Executing code:\n%s", truncate(code, 200))
-
 			result, _ := replEnv.Execute(ctx, code)
 			execResults = append(execResults, core.CodeBlock{
 				Code:   code,
 				Result: *result,
 			})
-
 			if result.Stdout != "" {
 				r.logf("Output: %s", truncate(result.Stdout, 200))
 			}
@@ -1122,38 +1316,39 @@ func (r *RLM) CompleteWithRecursion(
 			}
 		}
 
-		// Get RLM calls made during code execution and aggregate tokens
-		var rlmCalls []logger.RLMCallEntry
-		for _, call := range replEnv.GetLLMCalls() {
-			rlmCalls = append(rlmCalls, logger.RLMCallEntry{
+		replCalls := replEnv.GetLLMCalls()
+		llmCalls := make([]LLMCallRecord, len(replCalls))
+		for i, call := range replCalls {
+			llmCalls[i] = LLMCallRecord{
 				Prompt:           call.Prompt,
 				Response:         call.Response,
+				Duration:         call.Duration,
 				PromptTokens:     call.PromptTokens,
 				CompletionTokens: call.CompletionTokens,
-				ExecutionTime:    call.Duration,
-			})
-			totalPromptTokens += call.PromptTokens
-			totalCompletionTokens += call.CompletionTokens
+				Async:            call.Async,
+			}
+		}
+		rlmCalls := convertCallsToLoggerEntries(llmCalls)
+		state.aggregateLLMCallTokens(llmCalls)
+
+		if err := r.updateIterationStateAndCheckLimits(state, execResults, i+1); err != nil {
+			return nil, err
 		}
 
-		// Log iteration
 		if r.config.Logger != nil {
 			locals := replEnv.GetLocals()
 			_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, locals, nil, time.Since(iterStart))
 		}
 
-		// Detect confidence signals for adaptive early termination
 		if detectConfidence(response) {
-			confidenceSignals++
-			r.logf("Confidence signal detected (total: %d)", confidenceSignals)
+			state.confidenceSignals++
+			r.logf("Confidence signal detected (total: %d)", state.confidenceSignals)
 		}
 
-		// Check for final answer
 		if len(codeBlocks) == 0 && parsing.FindFinalAnswer(response) != nil {
 			final := parsing.FindFinalAnswer(response)
 			varName := final.Content
 			varValue := varName
-
 			if final.Type == core.FinalTypeVariable {
 				resolved, err := replEnv.GetVariable(varName)
 				if err != nil {
@@ -1162,38 +1357,21 @@ func (r *RLM) CompleteWithRecursion(
 					varValue = resolved
 				}
 			}
-
-			return &core.CompletionResult{
-				Response:   varValue,
-				Iterations: i + 1,
-				Duration:   time.Since(start),
-				Usage: core.UsageStats{
-					PromptTokens:        totalPromptTokens,
-					CompletionTokens:    totalCompletionTokens,
-					TotalTokens:         totalPromptTokens + totalCompletionTokens,
-					CacheCreationTokens: totalCacheCreationTokens,
-					CacheReadTokens:     totalCacheReadTokens,
-				},
-			}, nil
+			return state.buildResult(varValue, i+1), nil
 		}
 
-		// Check for early termination based on confidence signals
-		if r.shouldTerminateEarly(confidenceSignals, len(codeBlocks)) {
-			r.logf("Early termination triggered (confidence signals: %d)", confidenceSignals)
-			return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens, totalCacheCreationTokens, totalCacheReadTokens)
+		if r.shouldTerminateEarly(state.confidenceSignals, len(codeBlocks)) {
+			r.logf("Early termination triggered (confidence signals: %d)", state.confidenceSignals)
+			return r.forceDefaultAnswer(ctx, messages, state, i+1)
 		}
 
-		// Append iteration results to history
 		messages = r.appendIterationToHistory(messages, response, execResults)
-
-		// Apply history compression if enabled
 		if r.config.HistoryCompression != nil && r.config.HistoryCompression.Enabled {
 			messages = r.compressHistory(messages, i+1)
 		}
 	}
 
-	// Max iterations exhausted - force final answer
-	return r.forceDefaultAnswer(ctx, messages, start, totalPromptTokens, totalCompletionTokens, totalCacheCreationTokens, totalCacheReadTokens)
+	return r.forceDefaultAnswer(ctx, messages, state, maxIterations)
 }
 
 // computeMaxIterationsForDepth calculates max iterations considering recursion depth.
@@ -1271,14 +1449,21 @@ type iterationState struct {
 	totalCompletionTokens    int
 	totalCacheCreationTokens int
 	totalCacheReadTokens     int
+	totalCostUSD             float64
 
 	// Iteration tracking
 	confidenceSignals int
 	maxIterations     int
 	contextSize       int
+	consecutiveErrors int
+	lastError         string
 
 	// Timing
 	start time.Time
+
+	// Latest non-empty partial response seen so far.
+	latestPartialResponse   string
+	latestPartialIterations int
 }
 
 // newIterationState creates a new iteration state.
@@ -1306,20 +1491,39 @@ func (s *iterationState) aggregateLLMCallTokens(calls []LLMCallRecord) {
 	}
 }
 
+func (s *iterationState) recordLatestPartial(response string, iterations int) {
+	if strings.TrimSpace(response) == "" {
+		return
+	}
+	s.latestPartialResponse = response
+	s.latestPartialIterations = iterations
+}
+
+func (s *iterationState) usageStats() core.UsageStats {
+	return core.UsageStats{
+		PromptTokens:        s.totalPromptTokens,
+		CompletionTokens:    s.totalCompletionTokens,
+		TotalTokens:         s.totalPromptTokens + s.totalCompletionTokens,
+		CacheCreationTokens: s.totalCacheCreationTokens,
+		CacheReadTokens:     s.totalCacheReadTokens,
+	}
+}
+
 // buildResult creates a CompletionResult from the current state.
 func (s *iterationState) buildResult(response string, iterations int) *core.CompletionResult {
 	return &core.CompletionResult{
 		Response:   response,
 		Iterations: iterations,
 		Duration:   time.Since(s.start),
-		Usage: core.UsageStats{
-			PromptTokens:        s.totalPromptTokens,
-			CompletionTokens:    s.totalCompletionTokens,
-			TotalTokens:         s.totalPromptTokens + s.totalCompletionTokens,
-			CacheCreationTokens: s.totalCacheCreationTokens,
-			CacheReadTokens:     s.totalCacheReadTokens,
-		},
+		Usage:      s.usageStats(),
 	}
+}
+
+func (s *iterationState) buildPartialResult() *core.CompletionResult {
+	if strings.TrimSpace(s.latestPartialResponse) == "" {
+		return nil
+	}
+	return s.buildResult(s.latestPartialResponse, s.latestPartialIterations)
 }
 
 // codeExecutionResult holds the results of executing code blocks.
@@ -1508,6 +1712,9 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 	contextSize := getContextSize(contextPayload)
 	maxIterations := r.computeMaxIterations(contextSize)
 	state := newIterationState(contextSize, maxIterations)
+	if r.limitConfigErr != nil {
+		return nil, r.limitConfigErr
+	}
 
 	// Build compact history string
 	var history strings.Builder
@@ -1523,10 +1730,11 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 	for i := 0; i < maxIterations; i++ {
 		iterStart := time.Now()
 
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		if err := r.checkCancellation(ctx, state); err != nil {
+			return nil, err
+		}
+		if err := r.checkTimeout(state, i); err != nil {
+			return nil, err
 		}
 
 		r.logf("Iteration %d/%d (compact history)", i+1, maxIterations)
@@ -1541,9 +1749,19 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 			{Role: "user", Content: userPrompt},
 		}
 
-		// Get LLM response (streaming or non-streaming)
-		llmResp, err := r.completeWithOptionalStreaming(ctx, messages)
+		callCtx, cancelCall, err := r.withRemainingTimeout(ctx, state, i)
 		if err != nil {
+			return nil, err
+		}
+
+		// Get LLM response (streaming or non-streaming)
+		llmResp, err := r.completeWithOptionalStreaming(callCtx, messages)
+		cancelCall()
+		if err != nil {
+			wrappedErr := r.wrapCallError(err, state, i)
+			if wrappedErr != err {
+				return nil, wrappedErr
+			}
 			return nil, fmt.Errorf("iteration %d: llm completion failed: %w", i, err)
 		}
 		response := llmResp.Content
@@ -1562,6 +1780,7 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 
 		// Aggregate tokens
 		state.aggregateTokens(llmResp)
+		state.recordLatestPartial(response, i+1)
 		r.logCacheStats(llmResp, state)
 		r.logf("Response: %s", truncate(response, truncateLenShort))
 
@@ -1573,6 +1792,10 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 		llmCalls := execEnv.GetLLMCalls()
 		rlmCalls := convertCallsToLoggerEntries(llmCalls)
 		state.aggregateLLMCallTokens(llmCalls)
+
+		if err := r.updateIterationStateAndCheckLimits(state, execResult.execResults, i+1); err != nil {
+			return nil, err
+		}
 
 		// CRITICAL FIX: Add Query results to output so the LLM can see them in subsequent iterations.
 		for _, call := range llmCalls {
@@ -1629,7 +1852,7 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 		if r.shouldTerminateEarly(state.confidenceSignals, len(codeBlocks)) {
 			r.logf("Early termination triggered (confidence signals: %d)", state.confidenceSignals)
 			finalMessages := r.buildCompactHistoryMessages(contextInfo, query, history.String(), i)
-			return r.forceDefaultAnswerWithState(ctx, finalMessages, state)
+			return r.forceDefaultAnswer(ctx, finalMessages, state, i+1)
 		}
 
 		// Append to compact history
@@ -1642,7 +1865,7 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 
 	// Max iterations exhausted - force final answer
 	finalMessages := r.buildCompactHistoryMessages(contextInfo, query, history.String(), maxIterations-1)
-	return r.forceDefaultAnswerWithState(ctx, finalMessages, state)
+	return r.forceDefaultAnswer(ctx, finalMessages, state, maxIterations)
 }
 
 // determineActionType returns the action type string for compact history.

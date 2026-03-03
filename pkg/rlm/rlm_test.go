@@ -48,6 +48,15 @@ func (m *mockREPLClient) QueryBatched(ctx context.Context, prompts []string) ([]
 	return results, nil
 }
 
+func getPartialResultFromError(t *testing.T, err error) *core.CompletionResult {
+	t.Helper()
+	var partialErr PartialResultError
+	if !errors.As(err, &partialErr) {
+		t.Fatalf("expected PartialResultError, got %T (%v)", err, err)
+	}
+	return partialErr.PartialResult()
+}
+
 func TestNew(t *testing.T) {
 	client := &mockLLMClient{}
 	replClient := &mockREPLClient{}
@@ -83,6 +92,39 @@ func TestNewWithOptions(t *testing.T) {
 	}
 	if !rlm.config.Verbose {
 		t.Error("Verbose should be true")
+	}
+}
+
+func TestNewWithLimitOptions(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	estimator := func(usage core.UsageStats) (float64, error) {
+		return float64(usage.TotalTokens) * 0.001, nil
+	}
+
+	rlm := New(client, replClient,
+		WithMaxBudgetUSD(2.5),
+		WithMaxTimeout(15*time.Second),
+		WithMaxTokens(12345),
+		WithMaxErrors(3),
+		WithCostEstimator(estimator),
+	)
+
+	if rlm.config.MaxBudgetUSD != 2.5 {
+		t.Errorf("MaxBudgetUSD = %f, want 2.5", rlm.config.MaxBudgetUSD)
+	}
+	if rlm.config.MaxTimeout != 15*time.Second {
+		t.Errorf("MaxTimeout = %v, want 15s", rlm.config.MaxTimeout)
+	}
+	if rlm.config.MaxTokens != 12345 {
+		t.Errorf("MaxTokens = %d, want 12345", rlm.config.MaxTokens)
+	}
+	if rlm.config.MaxErrors != 3 {
+		t.Errorf("MaxErrors = %d, want 3", rlm.config.MaxErrors)
+	}
+	if rlm.config.CostEstimator == nil {
+		t.Fatal("CostEstimator should be set")
 	}
 }
 
@@ -262,6 +304,229 @@ func TestCompleteContextCancellation(t *testing.T) {
 	_, err := rlm.Complete(ctx, "test", "query")
 	if err == nil {
 		t.Error("expected context cancellation error")
+	}
+}
+
+func TestCompleteContextCancellationReturnsCancellationErrorWithPartial(t *testing.T) {
+	callCount := 0
+	ctx, cancel := context.WithCancel(context.Background())
+
+	client := &mockLLMClient{
+		completeFunc: func(callCtx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			callCount++
+			if callCount == 1 {
+				cancel() // Cancel before next iteration starts.
+				return core.LLMResponse{
+					Content:          "still thinking",
+					PromptTokens:     10,
+					CompletionTokens: 5,
+				}, nil
+			}
+			return core.LLMResponse{}, callCtx.Err()
+		},
+	}
+	replClient := &mockREPLClient{}
+	rlm := New(client, replClient, WithMaxIterations(10))
+
+	_, err := rlm.Complete(ctx, "test", "query")
+	if err == nil {
+		t.Fatal("expected cancellation error")
+	}
+
+	var cancelErr *CancellationError
+	if !errors.As(err, &cancelErr) {
+		t.Fatalf("expected CancellationError, got %T (%v)", err, err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected errors.Is(err, context.Canceled) to be true, got %v", err)
+	}
+	partial := getPartialResultFromError(t, err)
+	if partial == nil || partial.Response != "still thinking" {
+		t.Fatalf("expected partial response 'still thinking', got %+v", partial)
+	}
+	if partial.Iterations != 1 {
+		t.Errorf("partial.Iterations = %d, want 1", partial.Iterations)
+	}
+}
+
+func TestCompleteBudgetEstimatorRequired(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{Content: "FINAL(done)"}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+	rlm := New(client, replClient, WithMaxBudgetUSD(0.01))
+
+	_, err := rlm.Complete(context.Background(), "test", "query")
+	if err == nil {
+		t.Fatal("expected budget config error")
+	}
+
+	var cfgErr *BudgetEstimatorNotConfiguredError
+	if !errors.As(err, &cfgErr) {
+		t.Fatalf("expected BudgetEstimatorNotConfiguredError, got %T (%v)", err, err)
+	}
+}
+
+func TestCompleteTokenLimitExceeded(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{
+				Content:          "still thinking",
+				PromptTokens:     80,
+				CompletionTokens: 40,
+			}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+	rlm := New(client, replClient,
+		WithMaxIterations(5),
+		WithMaxTokens(100),
+	)
+
+	_, err := rlm.Complete(context.Background(), "test", "query")
+	if err == nil {
+		t.Fatal("expected token limit error")
+	}
+
+	var limitErr *TokenLimitExceededError
+	if !errors.As(err, &limitErr) {
+		t.Fatalf("expected TokenLimitExceededError, got %T (%v)", err, err)
+	}
+	if limitErr.TokensUsed != 120 {
+		t.Errorf("TokensUsed = %d, want 120", limitErr.TokensUsed)
+	}
+	if limitErr.TokenLimit != 100 {
+		t.Errorf("TokenLimit = %d, want 100", limitErr.TokenLimit)
+	}
+
+	partial := getPartialResultFromError(t, err)
+	if partial == nil || partial.Response != "still thinking" {
+		t.Fatalf("expected partial response 'still thinking', got %+v", partial)
+	}
+	if partial.Iterations != 1 {
+		t.Errorf("partial.Iterations = %d, want 1", partial.Iterations)
+	}
+}
+
+func TestCompleteTimeoutExceeded(t *testing.T) {
+	callCount := 0
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			callCount++
+			time.Sleep(20 * time.Millisecond)
+			return core.LLMResponse{
+				Content:          "still thinking",
+				PromptTokens:     10,
+				CompletionTokens: 5,
+			}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+	rlm := New(client, replClient,
+		WithMaxIterations(5),
+		WithMaxTimeout(5*time.Millisecond),
+	)
+
+	_, err := rlm.Complete(context.Background(), "test", "query")
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+
+	var timeoutErr *TimeoutExceededError
+	if !errors.As(err, &timeoutErr) {
+		t.Fatalf("expected TimeoutExceededError, got %T (%v)", err, err)
+	}
+	if callCount != 1 {
+		t.Errorf("LLM call count = %d, want 1", callCount)
+	}
+	partial := getPartialResultFromError(t, err)
+	if partial == nil || partial.Response != "still thinking" {
+		t.Fatalf("expected partial response 'still thinking', got %+v", partial)
+	}
+}
+
+func TestCompleteErrorThresholdExceeded(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{
+				Content:          "```go\ninvalid go code {{{{\n```",
+				PromptTokens:     10,
+				CompletionTokens: 5,
+			}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+	rlm := New(client, replClient,
+		WithMaxIterations(5),
+		WithMaxErrors(1),
+	)
+
+	_, err := rlm.Complete(context.Background(), "test", "query")
+	if err == nil {
+		t.Fatal("expected error threshold error")
+	}
+
+	var thresholdErr *ErrorThresholdExceededError
+	if !errors.As(err, &thresholdErr) {
+		t.Fatalf("expected ErrorThresholdExceededError, got %T (%v)", err, err)
+	}
+	if thresholdErr.ErrorCount != 1 {
+		t.Errorf("ErrorCount = %d, want 1", thresholdErr.ErrorCount)
+	}
+	if thresholdErr.Threshold != 1 {
+		t.Errorf("Threshold = %d, want 1", thresholdErr.Threshold)
+	}
+	if thresholdErr.LastError == "" {
+		t.Error("LastError should be set")
+	}
+
+	partial := getPartialResultFromError(t, err)
+	if partial == nil || partial.Response == "" {
+		t.Fatalf("expected non-empty partial response, got %+v", partial)
+	}
+}
+
+func TestCompleteBudgetExceeded(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{
+				Content:          "still thinking",
+				PromptTokens:     50,
+				CompletionTokens: 50,
+			}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+	estimator := func(usage core.UsageStats) (float64, error) {
+		return float64(usage.TotalTokens) * 0.001, nil
+	}
+	rlm := New(client, replClient,
+		WithMaxIterations(5),
+		WithMaxBudgetUSD(0.05),
+		WithCostEstimator(estimator),
+	)
+
+	_, err := rlm.Complete(context.Background(), "test", "query")
+	if err == nil {
+		t.Fatal("expected budget exceeded error")
+	}
+
+	var budgetErr *BudgetExceededError
+	if !errors.As(err, &budgetErr) {
+		t.Fatalf("expected BudgetExceededError, got %T (%v)", err, err)
+	}
+	if budgetErr.Iteration != 1 {
+		t.Errorf("Iteration = %d, want 1", budgetErr.Iteration)
+	}
+	if budgetErr.SpentUSD <= budgetErr.BudgetUSD {
+		t.Errorf("expected spent > budget, got spent=%f budget=%f", budgetErr.SpentUSD, budgetErr.BudgetUSD)
+	}
+
+	partial := getPartialResultFromError(t, err)
+	if partial == nil || partial.Response != "still thinking" {
+		t.Fatalf("expected partial response 'still thinking', got %+v", partial)
 	}
 }
 
@@ -1890,6 +2155,38 @@ func TestCompleteWithCompactHistoryMultipleIterations(t *testing.T) {
 	}
 	if result.Iterations != 3 {
 		t.Errorf("Iterations = %d, want 3", result.Iterations)
+	}
+}
+
+func TestCompleteWithCompactHistoryTokenLimitExceeded(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{
+				Content:          "still thinking",
+				PromptTokens:     80,
+				CompletionTokens: 40,
+			}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+	rlm := New(client, replClient,
+		WithCompactHistory(false),
+		WithMaxIterations(5),
+		WithMaxTokens(100),
+	)
+
+	_, err := rlm.Complete(context.Background(), "test context", "Think hard")
+	if err == nil {
+		t.Fatal("expected token limit error")
+	}
+
+	var limitErr *TokenLimitExceededError
+	if !errors.As(err, &limitErr) {
+		t.Fatalf("expected TokenLimitExceededError, got %T (%v)", err, err)
+	}
+	partial := getPartialResultFromError(t, err)
+	if partial == nil || partial.Response != "still thinking" {
+		t.Fatalf("expected partial response 'still thinking', got %+v", partial)
 	}
 }
 
