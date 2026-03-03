@@ -306,3 +306,141 @@ func TestOpenAIClient_NoChoices(t *testing.T) {
 		t.Errorf("Expected 'no choices' error, got %v", err)
 	}
 }
+
+func TestOpenAIClient_CompleteStream_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req openaiRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("Failed to decode request: %v", err)
+		}
+		if !req.Stream {
+			t.Error("Expected Stream to be true")
+		}
+		if req.StreamOptions == nil || !req.StreamOptions.IncludeUsage {
+			t.Error("Expected StreamOptions.IncludeUsage to be true")
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+
+		// Write SSE events
+		events := []string{
+			`data: {"choices":[{"delta":{"content":"Hello"}}]}`,
+			`data: {"choices":[{"delta":{"content":" world"}}]}`,
+			`data: {"choices":[{"delta":{"content":"!"}, "finish_reason":"stop"}], "usage":{"prompt_tokens":10, "completion_tokens":3}}`,
+			`data: [DONE]`,
+		}
+		for _, event := range events {
+			_, _ = w.Write([]byte(event + "\n"))
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIClient("test-key", "gpt-5", false)
+	client.baseURL = server.URL
+
+	messages := []core.Message{
+		{Role: "user", Content: "Say hello"},
+	}
+
+	var chunks []string
+	var doneReceived bool
+	handler := func(chunk string, done bool) error {
+		if done {
+			doneReceived = true
+		} else if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		return nil
+	}
+
+	resp, err := client.CompleteStream(context.Background(), messages, handler)
+	if err != nil {
+		t.Fatalf("CompleteStream failed: %v", err)
+	}
+	if resp.Content != "Hello world!" {
+		t.Errorf("Expected 'Hello world!', got %s", resp.Content)
+	}
+	if resp.PromptTokens != 10 {
+		t.Errorf("Expected 10 prompt tokens, got %d", resp.PromptTokens)
+	}
+	if resp.CompletionTokens != 3 {
+		t.Errorf("Expected 3 completion tokens, got %d", resp.CompletionTokens)
+	}
+	if len(chunks) != 3 {
+		t.Errorf("Expected 3 chunks, got %d", len(chunks))
+	}
+	if !doneReceived {
+		t.Error("Expected done to be received")
+	}
+}
+
+func TestOpenAIClient_CompleteStream_Error(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error": {"message": "Server error"}}`))
+	}))
+	defer server.Close()
+
+	client := NewOpenAIClient("test-key", "gpt-5", false)
+	client.baseURL = server.URL
+
+	_, err := client.CompleteStream(context.Background(), []core.Message{{Role: "user", Content: "Hi"}}, nil)
+	if err == nil {
+		t.Error("Expected error, got nil")
+	}
+}
+
+func TestOpenAIClient_CompleteStream_NilHandler(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		events := []string{
+			`data: {"choices":[{"delta":{"content":"Hello"}}]}`,
+			`data: {"choices":[{"delta":{"content":"!"}, "finish_reason":"stop"}], "usage":{"prompt_tokens":5, "completion_tokens":1}}`,
+			`data: [DONE]`,
+		}
+		for _, event := range events {
+			_, _ = w.Write([]byte(event + "\n"))
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIClient("test-key", "gpt-5", false)
+	client.baseURL = server.URL
+
+	// Nil handler should work without errors
+	resp, err := client.CompleteStream(context.Background(), []core.Message{{Role: "user", Content: "Hi"}}, nil)
+	if err != nil {
+		t.Fatalf("CompleteStream with nil handler failed: %v", err)
+	}
+	if resp.Content != "Hello!" {
+		t.Errorf("Expected 'Hello!', got %s", resp.Content)
+	}
+}
+
+func TestOpenAIClient_CompleteStream_Verbose(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		events := []string{
+			`data: {"choices":[{"delta":{"content":"Hi"}, "finish_reason":"stop"}], "usage":{"prompt_tokens":5, "completion_tokens":1}}`,
+			`data: [DONE]`,
+		}
+		for _, event := range events {
+			_, _ = w.Write([]byte(event + "\n"))
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIClient("test-key", "gpt-5", true)
+	client.baseURL = server.URL
+
+	_, err := client.CompleteStream(context.Background(), []core.Message{{Role: "user", Content: "Hi"}}, nil)
+	if err != nil {
+		t.Fatalf("CompleteStream with verbose failed: %v", err)
+	}
+}

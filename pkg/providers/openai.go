@@ -1,15 +1,18 @@
 package providers
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
+	"github.com/XiaoConstantine/rlm-go/pkg/rlm"
 )
 
 // OpenAIClient implements Client for OpenAI's API.
@@ -41,8 +44,14 @@ func NewOpenAIClient(apiKey, model string, verbose bool) *OpenAIClient {
 }
 
 type openaiRequest struct {
-	Model    string          `json:"model"`
-	Messages []openaiMessage `json:"messages"`
+	Model         string               `json:"model"`
+	Messages      []openaiMessage      `json:"messages"`
+	Stream        bool                 `json:"stream,omitempty"`
+	StreamOptions *openaiStreamOptions `json:"stream_options,omitempty"`
+}
+
+type openaiStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type openaiMessage struct {
@@ -65,6 +74,20 @@ type openaiResponse struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 	} `json:"error,omitempty"`
+}
+
+// openaiStreamEvent represents a streaming response chunk from OpenAI.
+type openaiStreamEvent struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content,omitempty"`
+		} `json:"delta"`
+		FinishReason string `json:"finish_reason,omitempty"`
+	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage,omitempty"`
 }
 
 // Complete implements rlm.LLMClient for root LLM orchestration.
@@ -166,4 +189,130 @@ func (c *OpenAIClient) doRequest(ctx context.Context, reqBody openaiRequest) (st
 	}
 
 	return apiResp.Choices[0].Message.Content, apiResp.Usage.PromptTokens, apiResp.Usage.CompletionTokens, nil
+}
+
+// CompleteStream performs a streaming completion request.
+// The handler is called for each chunk of content as it arrives.
+// Returns the complete response with token usage after stream completes.
+func (c *OpenAIClient) CompleteStream(ctx context.Context, messages []core.Message, handler rlm.StreamHandler) (core.LLMResponse, error) {
+	var apiMessages []openaiMessage
+	for _, msg := range messages {
+		apiMessages = append(apiMessages, openaiMessage{
+			Role:    msg.Role,
+			Content: msg.Content,
+		})
+	}
+
+	reqBody := openaiRequest{
+		Model:    c.model,
+		Messages: apiMessages,
+		Stream:   true,
+		StreamOptions: &openaiStreamOptions{
+			IncludeUsage: true,
+		},
+	}
+
+	return c.doStreamRequest(ctx, reqBody, handler)
+}
+
+func (c *OpenAIClient) doStreamRequest(ctx context.Context, reqBody openaiRequest, handler rlm.StreamHandler) (core.LLMResponse, error) {
+	start := time.Now()
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return core.LLMResponse{}, fmt.Errorf("marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/chat/completions", bytes.NewReader(jsonBody))
+	if err != nil {
+		return core.LLMResponse{}, fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return core.LLMResponse{}, fmt.Errorf("http request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return core.LLMResponse{}, fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// Parse SSE stream
+	var fullContent strings.Builder
+	var promptTokens, completionTokens int
+
+	scanner := bufio.NewScanner(resp.Body)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return core.LLMResponse{}, ctx.Err()
+		default:
+		}
+
+		line := scanner.Text()
+
+		// SSE format: "data: <json>" or "data: [DONE]"
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+
+		var event openaiStreamEvent
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+
+		// Extract content from delta
+		if len(event.Choices) > 0 {
+			delta := event.Choices[0].Delta
+			if delta.Content != "" {
+				fullContent.WriteString(delta.Content)
+				if handler != nil {
+					if err := handler(delta.Content, false); err != nil {
+						return core.LLMResponse{}, fmt.Errorf("handler error: %w", err)
+					}
+				}
+			}
+
+			// Check for finish
+			if event.Choices[0].FinishReason != "" && handler != nil {
+				if err := handler("", true); err != nil {
+					return core.LLMResponse{}, fmt.Errorf("handler error: %w", err)
+				}
+			}
+		}
+
+		// Extract usage from final chunk (with stream_options.include_usage)
+		if event.Usage != nil {
+			promptTokens = event.Usage.PromptTokens
+			completionTokens = event.Usage.CompletionTokens
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return core.LLMResponse{}, fmt.Errorf("scanner error: %w", err)
+	}
+
+	if c.verbose {
+		fmt.Printf("  [API Stream] %v, tokens: %d→%d\n",
+			time.Since(start), promptTokens, completionTokens)
+	}
+
+	return core.LLMResponse{
+		Content:          fullContent.String(),
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+	}, nil
 }
