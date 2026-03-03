@@ -175,11 +175,7 @@ func (a *sandboxLLMClientAdapter) Query(ctx context.Context, prompt string) (san
 	if err != nil {
 		return sandbox.QueryResponse{}, err
 	}
-	return sandbox.QueryResponse{
-		Response:         resp.Response,
-		PromptTokens:     resp.PromptTokens,
-		CompletionTokens: resp.CompletionTokens,
-	}, nil
+	return sandbox.QueryResponse(resp), nil
 }
 
 // QueryBatched makes concurrent LLM queries.
@@ -190,11 +186,7 @@ func (a *sandboxLLMClientAdapter) QueryBatched(ctx context.Context, prompts []st
 	}
 	responses := make([]sandbox.QueryResponse, len(results))
 	for i, r := range results {
-		responses[i] = sandbox.QueryResponse{
-			Response:         r.Response,
-			PromptTokens:     r.PromptTokens,
-			CompletionTokens: r.CompletionTokens,
-		}
+		responses[i] = sandbox.QueryResponse(r)
 	}
 	return responses, nil
 }
