@@ -674,20 +674,20 @@ func (e *LocalExecutor) resetAbandonedInterpreter() error {
 	return err
 }
 
-func (e *LocalExecutor) evalWithContext(ctx context.Context, code string, runID uint64) (error, bool, bool) {
+func (e *LocalExecutor) evalWithContext(ctx context.Context, code string, runID uint64) (bool, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return err, false, false
+		return false, false, err
 	}
 	e.stdout.AllowCurrent(runID)
 	e.stderr.AllowCurrent(runID)
 	_, err := e.interp.EvalWithContext(ctx, code)
 	if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
-		return err, true, false
+		return true, false, err
 	}
-	return err, true, true
+	return true, true, err
 }
 
 // Execute runs Go code and returns the result.
@@ -735,7 +735,7 @@ func (e *LocalExecutor) Execute(ctx context.Context, code string) (*core.Executi
 		}, nil
 	}
 
-	evalErr, evalStarted, evalCompleted := e.evalWithContext(evalCtx, code, runID)
+	evalStarted, evalCompleted, evalErr := e.evalWithContext(evalCtx, code, runID)
 	timeoutTimer.Stop()
 	timedOut := sandboxTimedOut.Load()
 	if !evalCompleted && evalCtx.Err() != nil {

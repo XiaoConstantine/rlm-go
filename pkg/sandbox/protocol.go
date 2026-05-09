@@ -421,11 +421,6 @@ func linkContexts(primary, secondary context.Context) (context.Context, context.
 	}
 }
 
-// recordCall records an LLM call for later retrieval.
-func (s *IPCServer) recordCall(prompt, response string, duration float64, promptTokens, completionTokens int) {
-	s.recordCallForExecution(0, false, prompt, response, duration, promptTokens, completionTokens)
-}
-
 func (s *IPCServer) recordCallForExecution(execID uint64, activeExecution bool, prompt, response string, duration float64, promptTokens, completionTokens int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
