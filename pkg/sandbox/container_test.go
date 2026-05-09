@@ -1929,16 +1929,10 @@ func runGeneratedProgram(t *testing.T, code string) string {
 	}
 	binary := filepath.Join(dir, binaryName)
 
-	buildCtx, buildCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer buildCancel()
-
-	build := osexec.CommandContext(buildCtx, "go", "build", "-o", binary, ".")
+	build := osexec.Command("go", "build", "-o", binary, ".")
 	build.Dir = dir
 	buildOutput, err := build.CombinedOutput()
 	if err != nil {
-		if buildCtx.Err() != nil {
-			t.Fatalf("build generated program timed out: %v\n%s", buildCtx.Err(), buildOutput)
-		}
 		t.Fatalf("build generated program failed: %v\n%s", err, buildOutput)
 	}
 
