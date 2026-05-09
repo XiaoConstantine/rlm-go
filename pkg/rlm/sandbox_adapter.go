@@ -271,6 +271,7 @@ func (r *RLM) createExecutionEnvironment() (ExecutionEnvironment, error) {
 	} else {
 		replEnv = repl.New(r.replClient)
 	}
+	replEnv.SetMaxFullContextQueryChars(r.config.MaxFullContextQueryChars)
 
 	return NewREPLAdapter(replEnv), nil
 }

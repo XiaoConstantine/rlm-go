@@ -435,6 +435,112 @@ for _, r := range responses {
 	}
 }
 
+func TestLLMQueryRawDoesNotPrependContext(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+	if err := repl.LoadContext("full context should not appear"); err != nil {
+		t.Fatalf("LoadContext() error: %v", err)
+	}
+
+	result, err := repl.Execute(context.Background(), `
+response := QueryRaw("raw prompt")
+fmt.Println(response)
+`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "mock response") {
+		t.Fatalf("unexpected stdout: %q", result.Stdout)
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.queryCalls) != 1 {
+		t.Fatalf("queryCalls = %d, want 1", len(client.queryCalls))
+	}
+	if client.queryCalls[0] != "raw prompt" {
+		t.Fatalf("QueryRaw prompt = %q, want raw prompt", client.queryCalls[0])
+	}
+}
+
+func TestLLMQueryWithUsesProvidedContextOnly(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+	if err := repl.LoadContext("full context should not appear"); err != nil {
+		t.Fatalf("LoadContext() error: %v", err)
+	}
+
+	_, err := repl.Execute(context.Background(), `
+response := QueryWith("selected slice", "answer from slice")
+fmt.Println(response)
+`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.queryCalls) != 1 {
+		t.Fatalf("queryCalls = %d, want 1", len(client.queryCalls))
+	}
+	if !strings.Contains(client.queryCalls[0], "selected slice") {
+		t.Fatalf("QueryWith prompt missing selected context: %q", client.queryCalls[0])
+	}
+	if strings.Contains(client.queryCalls[0], "full context should not appear") {
+		t.Fatalf("QueryWith prompt included full context: %q", client.queryCalls[0])
+	}
+}
+
+func TestLLMQueryBatchedRawDoesNotPrependContext(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+	if err := repl.LoadContext("full context should not appear"); err != nil {
+		t.Fatalf("LoadContext() error: %v", err)
+	}
+
+	_, err := repl.Execute(context.Background(), `
+responses := QueryBatchedRaw([]string{"raw one", "raw two"})
+fmt.Println(responses[0])
+`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.batchCalls) != 1 {
+		t.Fatalf("batchCalls = %d, want 1", len(client.batchCalls))
+	}
+	if got := client.batchCalls[0][0]; got != "raw one" {
+		t.Fatalf("QueryBatchedRaw prompt[0] = %q, want raw one", got)
+	}
+}
+
+func TestMaxFullContextQueryCharsBlocksQuery(t *testing.T) {
+	client := newMockClient()
+	repl := New(client, WithMaxFullContextQueryChars(5))
+	if err := repl.LoadContext("large context"); err != nil {
+		t.Fatalf("LoadContext() error: %v", err)
+	}
+
+	result, err := repl.Execute(context.Background(), `
+response := Query("blocked")
+fmt.Println(response)
+`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "exceeding the limit") {
+		t.Fatalf("stdout = %q, want guardrail error", result.Stdout)
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.queryCalls) != 0 {
+		t.Fatalf("queryCalls = %d, want 0", len(client.queryCalls))
+	}
+}
+
 func TestLLMQueryError(t *testing.T) {
 	client := newMockClient()
 	client.queryFunc = func(ctx context.Context, prompt string) (QueryResponse, error) {

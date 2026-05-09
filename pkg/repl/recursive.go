@@ -99,7 +99,10 @@ func (r *RecursiveREPL) injectBuiltins() error {
 		"rlm/rlm": {
 			// Standard Query functions
 			"Query":             reflect.ValueOf(r.llmQuery),
+			"QueryRaw":          reflect.ValueOf(r.llmQueryRaw),
+			"QueryWith":         reflect.ValueOf(r.llmQueryWith),
 			"QueryBatched":      reflect.ValueOf(r.llmQueryBatched),
+			"QueryBatchedRaw":   reflect.ValueOf(r.llmQueryBatchedRaw),
 			"QueryAsync":        reflect.ValueOf(r.llmQueryAsync),
 			"QueryBatchedAsync": reflect.ValueOf(r.llmQueryBatchedAsync),
 			"WaitAsync":         reflect.ValueOf(r.waitAsync),
@@ -149,6 +152,20 @@ func (r *RecursiveREPL) llmQuery(prompt string) string {
 	return response
 }
 
+// llmQueryRaw is an explicit no-context query. RecursiveREPL Query already sends
+// prompts as-is, so this is an alias for compatibility with the standard REPL.
+func (r *RecursiveREPL) llmQueryRaw(prompt string) string {
+	return r.llmQuery(prompt)
+}
+
+// llmQueryWith queries with only the provided context slice.
+func (r *RecursiveREPL) llmQueryWith(contextSlice, prompt string) string {
+	if contextSlice != "" {
+		prompt = fmt.Sprintf("Context data:\n%s\n\nTask: %s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextSlice, prompt)
+	}
+	return r.llmQuery(prompt)
+}
+
 // llmQueryBatched makes concurrent LLM queries (standard, non-recursive).
 func (r *RecursiveREPL) llmQueryBatched(prompts []string) []string {
 	start := time.Now()
@@ -186,6 +203,12 @@ func (r *RecursiveREPL) llmQueryBatched(prompts []string) []string {
 	}
 	r.mu.Unlock()
 	return responses
+}
+
+// llmQueryBatchedRaw is an explicit no-context batch query. RecursiveREPL
+// QueryBatched already sends prompts as-is.
+func (r *RecursiveREPL) llmQueryBatchedRaw(prompts []string) []string {
+	return r.llmQueryBatched(prompts)
 }
 
 // queryWithRLM performs a recursive RLM query at the specified depth.

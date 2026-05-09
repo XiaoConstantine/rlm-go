@@ -542,6 +542,17 @@ func Query(prompt string) string {
 	return resp.Response
 }
 
+func QueryRaw(prompt string) string {
+	return Query(prompt)
+}
+
+func QueryWith(contextSlice, prompt string) string {
+	if contextSlice != "" {
+		prompt = fmt.Sprintf("Context data:\n%%s\n\nTask: %%s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextSlice, prompt)
+	}
+	return Query(prompt)
+}
+
 // QueryBatched sends multiple queries concurrently and returns the responses.
 func QueryBatched(prompts []string) []string {
 	ipcMu.Lock()
@@ -588,6 +599,10 @@ func QueryBatched(prompts []string) []string {
 	}
 
 	return resp.Responses
+}
+
+func QueryBatchedRaw(prompts []string) []string {
+	return QueryBatched(prompts)
 }
 
 func FINAL(value any) string {

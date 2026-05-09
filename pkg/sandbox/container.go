@@ -196,6 +196,17 @@ func Query(prompt string) string {
 	return "Error: IPC disabled, cannot call Query()"
 }
 
+func QueryRaw(prompt string) string {
+	return Query(prompt)
+}
+
+func QueryWith(contextSlice, prompt string) string {
+	if contextSlice != "" {
+		prompt = fmt.Sprintf("Context data:\n%s\n\nTask: %s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextSlice, prompt)
+	}
+	return Query(prompt)
+}
+
 // QueryBatched stub - IPC disabled
 func QueryBatched(prompts []string) []string {
 	results := make([]string, len(prompts))
@@ -203,6 +214,10 @@ func QueryBatched(prompts []string) []string {
 		results[i] = "Error: IPC disabled, cannot call QueryBatched()"
 	}
 	return results
+}
+
+func QueryBatchedRaw(prompts []string) []string {
+	return QueryBatched(prompts)
 }
 
 func FINAL(value any) string {

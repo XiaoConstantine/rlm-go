@@ -68,10 +68,13 @@ func NewLocalExecutor(client LLMClient, cfg Config) (*LocalExecutor, error) {
 func (e *LocalExecutor) injectBuiltins() error {
 	symbols := interp.Exports{
 		"rlm/rlm": {
-			"Query":        reflect.ValueOf(e.llmQuery),
-			"QueryBatched": reflect.ValueOf(e.llmQueryBatched),
-			"FINAL":        reflect.ValueOf(e.finalAnswer),
-			"FINAL_VAR":    reflect.ValueOf(e.finalVarAnswer),
+			"Query":           reflect.ValueOf(e.llmQuery),
+			"QueryRaw":        reflect.ValueOf(e.llmQueryRaw),
+			"QueryWith":       reflect.ValueOf(e.llmQueryWith),
+			"QueryBatched":    reflect.ValueOf(e.llmQueryBatched),
+			"QueryBatchedRaw": reflect.ValueOf(e.llmQueryBatchedRaw),
+			"FINAL":           reflect.ValueOf(e.finalAnswer),
+			"FINAL_VAR":       reflect.ValueOf(e.finalVarAnswer),
 		},
 	}
 
@@ -105,6 +108,17 @@ func (e *LocalExecutor) llmQuery(prompt string) string {
 	e.mu.Unlock()
 
 	return response
+}
+
+func (e *LocalExecutor) llmQueryRaw(prompt string) string {
+	return e.llmQuery(prompt)
+}
+
+func (e *LocalExecutor) llmQueryWith(contextSlice, prompt string) string {
+	if contextSlice != "" {
+		prompt = fmt.Sprintf("Context data:\n%s\n\nTask: %s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextSlice, prompt)
+	}
+	return e.llmQuery(prompt)
 }
 
 // llmQueryBatched makes concurrent LLM queries.
@@ -145,6 +159,10 @@ func (e *LocalExecutor) llmQueryBatched(prompts []string) []string {
 	e.mu.Unlock()
 
 	return responses
+}
+
+func (e *LocalExecutor) llmQueryBatchedRaw(prompts []string) []string {
+	return e.llmQueryBatched(prompts)
 }
 
 func (e *LocalExecutor) finalAnswer(value any) string {

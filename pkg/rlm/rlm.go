@@ -98,6 +98,11 @@ type Config struct {
 	// the iteration loop starts. Use this to inject additional REPL symbols.
 	REPLSetup func(replEnv *repl.REPL) error
 
+	// MaxFullContextQueryChars blocks Query/QueryBatched from prepending the
+	// entire loaded context when it is larger than this many chars.
+	// Disabled when <= 0. Use QueryWith or QueryRaw for large contexts.
+	MaxFullContextQueryChars int
+
 	// Recursion configures multi-depth recursion behavior.
 	// When enabled, sub-LLMs can spawn their own sub-LLMs.
 	Recursion *RecursionConfig
@@ -586,6 +591,17 @@ func WithProgressHandler(handler func(IterationProgress)) Option {
 func WithREPLSetup(fn func(replEnv *repl.REPL) error) Option {
 	return func(c *Config) {
 		c.REPLSetup = fn
+	}
+}
+
+// WithMaxFullContextQueryChars blocks Query/QueryBatched when they would
+// prepend a loaded context larger than max chars. Zero disables the guard.
+func WithMaxFullContextQueryChars(max int) Option {
+	return func(c *Config) {
+		if max < 0 {
+			max = 0
+		}
+		c.MaxFullContextQueryChars = max
 	}
 }
 

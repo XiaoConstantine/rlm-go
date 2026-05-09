@@ -124,6 +124,7 @@ type REPL struct {
 	finalMu       sync.RWMutex
 	finalSet      bool
 	finalValue    string
+	maxFullQuery  int
 	execCount     int  // Track number of executions for health monitoring
 	needsReset    bool // Flag indicating interpreter corruption detected
 	injectedNames map[string]struct{}
@@ -131,6 +132,24 @@ type REPL struct {
 
 // REPLOption configures a REPL instance.
 type REPLOption func(*REPL)
+
+// WithMaxFullContextQueryChars blocks Query/QueryBatched when the loaded context
+// is larger than max chars. Zero disables the guard.
+func WithMaxFullContextQueryChars(max int) REPLOption {
+	return func(r *REPL) {
+		r.SetMaxFullContextQueryChars(max)
+	}
+}
+
+// SetMaxFullContextQueryChars updates the full-context Query guard. Zero disables it.
+func (r *REPL) SetMaxFullContextQueryChars(max int) {
+	if max < 0 {
+		max = 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.maxFullQuery = max
+}
 
 // New creates a new REPL instance.
 func New(client LLMClient, opts ...REPLOption) *REPL {
@@ -220,7 +239,10 @@ func (r *REPL) resetState() {
 func (r *REPL) injectBuiltins() error {
 	rlmSymbols := map[string]reflect.Value{
 		"Query":             reflect.ValueOf(r.llmQuery),
+		"QueryRaw":          reflect.ValueOf(r.llmQueryRaw),
+		"QueryWith":         reflect.ValueOf(r.llmQueryWith),
 		"QueryBatched":      reflect.ValueOf(r.llmQueryBatched),
+		"QueryBatchedRaw":   reflect.ValueOf(r.llmQueryBatchedRaw),
 		"QueryAsync":        reflect.ValueOf(r.llmQueryAsync),
 		"QueryBatchedAsync": reflect.ValueOf(r.llmQueryBatchedAsync),
 		"WaitAsync":         reflect.ValueOf(r.waitAsync),
@@ -288,6 +310,12 @@ func (r *REPL) InjectSymbols(symbols map[string]reflect.Value) error {
 func (r *REPL) llmQuery(prompt string) string {
 	start := time.Now()
 
+	if err := r.fullContextQueryBlocked("Query"); err != nil {
+		response := fmt.Sprintf("Error: %v", err)
+		r.recordLLMCall(prompt, response, time.Since(start).Seconds(), QueryResponse{})
+		return response
+	}
+
 	// Get the context variable from the interpreter and include it in the prompt
 	fullPrompt := r.buildPromptWithContext(prompt)
 
@@ -300,21 +328,12 @@ func (r *REPL) llmQuery(prompt string) string {
 	}
 
 	// Record the call with token usage (store original prompt for clarity)
-	r.llmCalls = append(r.llmCalls, LLMCall{
-		Prompt:           prompt,
-		Response:         response,
-		Duration:         duration,
-		PromptTokens:     result.PromptTokens,
-		CompletionTokens: result.CompletionTokens,
-	})
+	r.recordLLMCall(prompt, response, duration, result)
 
 	return response
 }
 
-// buildPromptWithContext retrieves the context variable and prepends it to the prompt.
-// This ensures sub-LLM queries have access to the loaded context data.
-// Thread-safe: acquires mutex before accessing interpreter.
-func (r *REPL) buildPromptWithContext(prompt string) string {
+func (r *REPL) contextString() (string, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -322,22 +341,35 @@ func (r *REPL) buildPromptWithContext(prompt string) string {
 	v, err := r.interp.Eval("context")
 	if err != nil || !v.IsValid() {
 		// No context loaded, use prompt as-is
-		return prompt
+		return "", false
 	}
 
-	contextStr := ""
 	switch ctx := v.Interface().(type) {
 	case string:
-		contextStr = ctx
+		return ctx, ctx != ""
 	default:
 		// For non-string context, try JSON marshaling
 		jsonBytes, err := json.Marshal(ctx)
 		if err != nil {
-			return prompt
+			return "", false
 		}
-		contextStr = string(jsonBytes)
+		contextStr := string(jsonBytes)
+		return contextStr, contextStr != ""
+	}
+}
+
+// buildPromptWithContext retrieves the context variable and prepends it to the prompt.
+// This ensures sub-LLM queries have access to the loaded context data.
+func (r *REPL) buildPromptWithContext(prompt string) string {
+	contextStr, ok := r.contextString()
+	if !ok {
+		return prompt
 	}
 
+	return r.buildPromptWithProvidedContext(contextStr, prompt)
+}
+
+func (r *REPL) buildPromptWithProvidedContext(contextStr, prompt string) string {
 	if contextStr == "" {
 		return prompt
 	}
@@ -346,10 +378,103 @@ func (r *REPL) buildPromptWithContext(prompt string) string {
 	return fmt.Sprintf("Context data:\n%s\n\nTask: %s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextStr, prompt)
 }
 
+func (r *REPL) fullContextQueryBlocked(name string) error {
+	r.mu.Lock()
+	maxChars := r.maxFullQuery
+	r.mu.Unlock()
+
+	if maxChars <= 0 {
+		return nil
+	}
+
+	contextStr, ok := r.contextString()
+	if !ok || len(contextStr) <= maxChars {
+		return nil
+	}
+
+	return fmt.Errorf("%s would prepend the full context (%d chars), exceeding the limit of %d chars; use QueryWith(contextSlice, prompt) or QueryRaw(prompt)", name, len(contextStr), maxChars)
+}
+
+func (r *REPL) recordLLMCall(prompt, response string, duration float64, result QueryResponse) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.llmCalls = append(r.llmCalls, LLMCall{
+		Prompt:           prompt,
+		Response:         response,
+		Duration:         duration,
+		PromptTokens:     result.PromptTokens,
+		CompletionTokens: result.CompletionTokens,
+	})
+}
+
+func (r *REPL) recordLLMCallAsync(prompt, response string, duration float64, result QueryResponse) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.llmCalls = append(r.llmCalls, LLMCall{
+		Prompt:           prompt,
+		Response:         response,
+		Duration:         duration,
+		PromptTokens:     result.PromptTokens,
+		CompletionTokens: result.CompletionTokens,
+		Async:            true,
+	})
+}
+
+func (r *REPL) queryBatchError(prompts []string, err error, duration float64) []string {
+	errResults := make([]string, len(prompts))
+	for i, p := range prompts {
+		errResults[i] = fmt.Sprintf("Error: %v", err)
+		r.recordLLMCall(p, errResults[i], durationPerPrompt(duration, len(prompts)), QueryResponse{})
+	}
+	return errResults
+}
+
+func durationPerPrompt(duration float64, promptCount int) float64 {
+	if promptCount <= 0 {
+		return duration
+	}
+	return duration / float64(promptCount)
+}
+
+// llmQueryRaw makes a single LLM query without prepending the loaded context.
+func (r *REPL) llmQueryRaw(prompt string) string {
+	start := time.Now()
+
+	result, err := r.llmClient.Query(r.ctx, prompt)
+	duration := time.Since(start).Seconds()
+
+	response := result.Response
+	if err != nil {
+		response = fmt.Sprintf("Error: %v", err)
+	}
+	r.recordLLMCall(prompt, response, duration, result)
+	return response
+}
+
+// llmQueryWith makes a single LLM query with only the provided context slice.
+func (r *REPL) llmQueryWith(contextSlice, prompt string) string {
+	start := time.Now()
+	fullPrompt := r.buildPromptWithProvidedContext(contextSlice, prompt)
+
+	result, err := r.llmClient.Query(r.ctx, fullPrompt)
+	duration := time.Since(start).Seconds()
+
+	response := result.Response
+	if err != nil {
+		response = fmt.Sprintf("Error: %v", err)
+	}
+	r.recordLLMCall(prompt, response, duration, result)
+	return response
+}
+
 // llmQueryBatched makes concurrent LLM queries. This is called from interpreted code.
 // It automatically includes the context variable (if loaded) in each prompt.
 func (r *REPL) llmQueryBatched(prompts []string) []string {
 	start := time.Now()
+
+	if err := r.fullContextQueryBlocked("QueryBatched"); err != nil {
+		return r.queryBatchError(prompts, err, time.Since(start).Seconds())
+	}
 
 	// Build full prompts with context included
 	fullPrompts := make([]string, len(prompts))
@@ -367,11 +492,7 @@ func (r *REPL) llmQueryBatched(prompts []string) []string {
 		}
 		// Record each as a failed call (store original prompts for clarity)
 		for i, p := range prompts {
-			r.llmCalls = append(r.llmCalls, LLMCall{
-				Prompt:   p,
-				Response: errResults[i],
-				Duration: duration / float64(len(prompts)),
-			})
+			r.recordLLMCall(p, errResults[i], durationPerPrompt(duration, len(prompts)), QueryResponse{})
 		}
 		return errResults
 	}
@@ -380,13 +501,26 @@ func (r *REPL) llmQueryBatched(prompts []string) []string {
 	responses := make([]string, len(results))
 	for i, p := range prompts {
 		responses[i] = results[i].Response
-		r.llmCalls = append(r.llmCalls, LLMCall{
-			Prompt:           p,
-			Response:         results[i].Response,
-			Duration:         duration / float64(len(prompts)),
-			PromptTokens:     results[i].PromptTokens,
-			CompletionTokens: results[i].CompletionTokens,
-		})
+		r.recordLLMCall(p, results[i].Response, durationPerPrompt(duration, len(prompts)), results[i])
+	}
+	return responses
+}
+
+// llmQueryBatchedRaw makes concurrent LLM queries without prepending loaded context.
+func (r *REPL) llmQueryBatchedRaw(prompts []string) []string {
+	start := time.Now()
+
+	results, err := r.llmClient.QueryBatched(r.ctx, prompts)
+	duration := time.Since(start).Seconds()
+
+	if err != nil {
+		return r.queryBatchError(prompts, err, duration)
+	}
+
+	responses := make([]string, len(results))
+	for i, p := range prompts {
+		responses[i] = results[i].Response
+		r.recordLLMCall(p, results[i].Response, durationPerPrompt(duration, len(prompts)), results[i])
 	}
 	return responses
 }
@@ -396,6 +530,16 @@ func (r *REPL) llmQueryBatched(prompts []string) []string {
 // It automatically includes the context variable (if loaded) in the prompt.
 func (r *REPL) llmQueryAsync(prompt string) string {
 	handle := newAsyncQueryHandle()
+
+	if err := r.fullContextQueryBlocked("QueryAsync"); err != nil {
+		response := fmt.Sprintf("Error: %v", err)
+		r.recordLLMCallAsync(prompt, response, 0, QueryResponse{})
+		r.asyncMu.Lock()
+		r.asyncQueries[handle.id] = handle
+		r.asyncMu.Unlock()
+		handle.complete(QueryResponse{}, err)
+		return handle.id
+	}
 
 	// Build full prompt with context included (capture before goroutine)
 	fullPrompt := r.buildPromptWithContext(prompt)
@@ -417,16 +561,7 @@ func (r *REPL) llmQueryAsync(prompt string) string {
 		}
 
 		// Record the async call (store original prompt for clarity)
-		r.mu.Lock()
-		r.llmCalls = append(r.llmCalls, LLMCall{
-			Prompt:           prompt,
-			Response:         response,
-			Duration:         duration,
-			PromptTokens:     result.PromptTokens,
-			CompletionTokens: result.CompletionTokens,
-			Async:            true,
-		})
-		r.mu.Unlock()
+		r.recordLLMCallAsync(prompt, response, duration, result)
 
 		// Complete the handle
 		handle.complete(result, err)
@@ -565,6 +700,16 @@ func (r *REPL) ClearFinal() {
 func (r *REPL) QueryAsync(prompt string) *AsyncQueryHandle {
 	handle := newAsyncQueryHandle()
 
+	if err := r.fullContextQueryBlocked("QueryAsync"); err != nil {
+		response := fmt.Sprintf("Error: %v", err)
+		r.recordLLMCallAsync(prompt, response, 0, QueryResponse{})
+		r.asyncMu.Lock()
+		r.asyncQueries[handle.id] = handle
+		r.asyncMu.Unlock()
+		handle.complete(QueryResponse{}, err)
+		return handle
+	}
+
 	// Build full prompt with context included (capture before goroutine)
 	fullPrompt := r.buildPromptWithContext(prompt)
 
@@ -585,16 +730,7 @@ func (r *REPL) QueryAsync(prompt string) *AsyncQueryHandle {
 		}
 
 		// Record the async call (store original prompt for clarity)
-		r.mu.Lock()
-		r.llmCalls = append(r.llmCalls, LLMCall{
-			Prompt:           prompt,
-			Response:         response,
-			Duration:         duration,
-			PromptTokens:     result.PromptTokens,
-			CompletionTokens: result.CompletionTokens,
-			Async:            true,
-		})
-		r.mu.Unlock()
+		r.recordLLMCallAsync(prompt, response, duration, result)
 
 		// Complete the handle
 		handle.complete(result, err)

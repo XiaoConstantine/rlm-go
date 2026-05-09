@@ -46,7 +46,7 @@ for i := 0; i < 5; i++ {
     if i == 4 { end = len(context) }
     prompts = append(prompts, fmt.Sprintf("Find any secret codes in this text. Return ONLY the code if found, or 'none' if not found: %s", context[start:end]))
 }
-results := QueryBatched(prompts)
+results := QueryBatchedRaw(prompts)
 for i, r := range results { fmt.Printf("Chunk %d: %s\n", i, r) }`,
 			Answer: "",
 		},
@@ -98,7 +98,7 @@ for _, doc := range docs {
 if batch != "" {
     prompts = append(prompts, "Identify main themes in these documents:\n"+batch)
 }
-results := QueryBatched(prompts)
+results := QueryBatchedRaw(prompts)
 for i, r := range results { fmt.Printf("Batch %d themes: %s\n", i, r) }`,
 			Answer: "",
 		},
@@ -141,10 +141,12 @@ IMPORTANT: PREFER Query() OVER MANUAL PARSING. Do NOT write complex string parsi
 
 The REPL environment is initialized with:
 1. A "context" variable (string) containing the data to analyze. ALWAYS explore this first.
-2. A "Query(prompt string) string" function to query a sub-LLM (handles ~500K chars) - USE THIS LIBERALLY.
-3. A "QueryBatched(prompts []string) []string" function for concurrent queries (much faster) - PREFERRED for multiple analyses.
-4. Pre-imported packages: fmt, strings, regexp, strconv, encoding/json, sort.
-5. Helper functions: min(a, b int), max(a, b int).
+2. A "Query(prompt string) string" function to query a sub-LLM with the full context automatically prepended.
+3. A "QueryRaw(prompt string) string" function to query a sub-LLM with exactly the prompt you provide.
+4. A "QueryWith(contextSlice, prompt string) string" function to query a sub-LLM with only a selected context slice.
+5. "QueryBatched" and "QueryBatchedRaw" functions for concurrent queries.
+6. Pre-imported packages: fmt, strings, regexp, strconv, encoding/json, sort.
+7. Helper functions: min(a, b int), max(a, b int).
 
 CRITICAL CODE RULES (violations cause errors):
 - DO NOT use 'import' statements - packages are already imported
@@ -161,6 +163,7 @@ Sub-LLM Capacity & Efficiency:
 - BATCH ~200K characters per Query call for optimal efficiency
 - MINIMIZE the number of Query() calls by batching information together
 - Do NOT make separate Query() calls for each line/item - batch them!
+- Query() and QueryBatched() automatically include the full context. If you manually include a context slice in the prompt, use QueryRaw() or QueryBatchedRaw(), or use QueryWith(slice, prompt).
 
 IMPORTANT: REPL outputs are truncated. Use Query() to analyze full content rather than printing large outputs.
 Make sure to explicitly look through the entire context before answering.
@@ -180,7 +183,7 @@ First check what you're working with:
 - fmt.Println("Preview:", context[:500])
 
 EXAMPLE - Simple query (IMMEDIATELY call FINAL when you have the answer):
-answer := Query(fmt.Sprintf("What is the secret code in this text? Return ONLY the code: %s", context))
+answer := QueryWith(context, "What is the secret code in this text? Return ONLY the code")
 FINAL(answer)  // Call FINAL immediately - don't wait for another iteration!
 
 EXAMPLE - Chunked parallel processing:
@@ -191,7 +194,7 @@ for i := 0; i < 5; i++ {
     if i == 4 { end = len(context) }
     prompts = append(prompts, fmt.Sprintf("Find secret codes in: %s", context[start:end]))
 }
-results := QueryBatched(prompts)
+results := QueryBatchedRaw(prompts)
 
 EXAMPLE - Large context (800K+ chars), filter first then batch:
 errorRe := regexp.MustCompile("(?i)error|exception|failed")
@@ -215,14 +218,14 @@ for _, doc := range docs {
 if batch != "" {
     prompts = append(prompts, "Identify main themes in these documents:\n"+batch)
 }
-results := QueryBatched(prompts)
+results := QueryBatchedRaw(prompts)
 for i, r := range results { fmt.Printf("Batch %d themes: %s\n", i, r) }
 
 CRITICAL - SIGNALING COMPLETION:
 When Query() returns the answer, IMMEDIATELY call FINAL() in the SAME code block!
 
 BEST PRACTICE - Call FINAL in code right after Query:
-answer := Query("What is the label? Return ONLY 'correct' or 'incorrect': " + context)
+answer := QueryWith(context, "What is the label? Return ONLY 'correct' or 'incorrect'")
 FINAL(answer)  // IMMEDIATELY signal completion - don't wait for next iteration!
 
 ALSO WORKS - FINAL_VAR for existing variables:
@@ -289,12 +292,14 @@ IMPORTANT: PREFER Query() OVER MANUAL PARSING. Do NOT write complex string parsi
 
 The REPL environment is initialized with:
 1. A "context" variable (string) containing the data to analyze. ALWAYS explore this first.
-2. A "Query(prompt string) string" function to query a sub-LLM (handles ~500K chars) - USE THIS LIBERALLY.
-3. A "QueryBatched(prompts []string) []string" function for concurrent queries (much faster) - PREFERRED for multiple analyses.
-4. A "QueryWithRLM(prompt string, depth int) string" function for RECURSIVE RLM queries.
-5. A "QueryBatchedWithRLM(prompts []string, depth int) []string" for concurrent recursive queries.
-6. Helper functions: "CurrentDepth() int", "MaxDepth() int", "CanRecurse() bool", min(a, b int), max(a, b int).
-7. Pre-imported packages: fmt, strings, regexp, strconv, encoding/json, sort.
+2. A "Query(prompt string) string" function to query a sub-LLM.
+3. A "QueryRaw(prompt string) string" function to query a sub-LLM with exactly the prompt you provide.
+4. A "QueryWith(contextSlice, prompt string) string" function to query a sub-LLM with only a selected context slice.
+5. "QueryBatched" and "QueryBatchedRaw" functions for concurrent queries.
+6. A "QueryWithRLM(prompt string, depth int) string" function for RECURSIVE RLM queries.
+7. A "QueryBatchedWithRLM(prompts []string, depth int) []string" for concurrent recursive queries.
+8. Helper functions: "CurrentDepth() int", "MaxDepth() int", "CanRecurse() bool", min(a, b int), max(a, b int).
+9. Pre-imported packages: fmt, strings, regexp, strconv, encoding/json, sort.
 
 CRITICAL CODE RULES (violations cause errors):
 - DO NOT use 'import' statements - packages are already imported
@@ -311,6 +316,7 @@ Sub-LLM Capacity & Efficiency:
 - BATCH ~200K characters per Query call for optimal efficiency
 - MINIMIZE the number of Query() calls by batching information together
 - Do NOT make separate Query() calls for each line/item - batch them!
+- In the standard REPL, Query() and QueryBatched() automatically include the full context. If you manually include a context slice in the prompt, use QueryRaw(), QueryBatchedRaw(), or QueryWith(slice, prompt).
 
 RECURSIVE RLM CAPABILITIES:
 - QueryWithRLM spawns a nested RLM that can execute code and query sub-LLMs
@@ -359,7 +365,7 @@ CRITICAL - SIGNALING COMPLETION:
 When Query() returns the answer, IMMEDIATELY call FINAL() in the SAME code block!
 
 BEST PRACTICE - Call FINAL in code right after Query:
-answer := Query("What is the label? Return ONLY 'correct' or 'incorrect': " + context)
+answer := QueryWith(context, "What is the label? Return ONLY 'correct' or 'incorrect'")
 FINAL(answer)  // IMMEDIATELY signal completion - don't wait for next iteration!
 
 ALSO WORKS - FINAL_VAR for existing variables:
