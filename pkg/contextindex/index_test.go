@@ -3,6 +3,7 @@ package contextindex
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestIndexLineAndChunkHelpers(t *testing.T) {
@@ -64,6 +65,31 @@ func TestFindRelevantScoresAndFallsBack(t *testing.T) {
 	}
 	if got := GetContext("a\nb\nc", 99, 99); got != "" {
 		t.Fatalf("package out-of-range GetContext() = %q, want empty", got)
+	}
+}
+
+func TestChunksDoNotSplitUTF8Runes(t *testing.T) {
+	raw := strings.Repeat("a", defaultChunkChars-1) + "🙂" + strings.Repeat("b", defaultChunkOverlap+1)
+	idx := New(raw)
+
+	if got := idx.ChunkCount(); got < 2 {
+		t.Fatalf("ChunkCount() = %d, want at least 2", got)
+	}
+	for i := 0; i < idx.ChunkCount(); i++ {
+		chunk, ok := idx.GetChunk(i)
+		if !ok {
+			t.Fatalf("GetChunk(%d) not found", i)
+		}
+		if !utf8.ValidString(chunk) {
+			t.Fatalf("GetChunk(%d) is invalid UTF-8: %q", i, chunk)
+		}
+	}
+
+	if idx.chunks[0].EndChar != defaultChunkChars {
+		t.Fatalf("first chunk EndChar = %d, want %d rune offset", idx.chunks[0].EndChar, defaultChunkChars)
+	}
+	if !strings.Contains(idx.chunks[0].Content, "🙂") {
+		t.Fatalf("first chunk = %q, want complete emoji", idx.chunks[0].Content)
 	}
 }
 

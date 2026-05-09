@@ -679,14 +679,15 @@ func contextChunks() []string {
 	}
 	const chunkSize = 4000
 	const overlap = 200
+	runes := []rune(context)
 	var chunks []string
-	for start := 0; start < len(context); {
+	for start := 0; start < len(runes); {
 		end := start + chunkSize
-		if end > len(context) {
-			end = len(context)
+		if end > len(runes) {
+			end = len(runes)
 		}
-		chunks = append(chunks, context[start:end])
-		if end == len(context) {
+		chunks = append(chunks, string(runes[start:end]))
+		if end == len(runes) {
 			break
 		}
 		start = end - overlap

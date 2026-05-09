@@ -15,8 +15,9 @@ const (
 
 // Chunk is a searchable slice of the loaded context.
 type Chunk struct {
-	ID        int
-	Content   string
+	ID      int
+	Content string
+	// StartChar and EndChar are zero-based rune offsets. EndChar is exclusive.
 	StartChar int
 	EndChar   int
 	StartLine int
@@ -87,23 +88,27 @@ func buildChunks(raw string, lines []string) []Chunk {
 		return nil
 	}
 
+	byteOffsets := runeByteOffsets(raw)
+	runeCount := len(byteOffsets) - 1
 	var chunks []Chunk
-	for start := 0; start < len(raw); {
+	for start := 0; start < runeCount; {
 		end := start + defaultChunkChars
-		if end > len(raw) {
-			end = len(raw)
+		if end > runeCount {
+			end = runeCount
 		}
-		startLine := lineForChar(raw, start)
-		endLine := lineForChar(raw, end)
+		startByte := byteOffsets[start]
+		endByte := byteOffsets[end]
+		startLine := lineForByte(raw, startByte)
+		endLine := lineForByte(raw, endByte)
 		chunks = append(chunks, Chunk{
 			ID:        len(chunks),
-			Content:   raw[start:end],
+			Content:   raw[startByte:endByte],
 			StartChar: start,
 			EndChar:   end,
 			StartLine: startLine,
 			EndLine:   endLine,
 		})
-		if end == len(raw) {
+		if end == runeCount {
 			break
 		}
 		start = end - defaultChunkOverlap
@@ -112,19 +117,28 @@ func buildChunks(raw string, lines []string) []Chunk {
 		}
 	}
 	if len(chunks) == 0 && len(lines) > 0 {
-		chunks = append(chunks, Chunk{ID: 0, Content: raw, StartLine: 1, EndLine: len(lines), EndChar: len(raw)})
+		chunks = append(chunks, Chunk{ID: 0, Content: raw, StartLine: 1, EndLine: len(lines), EndChar: runeCount})
 	}
 	return chunks
 }
 
-func lineForChar(raw string, charOffset int) int {
-	if charOffset <= 0 {
+func runeByteOffsets(raw string) []int {
+	offsets := make([]int, 0, len(raw)+1)
+	for offset := range raw {
+		offsets = append(offsets, offset)
+	}
+	offsets = append(offsets, len(raw))
+	return offsets
+}
+
+func lineForByte(raw string, byteOffset int) int {
+	if byteOffset <= 0 {
 		return 1
 	}
-	if charOffset > len(raw) {
-		charOffset = len(raw)
+	if byteOffset > len(raw) {
+		byteOffset = len(raw)
 	}
-	return strings.Count(raw[:charOffset], "\n") + 1
+	return strings.Count(raw[:byteOffset], "\n") + 1
 }
 
 // FindRelevant returns the top matching chunks by simple keyword score.
