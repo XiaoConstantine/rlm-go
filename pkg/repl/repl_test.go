@@ -598,11 +598,23 @@ func TestReset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("variable should exist before reset: %v", err)
 	}
+	if err := repl.LoadContext("old searchable context"); err != nil {
+		t.Fatalf("LoadContext() error: %v", err)
+	}
 
 	// Reset
 	err = repl.Reset()
 	if err != nil {
 		t.Fatalf("Reset() error: %v", err)
+	}
+	if got := repl.lineCount(); got != 0 {
+		t.Fatalf("LineCount after Reset = %d, want 0", got)
+	}
+	if got := repl.getContextRange(1, 1); got != "" {
+		t.Fatalf("GetContext after Reset = %q, want empty", got)
+	}
+	if got := repl.findRelevant("old", 1); len(got) != 0 {
+		t.Fatalf("FindRelevant after Reset = %q, want empty", got)
 	}
 
 	// Verify variable no longer exists
@@ -675,6 +687,97 @@ func TestContextInfo(t *testing.T) {
 				t.Errorf("ContextInfo() = %q, expected to contain %q", info, tt.expected)
 			}
 		})
+	}
+}
+
+func TestContextIndexHelpers(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+
+	if err := repl.LoadContext("alpha first\nbeta second\nalpha beta third"); err != nil {
+		t.Fatalf("LoadContext() error: %v", err)
+	}
+
+	info := repl.ContextInfo()
+	for _, want := range []string{"lines=3", "chunks=1"} {
+		if !strings.Contains(info, want) {
+			t.Fatalf("ContextInfo() = %q, want %q", info, want)
+		}
+	}
+
+	result, err := repl.Execute(context.Background(), `
+fmt.Println("lines", LineCount())
+fmt.Println("chunks", ChunkCount())
+fmt.Println("range", GetContext(2, 3))
+fmt.Println("past", GetContext(99, 99) == "")
+fmt.Println("chunk", strings.Contains(GetChunk(0), "alpha first"))
+relevant := FindRelevant("beta", 1)
+fmt.Println("relevant", len(relevant), strings.Contains(relevant[0], "beta second"))
+`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	for _, want := range []string{
+		"lines 3",
+		"chunks 1",
+		"range beta second\nalpha beta third",
+		"past true",
+		"chunk true",
+		"relevant 1 true",
+	} {
+		if !strings.Contains(result.Stdout, want) {
+			t.Fatalf("stdout = %q, want %q", result.Stdout, want)
+		}
+	}
+
+	result, err = repl.Execute(context.Background(), `
+context = "gamma first\ndelta second"
+fmt.Println("mutated lines", LineCount())
+fmt.Println("mutated range", GetContext(1, 2))
+mutated := FindRelevant("gamma?", 1)
+fmt.Println("mutated relevant", len(mutated), strings.Contains(mutated[0], "gamma first"), strings.Contains(mutated[0], "alpha first"))
+`)
+	if err != nil {
+		t.Fatalf("Execute mutated context error: %v", err)
+	}
+	for _, want := range []string{
+		"mutated lines 2",
+		"mutated range gamma first\ndelta second",
+		"mutated relevant 1 true false",
+	} {
+		if !strings.Contains(result.Stdout, want) {
+			t.Fatalf("mutated stdout = %q, want %q", result.Stdout, want)
+		}
+	}
+}
+
+func TestLoadContextNilIsEmpty(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+
+	if err := repl.LoadContext(nil); err != nil {
+		t.Fatalf("LoadContext(nil) error: %v", err)
+	}
+
+	result, err := repl.Execute(context.Background(), `
+fmt.Println("context", context == "")
+fmt.Println("lines", LineCount())
+fmt.Println("range", GetContext(1, 1) == "")
+fmt.Println("relevant", len(FindRelevant("null", 1)))
+`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	for _, want := range []string{
+		"context true",
+		"lines 0",
+		"range true",
+		"relevant 0",
+	} {
+		if !strings.Contains(result.Stdout, want) {
+			t.Fatalf("stdout = %q, want %q", result.Stdout, want)
+		}
 	}
 }
 

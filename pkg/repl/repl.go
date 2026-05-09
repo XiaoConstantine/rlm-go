@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/XiaoConstantine/rlm-go/pkg/contextindex"
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
 	"github.com/XiaoConstantine/rlm-go/pkg/interpreter"
 	"github.com/traefik/yaegi/interp"
@@ -243,6 +244,11 @@ func (r *REPL) injectBuiltins() error {
 		"QueryWith":         reflect.ValueOf(r.llmQueryWith),
 		"QueryBatched":      reflect.ValueOf(r.llmQueryBatched),
 		"QueryBatchedRaw":   reflect.ValueOf(r.llmQueryBatchedRaw),
+		"FindRelevant":      reflect.ValueOf(r.findRelevant),
+		"GetChunk":          reflect.ValueOf(r.getChunk),
+		"GetContext":        reflect.ValueOf(r.getContextRange),
+		"ChunkCount":        reflect.ValueOf(r.chunkCount),
+		"LineCount":         reflect.ValueOf(r.lineCount),
 		"QueryAsync":        reflect.ValueOf(r.llmQueryAsync),
 		"QueryBatchedAsync": reflect.ValueOf(r.llmQueryBatchedAsync),
 		"WaitAsync":         reflect.ValueOf(r.waitAsync),
@@ -791,6 +797,10 @@ func (r *REPL) WaitAllAsyncQueries() {
 func (r *REPL) LoadContext(payload any) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if payload == nil {
+		_, err := r.interp.Eval(`var context = ""`)
+		return err
+	}
 
 	switch v := payload.(type) {
 	case string:
@@ -812,7 +822,9 @@ func (r *REPL) LoadContext(payload any) error {
 		if err != nil {
 			return fmt.Errorf("unsupported context type %T: %w", v, err)
 		}
-		return r.LoadContext(string(jsonBytes))
+		contextStr := string(jsonBytes)
+		_, err = r.interp.Eval(`var context = ` + strconv.Quote(contextStr))
+		return err
 	}
 }
 
@@ -1030,10 +1042,53 @@ func (r *REPL) ContextInfo() string {
 	iface := v.Interface()
 	switch ctx := iface.(type) {
 	case string:
-		return fmt.Sprintf("type=string, len=%d", len(ctx))
+		idx := contextindex.New(ctx)
+		chunks := idx.ChunkCount()
+		lines := idx.LineCount()
+		return fmt.Sprintf("type=string, len=%d, lines=%d, chunks=%d", len(ctx), lines, chunks)
 	default:
 		return fmt.Sprintf("type=%T", ctx)
 	}
+}
+
+func (r *REPL) findRelevant(query string, topK int) []string {
+	contextStr, ok := r.contextString()
+	if !ok {
+		return []string{}
+	}
+	return contextindex.FindRelevant(contextStr, query, topK)
+}
+
+func (r *REPL) getChunk(id int) string {
+	contextStr, ok := r.contextString()
+	if !ok {
+		return ""
+	}
+	return contextindex.GetChunk(contextStr, id)
+}
+
+func (r *REPL) getContextRange(startLine, endLine int) string {
+	contextStr, ok := r.contextString()
+	if !ok {
+		return ""
+	}
+	return contextindex.GetContext(contextStr, startLine, endLine)
+}
+
+func (r *REPL) chunkCount() int {
+	contextStr, ok := r.contextString()
+	if !ok {
+		return 0
+	}
+	return contextindex.ChunkCount(contextStr)
+}
+
+func (r *REPL) lineCount() int {
+	contextStr, ok := r.contextString()
+	if !ok {
+		return 0
+	}
+	return contextindex.LineCount(contextStr)
 }
 
 // FormatExecutionResult formats an execution result for display to the LLM.

@@ -245,6 +245,119 @@ func TestLocalExecutorWithContext(t *testing.T) {
 	}
 }
 
+func TestLocalExecutorContextIndexHelpers(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	if err := exec.LoadContext("alpha first\nbeta second\nalpha beta third"); err != nil {
+		t.Fatalf("LoadContext failed: %v", err)
+	}
+
+	info := exec.ContextInfo()
+	for _, want := range []string{"lines=3", "chunks=1"} {
+		if !strings.Contains(info, want) {
+			t.Fatalf("ContextInfo() = %q, want %q", info, want)
+		}
+	}
+
+	result, err := exec.Execute(context.Background(), `
+fmt.Println("lines", LineCount())
+fmt.Println("chunks", ChunkCount())
+fmt.Println("range", GetContext(2, 3))
+fmt.Println("past", GetContext(99, 99) == "")
+fmt.Println("chunk", strings.Contains(GetChunk(0), "alpha first"))
+relevant := FindRelevant("beta", 1)
+fmt.Println("relevant", len(relevant), strings.Contains(relevant[0], "beta second"))
+`)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if result.Stderr != "" {
+		t.Fatalf("stderr = %q", result.Stderr)
+	}
+	for _, want := range []string{
+		"lines 3",
+		"chunks 1",
+		"range beta second\nalpha beta third",
+		"past true",
+		"chunk true",
+		"relevant 1 true",
+	} {
+		if !strings.Contains(result.Stdout, want) {
+			t.Fatalf("stdout = %q, want %q", result.Stdout, want)
+		}
+	}
+
+	result, err = exec.Execute(context.Background(), `
+context = "gamma first\ndelta second"
+fmt.Println("mutated lines", LineCount())
+fmt.Println("mutated range", GetContext(1, 2))
+mutated := FindRelevant("gamma?", 1)
+fmt.Println("mutated relevant", len(mutated), strings.Contains(mutated[0], "gamma first"), strings.Contains(mutated[0], "alpha first"))
+`)
+	if err != nil {
+		t.Fatalf("Execute mutated context failed: %v", err)
+	}
+	if result.Stderr != "" {
+		t.Fatalf("mutated stderr = %q", result.Stderr)
+	}
+	for _, want := range []string{
+		"mutated lines 2",
+		"mutated range gamma first\ndelta second",
+		"mutated relevant 1 true false",
+	} {
+		if !strings.Contains(result.Stdout, want) {
+			t.Fatalf("mutated stdout = %q, want %q", result.Stdout, want)
+		}
+	}
+}
+
+func TestLocalExecutorLoadContextNilIsEmpty(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	if err := exec.LoadContext(nil); err != nil {
+		t.Fatalf("LoadContext(nil) failed: %v", err)
+	}
+
+	result, err := exec.Execute(context.Background(), `
+fmt.Println("context", context == "")
+fmt.Println("lines", LineCount())
+fmt.Println("range", GetContext(1, 1) == "")
+fmt.Println("relevant", len(FindRelevant("null", 1)))
+`)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if result.Stderr != "" {
+		t.Fatalf("stderr = %q", result.Stderr)
+	}
+	for _, want := range []string{
+		"context true",
+		"lines 0",
+		"range true",
+		"relevant 0",
+	} {
+		if !strings.Contains(result.Stdout, want) {
+			t.Fatalf("stdout = %q, want %q", result.Stdout, want)
+		}
+	}
+}
+
 func TestLocalExecutorWithQuery(t *testing.T) {
 	client := NewMockLLMClient()
 	client.Responses["What is 2+2?"] = "4"
@@ -1648,6 +1761,32 @@ func TestContainerExecutorStringContextIsRaw(t *testing.T) {
 	if strings.Contains(code, `var context = "\"container context data\""`) {
 		t.Fatal("generated string context should not be JSON-quoted")
 	}
+	if !strings.Contains(code, "unicode.IsLetter") || !strings.Contains(code, "unicode.IsNumber") {
+		t.Error("no-IPC generated context search should use contextindex-style tokenization")
+	}
+	if !strings.Contains(code, "if startLine > len(lines)") {
+		t.Error("no-IPC generated GetContext should clamp startLine past EOF")
+	}
+}
+
+func TestContainerExecutorLoadContextNilIsEmpty(t *testing.T) {
+	exec := &ContainerExecutor{
+		variables: make(map[string]any),
+		finalTok:  "token",
+	}
+	if err := exec.LoadContext(nil); err != nil {
+		t.Fatalf("LoadContext(nil) failed: %v", err)
+	}
+	if info := exec.ContextInfo(); info != "context not loaded" {
+		t.Fatalf("ContextInfo() = %q, want context not loaded", info)
+	}
+	code, err := exec.generateProgram("", 0)
+	if err != nil {
+		t.Fatalf("generateProgram failed: %v", err)
+	}
+	if !strings.Contains(code, `var context = ""`) {
+		t.Fatalf("generated nil context should be empty string, code=%s", code)
+	}
 }
 
 func TestGenerateContainerRLMCode(t *testing.T) {
@@ -1664,6 +1803,22 @@ func TestGenerateContainerRLMCode(t *testing.T) {
 
 	if !strings.Contains(code, "func QueryBatched(prompts []string) []string") {
 		t.Error("Expected QueryBatched function in generated code")
+	}
+
+	if !strings.Contains(code, "func FindRelevant(query string, topK int) []string") {
+		t.Error("Expected FindRelevant function in generated code")
+	}
+
+	if !strings.Contains(code, "unicode.IsLetter") || !strings.Contains(code, "unicode.IsNumber") {
+		t.Error("Expected generated context search tokenization to match contextindex")
+	}
+
+	if !strings.Contains(code, "func GetContext(startLine, endLine int) string") {
+		t.Error("Expected GetContext function in generated code")
+	}
+
+	if !strings.Contains(code, "if startLine > len(lines)") {
+		t.Error("Expected generated GetContext to clamp startLine past EOF")
 	}
 
 	if !strings.Contains(code, "func QueryRaw(prompt string) string") {

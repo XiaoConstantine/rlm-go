@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/XiaoConstantine/rlm-go/pkg/contextindex"
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
 	"github.com/XiaoConstantine/rlm-go/pkg/interpreter"
 	"github.com/traefik/yaegi/interp"
@@ -333,10 +334,15 @@ func NewLocalExecutor(client LLMClient, cfg Config) (*LocalExecutor, error) {
 func (e *LocalExecutor) useBuiltins(token string, runCtx context.Context, stdout *localOutput, runID uint64) error {
 	symbols := interp.Exports{
 		"rlm/rlm": {
-			"QueryRaw":        reflect.ValueOf(func(prompt string) string { return e.llmQueryRaw(token, runCtx, prompt) }),
-			"QueryBatchedRaw": reflect.ValueOf(func(prompts []string) []string { return e.llmQueryBatchedRaw(token, runCtx, prompts) }),
-			"FINAL":           reflect.ValueOf(func(value any) string { return e.finalAnswer(token, stdout, runID, value) }),
-			"FINAL_VAR":       reflect.ValueOf(func(value any) string { return e.finalAnswer(token, stdout, runID, value) }),
+			"QueryRaw":              reflect.ValueOf(func(prompt string) string { return e.llmQueryRaw(token, runCtx, prompt) }),
+			"QueryBatchedRaw":       reflect.ValueOf(func(prompts []string) []string { return e.llmQueryBatchedRaw(token, runCtx, prompts) }),
+			"FindRelevantInContext": reflect.ValueOf(contextindex.FindRelevant),
+			"GetChunkInContext":     reflect.ValueOf(contextindex.GetChunk),
+			"GetContextInContext":   reflect.ValueOf(contextindex.GetContext),
+			"ChunkCountInContext":   reflect.ValueOf(contextindex.ChunkCount),
+			"LineCountInContext":    reflect.ValueOf(contextindex.LineCount),
+			"FINAL":                 reflect.ValueOf(func(value any) string { return e.finalAnswer(token, stdout, runID, value) }),
+			"FINAL_VAR":             reflect.ValueOf(func(value any) string { return e.finalAnswer(token, stdout, runID, value) }),
 		},
 	}
 
@@ -358,6 +364,26 @@ func buildPromptWithProvidedContext(contextStr, prompt string) string {
 		return prompt
 	}
 	return fmt.Sprintf("Context data:\n%s\n\nTask: %s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextStr, prompt)
+}
+
+func FindRelevant(query string, topK int) []string {
+	return FindRelevantInContext(context, query, topK)
+}
+
+func GetChunk(id int) string {
+	return GetChunkInContext(context, id)
+}
+
+func GetContext(startLine, endLine int) string {
+	return GetContextInContext(context, startLine, endLine)
+}
+
+func ChunkCount() int {
+	return ChunkCountInContext(context)
+}
+
+func LineCount() int {
+	return LineCountInContext(context)
 }
 `
 
@@ -738,6 +764,11 @@ func (e *LocalExecutor) Execute(ctx context.Context, code string) (*core.Executi
 func (e *LocalExecutor) LoadContext(payload any) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if payload == nil {
+		e.context = ""
+		_, err := e.interp.Eval(`context = ""`)
+		return err
+	}
 
 	switch v := payload.(type) {
 	case string:
@@ -837,7 +868,10 @@ func (e *LocalExecutor) ContextInfo() string {
 	iface := v.Interface()
 	switch ctx := iface.(type) {
 	case string:
-		return fmt.Sprintf("type=string, len=%d", len(ctx))
+		idx := contextindex.New(ctx)
+		chunks := idx.ChunkCount()
+		lines := idx.LineCount()
+		return fmt.Sprintf("type=string, len=%d, lines=%d, chunks=%d", len(ctx), lines, chunks)
 	default:
 		return fmt.Sprintf("type=%T", ctx)
 	}

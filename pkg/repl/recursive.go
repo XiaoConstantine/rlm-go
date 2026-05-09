@@ -4,11 +4,13 @@ package repl
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"sync"
 	"time"
 
+	"github.com/XiaoConstantine/rlm-go/pkg/contextindex"
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
 	"github.com/XiaoConstantine/rlm-go/pkg/interpreter"
 	"github.com/traefik/yaegi/interp"
@@ -103,6 +105,11 @@ func (r *RecursiveREPL) injectBuiltins() error {
 			"QueryWith":         reflect.ValueOf(r.llmQueryWith),
 			"QueryBatched":      reflect.ValueOf(r.llmQueryBatched),
 			"QueryBatchedRaw":   reflect.ValueOf(r.llmQueryBatchedRaw),
+			"FindRelevant":      reflect.ValueOf(r.findRelevant),
+			"GetChunk":          reflect.ValueOf(r.getChunk),
+			"GetContext":        reflect.ValueOf(r.getContextRange),
+			"ChunkCount":        reflect.ValueOf(r.chunkCount),
+			"LineCount":         reflect.ValueOf(r.lineCount),
 			"QueryAsync":        reflect.ValueOf(r.llmQueryAsync),
 			"QueryBatchedAsync": reflect.ValueOf(r.llmQueryBatchedAsync),
 			"WaitAsync":         reflect.ValueOf(r.waitAsync),
@@ -430,6 +437,10 @@ func (r *RecursiveREPL) asyncResult(handleID string) string {
 func (r *RecursiveREPL) LoadContext(payload any) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if payload == nil {
+		_, err := r.interp.Eval(`var context = ""`)
+		return err
+	}
 
 	switch v := payload.(type) {
 	case string:
@@ -437,7 +448,8 @@ func (r *RecursiveREPL) LoadContext(payload any) error {
 		return err
 	default:
 		// For other types, serialize to string
-		_, err := r.interp.Eval(`var context = ` + fmt.Sprintf("%q", fmt.Sprintf("%v", v)))
+		contextStr := contextindex.Stringify(v)
+		_, err := r.interp.Eval(`var context = ` + fmt.Sprintf("%q", contextStr))
 		return err
 	}
 }
@@ -572,10 +584,74 @@ func (r *RecursiveREPL) ContextInfo() string {
 	iface := v.Interface()
 	switch ctx := iface.(type) {
 	case string:
-		return fmt.Sprintf("type=string, len=%d", len(ctx))
+		idx := contextindex.New(ctx)
+		chunks := idx.ChunkCount()
+		lines := idx.LineCount()
+		return fmt.Sprintf("type=string, len=%d, lines=%d, chunks=%d", len(ctx), lines, chunks)
 	default:
 		return fmt.Sprintf("type=%T", ctx)
 	}
+}
+
+func (r *RecursiveREPL) contextString() (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	v, err := r.interp.Eval("context")
+	if err != nil || !v.IsValid() {
+		return "", false
+	}
+	switch ctx := v.Interface().(type) {
+	case string:
+		return ctx, ctx != ""
+	default:
+		jsonBytes, err := json.Marshal(ctx)
+		if err != nil {
+			return "", false
+		}
+		contextStr := string(jsonBytes)
+		return contextStr, contextStr != ""
+	}
+}
+
+func (r *RecursiveREPL) findRelevant(query string, topK int) []string {
+	contextStr, ok := r.contextString()
+	if !ok {
+		return []string{}
+	}
+	return contextindex.FindRelevant(contextStr, query, topK)
+}
+
+func (r *RecursiveREPL) getChunk(id int) string {
+	contextStr, ok := r.contextString()
+	if !ok {
+		return ""
+	}
+	return contextindex.GetChunk(contextStr, id)
+}
+
+func (r *RecursiveREPL) getContextRange(startLine, endLine int) string {
+	contextStr, ok := r.contextString()
+	if !ok {
+		return ""
+	}
+	return contextindex.GetContext(contextStr, startLine, endLine)
+}
+
+func (r *RecursiveREPL) chunkCount() int {
+	contextStr, ok := r.contextString()
+	if !ok {
+		return 0
+	}
+	return contextindex.ChunkCount(contextStr)
+}
+
+func (r *RecursiveREPL) lineCount() int {
+	contextStr, ok := r.contextString()
+	if !ok {
+		return 0
+	}
+	return contextindex.LineCount(contextStr)
 }
 
 // GetLocals extracts user-defined variables from the interpreter.

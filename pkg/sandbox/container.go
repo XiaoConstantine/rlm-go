@@ -209,6 +209,8 @@ func (e *ContainerExecutor) generateProgram(code string, execID uint64) (string,
 import (
 	"encoding/base64"
 	"fmt"
+	"strings"
+	"unicode"
 )
 
 func buildPromptWithProvidedContext(contextStr, prompt string) string {
@@ -216,6 +218,132 @@ func buildPromptWithProvidedContext(contextStr, prompt string) string {
 		return prompt
 	}
 	return fmt.Sprintf("Context data:\n%%s\n\nTask: %%s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextStr, prompt)
+}
+
+func contextChunks() []string {
+	if context == "" {
+		return nil
+	}
+	const chunkSize = 4000
+	const overlap = 200
+	var chunks []string
+	for start := 0; start < len(context); {
+		end := start + chunkSize
+		if end > len(context) {
+			end = len(context)
+		}
+		chunks = append(chunks, context[start:end])
+		if end == len(context) {
+			break
+		}
+		start = end - overlap
+		if start < 0 {
+			start = 0
+		}
+	}
+	return chunks
+}
+
+func FindRelevant(query string, topK int) []string {
+	chunks := contextChunks()
+	if len(chunks) == 0 {
+		return []string{}
+	}
+	if topK <= 0 {
+		topK = 3
+	}
+	if topK > len(chunks) {
+		topK = len(chunks)
+	}
+	terms := contextSearchTerms(query)
+	if len(terms) == 0 {
+		return chunks[:topK]
+	}
+	results := make([]string, 0, topK)
+	used := make([]bool, len(chunks))
+	for len(results) < topK {
+		bestIdx, bestScore := -1, 0
+		for i, chunk := range chunks {
+			if used[i] {
+				continue
+			}
+			score := 0
+			lower := strings.ToLower(chunk)
+			for _, term := range terms {
+				score += strings.Count(lower, term)
+			}
+			if bestIdx == -1 || score > bestScore {
+				bestIdx, bestScore = i, score
+			}
+		}
+		if bestIdx == -1 || bestScore == 0 {
+			break
+		}
+		used[bestIdx] = true
+		results = append(results, chunks[bestIdx])
+	}
+	if len(results) == 0 {
+		return chunks[:topK]
+	}
+	return results
+}
+
+func contextSearchTerms(query string) []string {
+	fields := strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
+	out := make([]string, 0, len(fields))
+	seen := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		if len(field) < 2 {
+			continue
+		}
+		if _, ok := seen[field]; ok {
+			continue
+		}
+		seen[field] = struct{}{}
+		out = append(out, field)
+	}
+	return out
+}
+
+func GetChunk(id int) string {
+	chunks := contextChunks()
+	if id < 0 || id >= len(chunks) {
+		return ""
+	}
+	return chunks[id]
+}
+
+func GetContext(startLine, endLine int) string {
+	lines := strings.Split(context, "\n")
+	if len(lines) == 0 || context == "" {
+		return ""
+	}
+	if startLine < 1 {
+		startLine = 1
+	}
+	if startLine > len(lines) {
+		return ""
+	}
+	if endLine < startLine {
+		endLine = startLine
+	}
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+	return strings.Join(lines[startLine-1:endLine], "\n")
+}
+
+func ChunkCount() int {
+	return len(contextChunks())
+}
+
+func LineCount() int {
+	if context == "" {
+		return 0
+	}
+	return len(strings.Split(context, "\n"))
 }
 
 // Query stub - IPC disabled
@@ -452,6 +580,9 @@ func (e *ContainerExecutor) LoadContext(payload any) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.contextData = payload
+	if payload == nil {
+		e.contextData = nil
+	}
 	return nil
 }
 
