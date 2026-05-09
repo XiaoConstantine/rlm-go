@@ -226,15 +226,16 @@ func contextChunks() []string {
 	}
 	const chunkSize = 4000
 	const overlap = 200
-	runes := []rune(context)
+	byteOffsets := runeByteOffsets(context)
+	runeCount := len(byteOffsets) - 1
 	var chunks []string
-	for start := 0; start < len(runes); {
+	for start := 0; start < runeCount; {
 		end := start + chunkSize
-		if end > len(runes) {
-			end = len(runes)
+		if end > runeCount {
+			end = runeCount
 		}
-		chunks = append(chunks, string(runes[start:end]))
-		if end == len(runes) {
+		chunks = append(chunks, context[byteOffsets[start]:byteOffsets[end]])
+		if end == runeCount {
 			break
 		}
 		start = end - overlap
@@ -243,6 +244,15 @@ func contextChunks() []string {
 		}
 	}
 	return chunks
+}
+
+func runeByteOffsets(raw string) []int {
+	offsets := make([]int, 0, len(raw)+1)
+	for offset := range raw {
+		offsets = append(offsets, offset)
+	}
+	offsets = append(offsets, len(raw))
+	return offsets
 }
 
 func FindRelevant(query string, topK int) []string {

@@ -1850,7 +1850,7 @@ func TestContainerExecutorStringContextIsRaw(t *testing.T) {
 	if !strings.Contains(code, "unicode.IsLetter") || !strings.Contains(code, "unicode.IsNumber") {
 		t.Error("no-IPC generated context search should use contextindex-style tokenization")
 	}
-	if !strings.Contains(code, "runes := []rune(context)") {
+	if !strings.Contains(code, "runeByteOffsets") || !strings.Contains(code, "context[byteOffsets[start]:byteOffsets[end]]") {
 		t.Error("no-IPC generated context chunking should be UTF-8 safe")
 	}
 	if !strings.Contains(code, "if startLine > len(lines)") {
@@ -1914,7 +1914,7 @@ func TestGenerateContainerRLMCode(t *testing.T) {
 		t.Error("Expected generated context search tokenization to match contextindex")
 	}
 
-	if !strings.Contains(code, "runes := []rune(context)") {
+	if !strings.Contains(code, "runeByteOffsets") || !strings.Contains(code, "context[byteOffsets[start]:byteOffsets[end]]") {
 		t.Error("Expected generated context chunking to be UTF-8 safe")
 	}
 
