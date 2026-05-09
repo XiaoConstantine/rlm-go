@@ -1922,10 +1922,16 @@ func runGeneratedProgram(t *testing.T, code string) string {
 		t.Fatalf("write generated go.mod: %v", err)
 	}
 
-	cmd := osexec.Command("go", "run", ".")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := osexec.CommandContext(ctx, "go", "run", ".")
 	cmd.Dir = dir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() != nil {
+			t.Fatalf("generated program timed out: %v\n%s", ctx.Err(), output)
+		}
 		t.Fatalf("generated program failed: %v\n%s", err, output)
 	}
 	return string(output)
