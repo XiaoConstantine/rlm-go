@@ -341,8 +341,11 @@ func (e *LocalExecutor) useBuiltins(token string, runCtx context.Context, stdout
 			"GetContextInContext":   reflect.ValueOf(contextindex.GetContext),
 			"ChunkCountInContext":   reflect.ValueOf(contextindex.ChunkCount),
 			"LineCountInContext":    reflect.ValueOf(contextindex.LineCount),
-			"FINAL":                 reflect.ValueOf(func(value any) string { return e.finalAnswer(token, stdout, runID, value) }),
-			"FINAL_VAR":             reflect.ValueOf(func(value any) string { return e.finalAnswer(token, stdout, runID, value) }),
+			"MaxFullContextQueryChars": reflect.ValueOf(func() int {
+				return e.config.MaxFullContextQueryChars
+			}),
+			"FINAL":     reflect.ValueOf(func(value any) string { return e.finalAnswer(token, stdout, runID, value) }),
+			"FINAL_VAR": reflect.ValueOf(func(value any) string { return e.finalAnswer(token, stdout, runID, value) }),
 		},
 	}
 
@@ -385,10 +388,21 @@ func ChunkCount() int {
 func LineCount() int {
 	return LineCountInContext(context)
 }
-`
+
+func fullContextQueryBlocked(name string) string {
+	maxChars := MaxFullContextQueryChars()
+	if maxChars <= 0 || len(context) <= maxChars {
+		return ""
+	}
+	return fmt.Sprintf("%s would prepend the full context (%d chars), exceeding the limit of %d chars; use QueryWith(contextSlice, prompt) or QueryRaw(prompt)", name, len(context), maxChars)
+}
+	`
 
 const localRLMWrapperCode = `
 Query = func(prompt string) string {
+	if err := fullContextQueryBlocked("Query"); err != "" {
+		return "Error: " + err
+	}
 	return QueryRaw(buildPromptWithProvidedContext(context, prompt))
 }
 
@@ -397,6 +411,13 @@ QueryWith = func(contextSlice, prompt string) string {
 }
 
 QueryBatched = func(prompts []string) []string {
+	if err := fullContextQueryBlocked("QueryBatched"); err != "" {
+		results := make([]string, len(prompts))
+		for i := range results {
+			results[i] = "Error: " + err
+		}
+		return results
+	}
 	fullPrompts := make([]string, len(prompts))
 	for i, prompt := range prompts {
 		fullPrompts[i] = buildPromptWithProvidedContext(context, prompt)

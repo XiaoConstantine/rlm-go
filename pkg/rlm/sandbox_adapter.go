@@ -252,6 +252,9 @@ func (r *RLM) createExecutionEnvironment() (ExecutionEnvironment, error) {
 			cfg = *r.config.Sandbox.Config
 		}
 		cfg.Verbose = r.config.Verbose
+		if r.config.MaxFullContextQueryChars > 0 {
+			cfg.MaxFullContextQueryChars = r.config.MaxFullContextQueryChars
+		}
 
 		// Adapt the REPL client for sandbox
 		sandboxClient := &sandboxLLMClientAdapter{client: r.replClient}

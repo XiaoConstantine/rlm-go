@@ -86,6 +86,10 @@ type Config struct {
 
 	// Verbose enables verbose logging of sandbox operations.
 	Verbose bool
+
+	// MaxFullContextQueryChars blocks Query/QueryBatched when they would prepend
+	// a loaded context larger than this many bytes. Zero disables the guard.
+	MaxFullContextQueryChars int
 }
 
 // DefaultConfig returns a Config with sensible defaults.

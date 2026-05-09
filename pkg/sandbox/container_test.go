@@ -478,6 +478,50 @@ Query("mutated question")`); err != nil {
 	}
 }
 
+func TestLocalExecutorMaxFullContextQueryCharsBlocksQuery(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+	cfg.MaxFullContextQueryChars = 5
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	if err := exec.LoadContext("large context"); err != nil {
+		t.Fatalf("LoadContext failed: %v", err)
+	}
+
+	result, err := exec.Execute(context.Background(), `
+fmt.Println(Query("blocked"))
+responses := QueryBatched([]string{"one", "two"})
+fmt.Println(responses[0])
+fmt.Println(responses[1])
+fmt.Println(QueryRaw("raw"))
+fmt.Println(QueryWith("slice", "allowed"))
+`)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if result.Stderr != "" {
+		t.Fatalf("stderr = %q", result.Stderr)
+	}
+	if got := strings.Count(result.Stdout, "exceeding the limit"); got != 3 {
+		t.Fatalf("stdout = %q, want 3 guardrail errors", result.Stdout)
+	}
+	if len(client.Calls) != 2 {
+		t.Fatalf("client calls = %v, want only QueryRaw and QueryWith", client.Calls)
+	}
+	if client.Calls[0] != "raw" {
+		t.Fatalf("QueryRaw call = %q, want raw", client.Calls[0])
+	}
+	if !strings.Contains(client.Calls[1], "slice") || strings.Contains(client.Calls[1], "large context") {
+		t.Fatalf("QueryWith call should use selected context only, calls=%v", client.Calls)
+	}
+}
+
 func TestLocalExecutorWithBatchedQuery(t *testing.T) {
 	client := NewMockLLMClient()
 	client.Responses["Q1"] = "A1"
@@ -1790,7 +1834,7 @@ func TestContainerExecutorLoadContextNilIsEmpty(t *testing.T) {
 }
 
 func TestGenerateContainerRLMCode(t *testing.T) {
-	code := GenerateContainerRLMCode("host.containers.internal:12345")
+	code := GenerateContainerRLMCode("host.containers.internal:12345", "token", "1", "5")
 
 	// Verify the code contains expected elements
 	if !strings.Contains(code, "package main") {
@@ -1803,6 +1847,14 @@ func TestGenerateContainerRLMCode(t *testing.T) {
 
 	if !strings.Contains(code, "func QueryBatched(prompts []string) []string") {
 		t.Error("Expected QueryBatched function in generated code")
+	}
+
+	if !strings.Contains(code, "const maxFullContextQueryChars = 5") {
+		t.Error("Expected generated full-context query limit")
+	}
+
+	if !strings.Contains(code, `fullContextQueryBlocked("Query")`) || !strings.Contains(code, `fullContextQueryBlocked("QueryBatched")`) {
+		t.Error("Expected generated Query/QueryBatched guardrails")
 	}
 
 	if !strings.Contains(code, "func FindRelevant(query string, topK int) []string") {

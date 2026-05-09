@@ -2119,6 +2119,42 @@ func TestCreateExecutionEnvironmentWithSandbox(t *testing.T) {
 	}
 }
 
+func TestCreateExecutionEnvironmentWithSandboxMaxFullContextQueryChars(t *testing.T) {
+	client := &mockLLMClient{}
+	var prompts []string
+	replClient := &mockREPLClient{
+		queryFunc: func(ctx context.Context, prompt string) (repl.QueryResponse, error) {
+			prompts = append(prompts, prompt)
+			return repl.QueryResponse{Response: "ok"}, nil
+		},
+	}
+
+	rlm := New(client, replClient,
+		WithSandboxBackend(sandbox.BackendLocal),
+		WithMaxFullContextQueryChars(5),
+	)
+
+	env, err := rlm.createExecutionEnvironment()
+	if err != nil {
+		t.Fatalf("createExecutionEnvironment() error: %v", err)
+	}
+	defer env.Close()
+
+	if err := env.LoadContext("large context"); err != nil {
+		t.Fatalf("LoadContext() error: %v", err)
+	}
+	result, err := env.Execute(context.Background(), `fmt.Println(Query("blocked"))`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "exceeding the limit") {
+		t.Fatalf("stdout = %q, want guardrail error", result.Stdout)
+	}
+	if len(prompts) != 0 {
+		t.Fatalf("prompts = %v, want no sandbox LLM calls", prompts)
+	}
+}
+
 func TestCreateExecutionEnvironmentWithoutSandbox(t *testing.T) {
 	client := &mockLLMClient{}
 	replClient := &mockREPLClient{}

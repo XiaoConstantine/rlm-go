@@ -543,6 +543,10 @@ func GenerateContainerRLMCode(ipcAddr string, finalTokens ...string) string {
 	if len(finalTokens) > 1 && finalTokens[1] != "" {
 		_, _ = fmt.Sscanf(finalTokens[1], "%d", &executionID)
 	}
+	maxFullContextQueryChars := 0
+	if len(finalTokens) > 2 && finalTokens[2] != "" {
+		_, _ = fmt.Sscanf(finalTokens[2], "%d", &maxFullContextQueryChars)
+	}
 	return fmt.Sprintf(`package main
 
 import (
@@ -594,6 +598,8 @@ var (
 	ipcExecutionID uint64 = %d
 )
 
+const maxFullContextQueryChars = %d
+
 func init() {
 	var err error
 	ipcConn, err = net.DialTimeout("tcp", ipcAddr, 10*time.Second)
@@ -618,6 +624,13 @@ func buildPromptWithProvidedContext(contextStr, prompt string) string {
 		return prompt
 	}
 	return fmt.Sprintf("Context data:\n%%s\n\nTask: %%s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextStr, prompt)
+}
+
+func fullContextQueryBlocked(name string) string {
+	if maxFullContextQueryChars <= 0 || len(context) <= maxFullContextQueryChars {
+		return ""
+	}
+	return fmt.Sprintf("%%s would prepend the full context (%%d chars), exceeding the limit of %%d chars; use QueryWith(contextSlice, prompt) or QueryRaw(prompt)", name, len(context), maxFullContextQueryChars)
 }
 
 func contextChunks() []string {
@@ -780,6 +793,9 @@ func queryRaw(prompt string) string {
 
 // Query sends a query with the full context prepended to the host LLM.
 func Query(prompt string) string {
+	if err := fullContextQueryBlocked("Query"); err != "" {
+		return "Error: " + err
+	}
 	return queryRaw(buildPromptWithContext(prompt))
 }
 
@@ -841,6 +857,13 @@ func queryBatchedRaw(prompts []string) []string {
 
 // QueryBatched sends multiple full-context queries and returns the responses.
 func QueryBatched(prompts []string) []string {
+	if err := fullContextQueryBlocked("QueryBatched"); err != "" {
+		results := make([]string, len(prompts))
+		for i := range results {
+			results[i] = "Error: " + err
+		}
+		return results
+	}
 	fullPrompts := make([]string, len(prompts))
 	for i, prompt := range prompts {
 		fullPrompts[i] = buildPromptWithContext(prompt)
@@ -867,7 +890,7 @@ var FINAL_VAR = FINAL
 `,
 		bt, bt, bt, bt, // tokenUsage (2 fields x 2 backticks)
 		bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, // ipcMessage (10 fields x 2 backticks)
-		ipcAddr, executionID,
+		ipcAddr, executionID, maxFullContextQueryChars,
 		finalMarkerPrefix, finalToken,
 	)
 }

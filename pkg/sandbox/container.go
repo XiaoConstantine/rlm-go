@@ -201,7 +201,7 @@ func (e *ContainerExecutor) generateProgram(code string, execID uint64) (string,
 	// Add IPC code if enabled
 	if e.config.EnableIPC && e.ipcServer != nil {
 		ipcAddr := e.getIPCAddress()
-		sb.WriteString(GenerateContainerRLMCode(ipcAddr, e.finalTok, strconv.FormatUint(execID, 10)))
+		sb.WriteString(GenerateContainerRLMCode(ipcAddr, e.finalTok, strconv.FormatUint(execID, 10), strconv.Itoa(e.config.MaxFullContextQueryChars)))
 	} else {
 		// Add stub functions if IPC is disabled
 		sb.WriteString(fmt.Sprintf(`package main
