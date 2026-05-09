@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
+	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/XiaoConstantine/rlm-go/pkg/core"
@@ -20,8 +23,8 @@ import (
 // This is the fastest option but has the least isolation.
 type LocalExecutor struct {
 	interp   *interp.Interpreter
-	stdout   *bytes.Buffer
-	stderr   *bytes.Buffer
+	stdout   *localOutput
+	stderr   *localOutput
 	client   LLMClient
 	ctx      context.Context
 	mu       sync.Mutex
@@ -29,13 +32,274 @@ type LocalExecutor struct {
 	finalMu  sync.RWMutex
 	finalSet bool
 	finalVal string
+	finalTok string
+	context  string
+	runSeq   uint64
 	config   Config
+}
+
+type localOutput struct {
+	mu          sync.Mutex
+	buf         bytes.Buffer
+	activeRun   uint64
+	rootGID     uint64
+	allowed     map[uint64]struct{}
+	preexisting map[uint64]struct{}
+}
+
+// localOutput favors dropping ambiguous late goroutine writes over leaking
+// stale output into a later execution. Awaited child output is captured only
+// when the child was created after the current run began.
+func (o *localOutput) Write(p []byte) (int, error) {
+	var stack [4096]byte
+	n := runtime.Stack(stack[:], false)
+	gid, ok := goroutineID(stack[:n])
+	parentID, hasParent := goroutineParentID(stack[:n])
+	yaegiStack := bytes.Contains(stack[:n], []byte("github.com/traefik/yaegi/interp."))
+	var parents map[uint64]uint64
+	if yaegiStack {
+		parents = goroutineParents(allGoroutineStacks())
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !ok || !o.allowWriteLocked(gid, parentID, hasParent, yaegiStack, parents) {
+		return len(p), nil
+	}
+	return o.buf.Write(p)
+}
+
+func (o *localOutput) AllowCurrent(runID uint64) {
+	var stack [256]byte
+	n := runtime.Stack(stack[:], false)
+	gid, ok := goroutineID(stack[:n])
+	if !ok {
+		return
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if runID == 0 || runID != o.activeRun {
+		return
+	}
+	if o.rootGID == 0 {
+		o.rootGID = gid
+	}
+	o.allowed[gid] = struct{}{}
+}
+
+func (o *localOutput) allowWrite(gid, parentID uint64, hasParent, yaegiStack bool) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.allowWriteLocked(gid, parentID, hasParent, yaegiStack, nil)
+}
+
+func (o *localOutput) allowWriteLocked(gid, parentID uint64, hasParent, yaegiStack bool, parents map[uint64]uint64) bool {
+	if o.activeRun == 0 || gid == 0 {
+		return false
+	}
+	if _, allowed := o.allowed[gid]; allowed {
+		return true
+	}
+	if _, existed := o.preexisting[gid]; existed {
+		return false
+	}
+	_, parentAllowed := o.allowed[parentID]
+	if hasParent && parentAllowed {
+		o.allowed[gid] = struct{}{}
+		return true
+	}
+	if yaegiStack && o.rootGID != 0 && goroutineDescendsFrom(gid, o.rootGID, parents, o.preexisting) {
+		o.allowed[gid] = struct{}{}
+		return true
+	}
+	return false
+}
+
+func (o *localOutput) WriteForRun(runID uint64, p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if runID == 0 || runID != o.activeRun {
+		return len(p), nil
+	}
+	return o.buf.Write(p)
+}
+
+func (o *localOutput) Begin(runID uint64, snapshots ...map[uint64]struct{}) {
+	var preexisting map[uint64]struct{}
+	if len(snapshots) > 0 {
+		preexisting = snapshots[0]
+	} else {
+		preexisting = goroutineIDs(allGoroutineStacks())
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.buf.Reset()
+	o.activeRun = runID
+	o.rootGID = 0
+	o.allowed = make(map[uint64]struct{})
+	o.preexisting = preexisting
+}
+
+func (o *localOutput) End(runID uint64) string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if runID != 0 && runID == o.activeRun {
+		o.activeRun = 0
+		o.rootGID = 0
+		o.allowed = nil
+		o.preexisting = nil
+	}
+	return o.buf.String()
+}
+
+func (o *localOutput) Clear() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.activeRun = 0
+	o.rootGID = 0
+	o.allowed = nil
+	o.preexisting = nil
+	o.buf.Reset()
+}
+
+func (o *localOutput) Reset() {
+	o.Clear()
+}
+
+func (o *localOutput) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.String()
+}
+
+func goroutineID(stack []byte) (uint64, bool) {
+	const prefix = "goroutine "
+	if !bytes.HasPrefix(stack, []byte(prefix)) {
+		return 0, false
+	}
+	stack = stack[len(prefix):]
+	i := bytes.IndexByte(stack, ' ')
+	if i < 0 {
+		return 0, false
+	}
+	id, err := strconv.ParseUint(string(stack[:i]), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return id, true
+}
+
+func goroutineParentID(stack []byte) (uint64, bool) {
+	const marker = " in goroutine "
+	i := bytes.LastIndex(stack, []byte(marker))
+	if i < 0 {
+		return 0, false
+	}
+	stack = stack[i+len(marker):]
+	end := bytes.IndexByte(stack, '\n')
+	if end >= 0 {
+		stack = stack[:end]
+	}
+	id, err := strconv.ParseUint(string(stack), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return id, true
+}
+
+func goroutineParents(stacks []byte) map[uint64]uint64 {
+	parents := make(map[uint64]uint64)
+	for _, chunk := range goroutineStackChunks(stacks) {
+		gid, ok := goroutineID(chunk)
+		if !ok {
+			continue
+		}
+		parentID, ok := goroutineParentID(chunk)
+		if ok {
+			parents[gid] = parentID
+		}
+	}
+	return parents
+}
+
+func goroutineIDs(stacks []byte) map[uint64]struct{} {
+	ids := make(map[uint64]struct{})
+	for _, chunk := range goroutineStackChunks(stacks) {
+		gid, ok := goroutineID(chunk)
+		if ok {
+			ids[gid] = struct{}{}
+		}
+	}
+	return ids
+}
+
+func goroutineStackChunks(stacks []byte) [][]byte {
+	rawChunks := bytes.Split(stacks, []byte("\ngoroutine "))
+	chunks := make([][]byte, 0, len(rawChunks))
+	for _, chunk := range rawChunks {
+		if len(chunk) == 0 {
+			continue
+		}
+		if !bytes.HasPrefix(chunk, []byte("goroutine ")) {
+			chunk = append([]byte("goroutine "), chunk...)
+		}
+		chunks = append(chunks, chunk)
+	}
+	return chunks
+}
+
+func allGoroutineStacks() []byte {
+	size := 1 << 20
+	for {
+		buf := make([]byte, size)
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return buf[:n]
+		}
+		size *= 2
+	}
+}
+
+func newYaegiGoroutines(preexisting map[uint64]struct{}) []uint64 {
+	var ids []uint64
+	for _, chunk := range goroutineStackChunks(allGoroutineStacks()) {
+		gid, ok := goroutineID(chunk)
+		if !ok {
+			continue
+		}
+		if _, existed := preexisting[gid]; existed {
+			continue
+		}
+		if bytes.Contains(chunk, []byte("github.com/traefik/yaegi/")) {
+			ids = append(ids, gid)
+		}
+	}
+	return ids
+}
+
+func goroutineDescendsFrom(gid, root uint64, parents map[uint64]uint64, preexisting map[uint64]struct{}) bool {
+	for i := 0; i < 64; i++ {
+		if gid == root {
+			return true
+		}
+		if _, existed := preexisting[gid]; existed {
+			return false
+		}
+		parentID, ok := parents[gid]
+		if !ok || parentID == 0 || parentID == gid {
+			return false
+		}
+		gid = parentID
+	}
+	return false
 }
 
 // NewLocalExecutor creates a new local executor using Yaegi.
 func NewLocalExecutor(client LLMClient, cfg Config) (*LocalExecutor, error) {
-	stdout := new(bytes.Buffer)
-	stderr := new(bytes.Buffer)
+	stdout := new(localOutput)
+	stderr := new(localOutput)
 
 	i := interp.New(interp.Options{
 		Stdout: stdout,
@@ -48,12 +312,13 @@ func NewLocalExecutor(client LLMClient, cfg Config) (*LocalExecutor, error) {
 	}
 
 	exec := &LocalExecutor{
-		interp: i,
-		stdout: stdout,
-		stderr: stderr,
-		client: client,
-		ctx:    context.Background(),
-		config: cfg,
+		interp:   i,
+		stdout:   stdout,
+		stderr:   stderr,
+		client:   client,
+		ctx:      context.Background(),
+		finalTok: newFinalToken(),
+		config:   cfg,
 	}
 
 	// Inject RLM functions
@@ -64,17 +329,14 @@ func NewLocalExecutor(client LLMClient, cfg Config) (*LocalExecutor, error) {
 	return exec, nil
 }
 
-// injectBuiltins registers Query and QueryBatched functions in the interpreter.
-func (e *LocalExecutor) injectBuiltins() error {
+// useBuiltins registers Query and QueryBatched functions in the interpreter.
+func (e *LocalExecutor) useBuiltins(token string, runCtx context.Context, stdout *localOutput, runID uint64) error {
 	symbols := interp.Exports{
 		"rlm/rlm": {
-			"Query":           reflect.ValueOf(e.llmQuery),
-			"QueryRaw":        reflect.ValueOf(e.llmQueryRaw),
-			"QueryWith":       reflect.ValueOf(e.llmQueryWith),
-			"QueryBatched":    reflect.ValueOf(e.llmQueryBatched),
-			"QueryBatchedRaw": reflect.ValueOf(e.llmQueryBatchedRaw),
-			"FINAL":           reflect.ValueOf(e.finalAnswer),
-			"FINAL_VAR":       reflect.ValueOf(e.finalVarAnswer),
+			"QueryRaw":        reflect.ValueOf(func(prompt string) string { return e.llmQueryRaw(token, runCtx, prompt) }),
+			"QueryBatchedRaw": reflect.ValueOf(func(prompts []string) []string { return e.llmQueryBatchedRaw(token, runCtx, prompts) }),
+			"FINAL":           reflect.ValueOf(func(value any) string { return e.finalAnswer(token, stdout, runID, value) }),
+			"FINAL_VAR":       reflect.ValueOf(func(value any) string { return e.finalAnswer(token, stdout, runID, value) }),
 		},
 	}
 
@@ -82,14 +344,88 @@ func (e *LocalExecutor) injectBuiltins() error {
 		return fmt.Errorf("failed to inject rlm symbols: %w", err)
 	}
 
-	// Use the shared setup code for basic imports
-	return interpreter.RunSetup(e.interp, interpreter.SetupCode)
+	return nil
 }
 
-// llmQuery makes a single LLM query.
-func (e *LocalExecutor) llmQuery(prompt string) string {
+const localRLMSetupCode = `
+var context = ""
+var Query func(string) string
+var QueryWith func(string, string) string
+var QueryBatched func([]string) []string
+
+func buildPromptWithProvidedContext(contextStr, prompt string) string {
+	if contextStr == "" {
+		return prompt
+	}
+	return fmt.Sprintf("Context data:\n%s\n\nTask: %s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextStr, prompt)
+}
+`
+
+const localRLMWrapperCode = `
+Query = func(prompt string) string {
+	return QueryRaw(buildPromptWithProvidedContext(context, prompt))
+}
+
+QueryWith = func(contextSlice, prompt string) string {
+	return QueryRaw(buildPromptWithProvidedContext(contextSlice, prompt))
+}
+
+QueryBatched = func(prompts []string) []string {
+	fullPrompts := make([]string, len(prompts))
+	for i, prompt := range prompts {
+		fullPrompts[i] = buildPromptWithProvidedContext(context, prompt)
+	}
+	return QueryBatchedRaw(fullPrompts)
+}
+`
+
+// injectBuiltins registers Query and QueryBatched functions in the interpreter.
+func (e *LocalExecutor) injectBuiltins() error {
+	if err := e.useBuiltins(e.finalTok, context.Background(), e.stdout, 0); err != nil {
+		return err
+	}
+
+	// Use the shared setup code for basic imports
+	if err := interpreter.RunSetup(e.interp, interpreter.SetupCode); err != nil {
+		return err
+	}
+	if _, err := e.interp.Eval(localRLMSetupCode); err != nil {
+		return err
+	}
+	return e.refreshLocalRLMWrappers()
+}
+
+func (e *LocalExecutor) refreshBuiltins(token string, runCtx context.Context, runID uint64) error {
+	if err := e.useBuiltins(token, runCtx, e.stdout, runID); err != nil {
+		return err
+	}
+	if _, err := e.interp.Eval(`import . "rlm/rlm"`); err != nil {
+		return fmt.Errorf("failed to refresh rlm imports: %w", err)
+	}
+	if err := e.refreshLocalRLMWrappers(); err != nil {
+		return fmt.Errorf("failed to refresh rlm wrappers: %w", err)
+	}
+	return nil
+}
+
+func (e *LocalExecutor) refreshLocalRLMWrappers() error {
+	_, err := e.interp.Eval(localRLMWrapperCode)
+	return err
+}
+
+func (e *LocalExecutor) llmQueryRaw(token string, ctx context.Context, prompt string) string {
+	return e.query(token, ctx, prompt, prompt)
+}
+
+func (e *LocalExecutor) query(token string, ctx context.Context, fullPrompt, recordedPrompt string) string {
+	if !e.tokenActive(token) {
+		return "Error: execution expired"
+	}
 	start := time.Now()
-	result, err := e.client.Query(e.ctx, prompt)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := e.client.Query(ctx, fullPrompt)
 	duration := time.Since(start).Seconds()
 
 	response := result.Response
@@ -97,9 +433,12 @@ func (e *LocalExecutor) llmQuery(prompt string) string {
 		response = fmt.Sprintf("Error: %v", err)
 	}
 
+	if !e.tokenActive(token) {
+		return response
+	}
 	e.mu.Lock()
 	e.llmCalls = append(e.llmCalls, LLMCall{
-		Prompt:           prompt,
+		Prompt:           recordedPrompt,
 		Response:         response,
 		Duration:         duration,
 		PromptTokens:     result.PromptTokens,
@@ -110,83 +449,96 @@ func (e *LocalExecutor) llmQuery(prompt string) string {
 	return response
 }
 
-func (e *LocalExecutor) llmQueryRaw(prompt string) string {
-	return e.llmQuery(prompt)
-}
-
-func (e *LocalExecutor) llmQueryWith(contextSlice, prompt string) string {
-	if contextSlice != "" {
-		prompt = fmt.Sprintf("Context data:\n%s\n\nTask: %s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextSlice, prompt)
+func (e *LocalExecutor) llmQueryBatchedRaw(token string, ctx context.Context, prompts []string) []string {
+	if !e.tokenActive(token) {
+		return queryBatchError(prompts, fmt.Errorf("execution expired"))
 	}
-	return e.llmQuery(prompt)
-}
-
-// llmQueryBatched makes concurrent LLM queries.
-func (e *LocalExecutor) llmQueryBatched(prompts []string) []string {
 	start := time.Now()
-	results, err := e.client.QueryBatched(e.ctx, prompts)
-	duration := time.Since(start).Seconds()
-
-	if err != nil {
-		errResults := make([]string, len(prompts))
-		for i := range errResults {
-			errResults[i] = fmt.Sprintf("Error: %v", err)
-		}
-		e.mu.Lock()
-		for i, p := range prompts {
-			e.llmCalls = append(e.llmCalls, LLMCall{
-				Prompt:   p,
-				Response: errResults[i],
-				Duration: duration / float64(len(prompts)),
-			})
-		}
-		e.mu.Unlock()
-		return errResults
+	if ctx == nil {
+		ctx = context.Background()
 	}
-
+	results, err := e.client.QueryBatched(ctx, prompts)
+	duration := time.Since(start).Seconds()
+	if err != nil {
+		return e.recordBatchError(token, prompts, err, duration)
+	}
 	responses := make([]string, len(results))
+	if !e.tokenActive(token) {
+		for i, result := range results {
+			responses[i] = result.Response
+		}
+		return responses
+	}
 	e.mu.Lock()
 	for i, p := range prompts {
 		responses[i] = results[i].Response
 		e.llmCalls = append(e.llmCalls, LLMCall{
 			Prompt:           p,
 			Response:         results[i].Response,
-			Duration:         duration / float64(len(prompts)),
+			Duration:         durationPerPrompt(duration, len(prompts)),
 			PromptTokens:     results[i].PromptTokens,
 			CompletionTokens: results[i].CompletionTokens,
 		})
 	}
 	e.mu.Unlock()
-
 	return responses
 }
 
-func (e *LocalExecutor) llmQueryBatchedRaw(prompts []string) []string {
-	return e.llmQueryBatched(prompts)
-}
-
-func (e *LocalExecutor) finalAnswer(value any) string {
+func (e *LocalExecutor) finalAnswer(token string, stdout *localOutput, runID uint64, value any) string {
 	finalValue := fmt.Sprint(value)
-	e.setFinal(finalValue)
-	fmt.Fprintf(e.stdout, "\nFINAL(%s)\n", finalValue)
+	if e.setFinal(token, finalValue) {
+		_, _ = stdout.WriteForRun(runID, []byte(formatFinalMarker(token, finalValue)))
+	}
 	return finalValue
 }
 
-func (e *LocalExecutor) finalVarAnswer(value any) string {
-	finalValue := fmt.Sprint(value)
-	e.setFinal(finalValue)
-	fmt.Fprintf(e.stdout, "\nFINAL(%s)\n", finalValue)
-	return finalValue
+func (e *LocalExecutor) tokenActive(token string) bool {
+	e.finalMu.RLock()
+	defer e.finalMu.RUnlock()
+	return token != "" && token == e.finalTok
 }
 
-func (e *LocalExecutor) setFinal(value string) {
+func (e *LocalExecutor) setFinal(token, value string) bool {
 	e.finalMu.Lock()
 	defer e.finalMu.Unlock()
-	if e.finalSet {
-		return
+	if token == "" || token != e.finalTok || e.finalSet {
+		return false
 	}
 	e.finalSet = true
 	e.finalVal = value
+	return true
+}
+
+func (e *LocalExecutor) recordBatchError(token string, prompts []string, err error, duration float64) []string {
+	results := queryBatchError(prompts, err)
+	if !e.tokenActive(token) {
+		return results
+	}
+	e.mu.Lock()
+	for i, prompt := range prompts {
+		e.llmCalls = append(e.llmCalls, LLMCall{
+			Prompt:   prompt,
+			Response: results[i],
+			Duration: durationPerPrompt(duration, len(prompts)),
+		})
+	}
+	e.mu.Unlock()
+	return results
+}
+
+func queryBatchError(prompts []string, err error) []string {
+	results := make([]string, len(prompts))
+	for i := range results {
+		results[i] = fmt.Sprintf("Error: %v", err)
+	}
+	return results
+}
+
+func durationPerPrompt(duration float64, promptCount int) float64 {
+	if promptCount <= 0 {
+		return duration
+	}
+	return duration / float64(promptCount)
 }
 
 // HasFinal reports whether executed code called FINAL or FINAL_VAR.
@@ -214,40 +566,130 @@ func (e *LocalExecutor) ClearFinal() {
 	e.finalVal = ""
 }
 
-// Execute runs Go code and returns the result.
-func (e *LocalExecutor) Execute(ctx context.Context, code string) (*core.ExecutionResult, error) {
-	e.mu.Lock()
-	e.ctx = ctx
-	e.stdout.Reset()
-	e.stderr.Reset()
-	e.mu.Unlock()
-	e.ClearFinal()
+func (e *LocalExecutor) rotateFinalToken() string {
+	e.finalMu.Lock()
+	defer e.finalMu.Unlock()
+	e.finalTok = newFinalToken()
+	e.finalSet = false
+	e.finalVal = ""
+	return e.finalTok
+}
 
-	start := time.Now()
+func (e *LocalExecutor) expireFinalToken(token string) {
+	e.finalMu.Lock()
+	defer e.finalMu.Unlock()
+	if token != "" && token == e.finalTok {
+		e.finalTok = newFinalToken()
+	}
+}
 
-	select {
-	case <-ctx.Done():
-		return &core.ExecutionResult{
-			Stderr:   "execution cancelled",
-			Duration: time.Since(start),
-		}, ctx.Err()
-	default:
+func (e *LocalExecutor) resetAbandonedInterpreter() error {
+	stdout := new(localOutput)
+	stderr := new(localOutput)
+	i := interp.New(interp.Options{
+		Stdout: stdout,
+		Stderr: stderr,
+	})
+
+	if err := i.Use(stdlib.Symbols); err != nil {
+		return fmt.Errorf("failed to load stdlib: %w", err)
 	}
 
-	var evalErr error
-	_, evalErr = e.interp.Eval(code)
+	e.mu.Lock()
+	e.interp = i
+	e.stdout = stdout
+	e.stderr = stderr
+	e.finalMu.Lock()
+	e.finalTok = newFinalToken()
+	e.finalMu.Unlock()
+	contextStr := e.context
+	err := e.injectBuiltins()
+	if err == nil && contextStr != "" {
+		_, err = e.interp.Eval(`context = ` + strconv.Quote(contextStr))
+	}
+	e.mu.Unlock()
+	return err
+}
 
+func (e *LocalExecutor) evalWithContext(ctx context.Context, code string, runID uint64) (error, bool, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err, false, false
+	}
+	e.stdout.AllowCurrent(runID)
+	e.stderr.AllowCurrent(runID)
+	_, err := e.interp.EvalWithContext(ctx, code)
+	if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+		return err, true, false
+	}
+	return err, true, true
+}
+
+// Execute runs Go code and returns the result.
+func (e *LocalExecutor) Execute(ctx context.Context, code string) (*core.ExecutionResult, error) {
+	start := time.Now()
 	timeout := e.config.Timeout
 	if timeout == 0 {
 		timeout = 60 * time.Second
 	}
 
+	evalCtx, cancel := context.WithTimeout(ctx, timeout)
+	var sandboxTimedOut atomic.Bool
+	timeoutTimer := time.AfterFunc(timeout, func() {
+		sandboxTimedOut.Store(true)
+	})
+	defer func() {
+		timeoutTimer.Stop()
+		cancel()
+	}()
+
+	token := e.rotateFinalToken()
 	e.mu.Lock()
+	e.runSeq++
+	runID := e.runSeq
+	if runID == 0 {
+		e.runSeq++
+		runID = e.runSeq
+	}
+	preexistingGoroutines := goroutineIDs(allGoroutineStacks())
+	e.ctx = evalCtx
+	e.stdout.Begin(runID, preexistingGoroutines)
+	e.stderr.Begin(runID, preexistingGoroutines)
+	refreshErr := e.refreshBuiltins(token, evalCtx, runID)
+	e.mu.Unlock()
+	if refreshErr != nil {
+		e.expireFinalToken(token)
+		e.mu.Lock()
+		e.stdout.Clear()
+		e.stderr.Clear()
+		e.ctx = context.Background()
+		e.mu.Unlock()
+		return &core.ExecutionResult{
+			Stderr:   refreshErr.Error(),
+			Duration: time.Since(start),
+		}, nil
+	}
+
+	evalErr, evalStarted, evalCompleted := e.evalWithContext(evalCtx, code, runID)
+	timeoutTimer.Stop()
+	timedOut := sandboxTimedOut.Load()
+	if !evalCompleted && evalCtx.Err() != nil {
+		evalErr = evalCtx.Err()
+	}
+	escapedGoroutines := newYaegiGoroutines(preexistingGoroutines)
+	cancel()
+	e.expireFinalToken(token)
+
+	e.mu.Lock()
+	stdout := e.stdout.End(runID)
 	result := &core.ExecutionResult{
-		Stdout:   e.stdout.String(),
-		Stderr:   e.stderr.String(),
+		Stdout:   stripFinalMarkers(stdout, token),
+		Stderr:   e.stderr.End(runID),
 		Duration: time.Since(start),
 	}
+	e.ctx = context.Background()
 	e.mu.Unlock()
 
 	if evalErr != nil {
@@ -256,18 +698,37 @@ func (e *LocalExecutor) Execute(ctx context.Context, code string) (*core.Executi
 		}
 		result.Stderr += evalErr.Error()
 	}
-	if timeout > 0 && result.Duration > timeout {
-		if result.Stderr != "" {
-			result.Stderr += "\n"
-		}
-		result.Stderr += "execution timeout exceeded"
-	}
-	if ctx.Err() != nil {
+	if !evalCompleted && ctx.Err() != nil && !timedOut {
+		e.ClearFinal()
 		if result.Stderr != "" {
 			result.Stderr += "\n"
 		}
 		result.Stderr += "execution cancelled"
+		if evalStarted {
+			if resetErr := e.resetAbandonedInterpreter(); resetErr != nil {
+				result.Stderr += "\n" + resetErr.Error()
+			}
+		}
 		return result, ctx.Err()
+	}
+	if timedOut || (!evalCompleted && errors.Is(evalErr, context.DeadlineExceeded)) {
+		e.ClearFinal()
+		if result.Stderr != "" {
+			result.Stderr += "\n"
+		}
+		result.Stderr += "execution timeout exceeded"
+		if resetErr := e.resetAbandonedInterpreter(); resetErr != nil {
+			result.Stderr += "\n" + resetErr.Error()
+		}
+		return result, nil
+	}
+	if len(escapedGoroutines) > 0 {
+		if resetErr := e.resetAbandonedInterpreter(); resetErr != nil {
+			if result.Stderr != "" {
+				result.Stderr += "\n"
+			}
+			result.Stderr += resetErr.Error()
+		}
 	}
 
 	return result, nil
@@ -280,7 +741,8 @@ func (e *LocalExecutor) LoadContext(payload any) error {
 
 	switch v := payload.(type) {
 	case string:
-		_, err := e.interp.Eval(`var context = ` + strconv.Quote(v))
+		e.context = v
+		_, err := e.interp.Eval(`context = ` + strconv.Quote(v))
 		return err
 
 	case map[string]any:
@@ -294,7 +756,9 @@ func (e *LocalExecutor) LoadContext(payload any) error {
 		if err != nil {
 			return fmt.Errorf("unsupported context type %T: %w", v, err)
 		}
-		return e.LoadContext(string(jsonBytes))
+		e.context = string(jsonBytes)
+		_, err = e.interp.Eval(`context = ` + strconv.Quote(string(jsonBytes)))
+		return err
 	}
 }
 
@@ -307,7 +771,8 @@ func (e *LocalExecutor) loadStructuredContext(v any) error {
 	}
 
 	// Store as JSON string - user code can parse if needed
-	_, err = e.interp.Eval(`var context = ` + strconv.Quote(string(jsonBytes)))
+	e.context = string(jsonBytes)
+	_, err = e.interp.Eval(`context = ` + strconv.Quote(string(jsonBytes)))
 	return err
 }
 
@@ -386,7 +851,8 @@ func (e *LocalExecutor) Reset() error {
 	e.stdout.Reset()
 	e.stderr.Reset()
 	e.llmCalls = nil
-	e.ClearFinal()
+	e.context = ""
+	e.rotateFinalToken()
 
 	// Create a fresh interpreter
 	i := interp.New(interp.Options{
@@ -411,7 +877,7 @@ func (e *LocalExecutor) Close() error {
 	e.stdout.Reset()
 	e.stderr.Reset()
 	e.llmCalls = nil
-	e.ClearFinal()
+	e.rotateFinalToken()
 
 	return nil
 }

@@ -26,6 +26,9 @@ type ContainerExecutor struct {
 	contextData any
 	mu          sync.Mutex
 	variables   map[string]any
+	finalTok    string
+	finalSet    bool
+	finalVal    string
 }
 
 // NewContainerExecutor creates a new container-based executor.
@@ -75,6 +78,7 @@ func NewContainerExecutor(client LLMClient, cfg Config, backend Backend) (*Conta
 		runtime:   runtime,
 		ipcServer: ipcServer,
 		variables: make(map[string]any),
+		finalTok:  newFinalToken(),
 	}, nil
 }
 
@@ -99,6 +103,10 @@ func IsRuntimeAvailable(runtime string) bool {
 func (e *ContainerExecutor) Execute(ctx context.Context, code string) (*core.ExecutionResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.finalSet = false
+	e.finalVal = ""
+	e.finalTok = newFinalToken()
+	finalToken := e.finalTok
 
 	start := time.Now()
 
@@ -109,8 +117,21 @@ func (e *ContainerExecutor) Execute(ctx context.Context, code string) (*core.Exe
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
+	// Create the command with timeout context
+	timeout := e.config.Timeout
+	if timeout == 0 {
+		timeout = 60 * time.Second
+	}
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var execID uint64
+	if e.ipcServer != nil {
+		execID = e.ipcServer.beginExecution(cmdCtx)
+		defer e.ipcServer.endExecution(execID)
+	}
+
 	// Generate the full Go program
-	program, err := e.generateProgram(code)
+	program, err := e.generateProgram(code, execID)
 	if err != nil {
 		return &core.ExecutionResult{
 			Stderr:   fmt.Sprintf("failed to generate program: %v", err),
@@ -133,14 +154,6 @@ func (e *ContainerExecutor) Execute(ctx context.Context, code string) (*core.Exe
 
 	// Build container command
 	args := e.buildContainerArgs(tmpDir)
-
-	// Create the command with timeout context
-	timeout := e.config.Timeout
-	if timeout == 0 {
-		timeout = 60 * time.Second
-	}
-	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, e.runtime, args...)
 
@@ -173,23 +186,37 @@ func (e *ContainerExecutor) Execute(ctx context.Context, code string) (*core.Exe
 
 	// Extract variables from stdout (we encode them as JSON at the end)
 	e.extractVariables(result.Stdout)
+	if cmdCtx.Err() == nil {
+		e.extractFinal(result.Stdout, finalToken)
+	}
+	result.Stdout = stripFinalMarkers(result.Stdout, finalToken)
 
 	return result, nil
 }
 
 // generateProgram creates a complete Go program from the code snippet.
-func (e *ContainerExecutor) generateProgram(code string) (string, error) {
+func (e *ContainerExecutor) generateProgram(code string, execID uint64) (string, error) {
 	var sb strings.Builder
 
 	// Add IPC code if enabled
 	if e.config.EnableIPC && e.ipcServer != nil {
 		ipcAddr := e.getIPCAddress()
-		sb.WriteString(GenerateContainerRLMCode(ipcAddr))
+		sb.WriteString(GenerateContainerRLMCode(ipcAddr, e.finalTok, strconv.FormatUint(execID, 10)))
 	} else {
 		// Add stub functions if IPC is disabled
-		sb.WriteString(`package main
+		sb.WriteString(fmt.Sprintf(`package main
 
-import "fmt"
+import (
+	"encoding/base64"
+	"fmt"
+)
+
+func buildPromptWithProvidedContext(contextStr, prompt string) string {
+	if contextStr == "" {
+		return prompt
+	}
+	return fmt.Sprintf("Context data:\n%%s\n\nTask: %%s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextStr, prompt)
+}
 
 // Query stub - IPC disabled
 func Query(prompt string) string {
@@ -201,10 +228,7 @@ func QueryRaw(prompt string) string {
 }
 
 func QueryWith(contextSlice, prompt string) string {
-	if contextSlice != "" {
-		prompt = fmt.Sprintf("Context data:\n%s\n\nTask: %s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextSlice, prompt)
-	}
-	return Query(prompt)
+	return QueryRaw(buildPromptWithProvidedContext(contextSlice, prompt))
 }
 
 // QueryBatched stub - IPC disabled
@@ -220,28 +244,34 @@ func QueryBatchedRaw(prompts []string) []string {
 	return QueryBatched(prompts)
 }
 
-func FINAL(value any) string {
-	finalValue := fmt.Sprint(value)
-	fmt.Printf("\nFINAL(%s)\n", finalValue)
-	return finalValue
-}
+var FINAL = func() func(any) string {
+	finalPrefix := %q
+	finalToken := %q
+	return func(value any) string {
+		finalValue := fmt.Sprint(value)
+		encoded := base64.StdEncoding.EncodeToString([]byte(finalValue))
+		fmt.Printf("\n%%s%%s__%%s\n", finalPrefix, finalToken, encoded)
+		return finalValue
+	}
+}()
 
-func FINAL_VAR(value any) string {
-	finalValue := fmt.Sprint(value)
-	fmt.Printf("\nFINAL(%s)\n", finalValue)
-	return finalValue
-}
-`)
+var FINAL_VAR = FINAL
+`, finalMarkerPrefix, e.finalTok))
 	}
 
 	// Add context variable
 	sb.WriteString("\n// Context data\n")
 	if e.contextData != nil {
-		contextJSON, err := json.Marshal(e.contextData)
-		if err != nil {
-			return "", fmt.Errorf("failed to marshal context: %w", err)
+		switch ctx := e.contextData.(type) {
+		case string:
+			sb.WriteString(fmt.Sprintf("var context = %s\n", strconv.Quote(ctx)))
+		default:
+			contextJSON, err := json.Marshal(e.contextData)
+			if err != nil {
+				return "", fmt.Errorf("failed to marshal context: %w", err)
+			}
+			sb.WriteString(fmt.Sprintf("var context = %s\n", strconv.Quote(string(contextJSON))))
 		}
-		sb.WriteString(fmt.Sprintf("var context = %s\n", strconv.Quote(string(contextJSON))))
 	} else {
 		sb.WriteString("var context = \"\"\n")
 	}
@@ -383,6 +413,40 @@ func (e *ContainerExecutor) extractVariables(output string) {
 	}
 }
 
+func (e *ContainerExecutor) extractFinal(output, token string) {
+	value, ok := findFinalMarker(output, token)
+	if !ok {
+		return
+	}
+	e.finalSet = true
+	e.finalVal = value
+}
+
+// HasFinal reports whether executed code called FINAL or FINAL_VAR.
+func (e *ContainerExecutor) HasFinal() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.finalSet
+}
+
+// Final returns the value supplied to FINAL or FINAL_VAR.
+func (e *ContainerExecutor) Final() (string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.finalSet {
+		return "", false
+	}
+	return e.finalVal, true
+}
+
+// ClearFinal clears any previous FINAL/FINAL_VAR signal.
+func (e *ContainerExecutor) ClearFinal() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.finalSet = false
+	e.finalVal = ""
+}
+
 // LoadContext stores the context payload for injection into the container.
 func (e *ContainerExecutor) LoadContext(payload any) error {
 	e.mu.Lock()
@@ -450,6 +514,9 @@ func (e *ContainerExecutor) Reset() error {
 
 	e.variables = make(map[string]any)
 	e.contextData = nil
+	e.finalSet = false
+	e.finalVal = ""
+	e.finalTok = newFinalToken()
 
 	if e.ipcServer != nil {
 		e.ipcServer.ClearCalls()

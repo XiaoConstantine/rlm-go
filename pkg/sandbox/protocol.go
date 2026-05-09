@@ -42,6 +42,9 @@ type IPCMessage struct {
 	// ID is a unique identifier for request-response correlation.
 	ID string `json:"id,omitempty"`
 
+	// ExecutionID identifies the container execution that produced this message.
+	ExecutionID uint64 `json:"execution_id,omitempty"`
+
 	// Prompt is the query prompt (for Query messages).
 	Prompt string `json:"prompt,omitempty"`
 
@@ -83,6 +86,8 @@ type IPCServer struct {
 	running  bool
 	ctx      context.Context
 	cancel   context.CancelFunc
+	execCtx  context.Context
+	execID   uint64
 }
 
 // NewIPCServer creates a new IPC server that handles Query() calls from the sandbox.
@@ -237,12 +242,21 @@ func (s *IPCServer) handleMessage(msg IPCMessage) IPCMessage {
 // handleQuery processes a single Query() request.
 func (s *IPCServer) handleQuery(msg IPCMessage) IPCMessage {
 	start := time.Now()
+	queryCtx, cleanup, execID, activeExecution, ok := s.queryContext(msg.ExecutionID)
+	defer cleanup()
+	if !ok {
+		return IPCMessage{
+			Type:  MessageError,
+			ID:    msg.ID,
+			Error: "execution expired",
+		}
+	}
 
-	resp, err := s.client.Query(s.ctx, msg.Prompt)
+	resp, err := s.client.Query(queryCtx, msg.Prompt)
 	duration := time.Since(start).Seconds()
 
 	if err != nil {
-		s.recordCall(msg.Prompt, fmt.Sprintf("Error: %v", err), duration, 0, 0)
+		s.recordCallForExecution(execID, activeExecution, msg.Prompt, fmt.Sprintf("Error: %v", err), duration, 0, 0)
 		return IPCMessage{
 			Type:  MessageError,
 			ID:    msg.ID,
@@ -250,7 +264,7 @@ func (s *IPCServer) handleQuery(msg IPCMessage) IPCMessage {
 		}
 	}
 
-	s.recordCall(msg.Prompt, resp.Response, duration, resp.PromptTokens, resp.CompletionTokens)
+	s.recordCallForExecution(execID, activeExecution, msg.Prompt, resp.Response, duration, resp.PromptTokens, resp.CompletionTokens)
 
 	return IPCMessage{
 		Type:     MessageResponse,
@@ -267,14 +281,23 @@ func (s *IPCServer) handleQuery(msg IPCMessage) IPCMessage {
 // handleQueryBatched processes a batched Query() request.
 func (s *IPCServer) handleQueryBatched(msg IPCMessage) IPCMessage {
 	start := time.Now()
+	queryCtx, cleanup, execID, activeExecution, ok := s.queryContext(msg.ExecutionID)
+	defer cleanup()
+	if !ok {
+		return IPCMessage{
+			Type:  MessageError,
+			ID:    msg.ID,
+			Error: "execution expired",
+		}
+	}
 
-	results, err := s.client.QueryBatched(s.ctx, msg.Prompts)
+	results, err := s.client.QueryBatched(queryCtx, msg.Prompts)
 	duration := time.Since(start).Seconds()
 
 	if err != nil {
 		// Record each as failed
 		for _, prompt := range msg.Prompts {
-			s.recordCall(prompt, fmt.Sprintf("Error: %v", err), duration/float64(len(msg.Prompts)), 0, 0)
+			s.recordCallForExecution(execID, activeExecution, prompt, fmt.Sprintf("Error: %v", err), durationPerPrompt(duration, len(msg.Prompts)), 0, 0)
 		}
 		return IPCMessage{
 			Type:  MessageError,
@@ -291,7 +314,7 @@ func (s *IPCServer) handleQueryBatched(msg IPCMessage) IPCMessage {
 			PromptTokens:     r.PromptTokens,
 			CompletionTokens: r.CompletionTokens,
 		}
-		s.recordCall(msg.Prompts[i], r.Response, duration/float64(len(results)), r.PromptTokens, r.CompletionTokens)
+		s.recordCallForExecution(execID, activeExecution, msg.Prompts[i], r.Response, durationPerPrompt(duration, len(results)), r.PromptTokens, r.CompletionTokens)
 	}
 
 	return IPCMessage{
@@ -303,10 +326,73 @@ func (s *IPCServer) handleQueryBatched(msg IPCMessage) IPCMessage {
 	}
 }
 
-// recordCall records an LLM call for later retrieval.
-func (s *IPCServer) recordCall(prompt, response string, duration float64, promptTokens, completionTokens int) {
+func (s *IPCServer) beginExecution(ctx context.Context) uint64 {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.execID++
+	if s.execID == 0 {
+		s.execID++
+	}
+	s.execCtx = ctx
+	return s.execID
+}
+
+func (s *IPCServer) endExecution(id uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id != 0 && id == s.execID {
+		s.execCtx = nil
+	}
+}
+
+func (s *IPCServer) queryContext(messageExecID uint64) (context.Context, context.CancelFunc, uint64, bool, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.execCtx != nil {
+		if s.execCtx.Err() != nil {
+			return context.Background(), func() {}, s.execID, true, false
+		}
+		if messageExecID != s.execID {
+			return context.Background(), func() {}, s.execID, true, false
+		}
+		ctx, cancel := linkContexts(s.execCtx, s.ctx)
+		return ctx, cancel, s.execID, true, true
+	}
+	if s.execID != 0 {
+		return context.Background(), func() {}, s.execID, true, false
+	}
+	return s.ctx, func() {}, 0, false, true
+}
+
+func linkContexts(primary, secondary context.Context) (context.Context, context.CancelFunc) {
+	if primary == nil {
+		primary = context.Background()
+	}
+	if secondary == nil || primary == secondary {
+		return primary, func() {}
+	}
+	ctx, cancel := context.WithCancel(primary)
+	stop := context.AfterFunc(secondary, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+// recordCall records an LLM call for later retrieval.
+func (s *IPCServer) recordCall(prompt, response string, duration float64, promptTokens, completionTokens int) {
+	s.recordCallForExecution(0, false, prompt, response, duration, promptTokens, completionTokens)
+}
+
+func (s *IPCServer) recordCallForExecution(execID uint64, activeExecution bool, prompt, response string, duration float64, promptTokens, completionTokens int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if activeExecution && (s.execCtx == nil || s.execID != execID) {
+		return
+	}
 	s.calls = append(s.calls, LLMCall{
 		Prompt:           prompt,
 		Response:         response,
@@ -446,13 +532,22 @@ func (c *IPCClient) Close() error {
 
 // GenerateContainerRLMCode generates Go code for the container that provides
 // Query() and QueryBatched() functions that communicate via IPC.
-func GenerateContainerRLMCode(ipcAddr string) string {
+func GenerateContainerRLMCode(ipcAddr string, finalTokens ...string) string {
 	// Using backtick for struct tags
 	bt := "`"
+	finalToken := "test"
+	if len(finalTokens) > 0 && finalTokens[0] != "" {
+		finalToken = finalTokens[0]
+	}
+	var executionID uint64
+	if len(finalTokens) > 1 && finalTokens[1] != "" {
+		_, _ = fmt.Sscanf(finalTokens[1], "%d", &executionID)
+	}
 	return fmt.Sprintf(`package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -477,6 +572,7 @@ type tokenUsage struct {
 type ipcMessage struct {
 	Type        messageType   %sjson:"type"%s
 	ID          string        %sjson:"id,omitempty"%s
+	ExecutionID uint64        %sjson:"execution_id,omitempty"%s
 	Prompt      string        %sjson:"prompt,omitempty"%s
 	Prompts     []string      %sjson:"prompts,omitempty"%s
 	Response    string        %sjson:"response,omitempty"%s
@@ -493,6 +589,7 @@ var (
 	ipcMu      sync.Mutex
 	ipcCounter int
 	ipcAddr    = %q
+	ipcExecutionID uint64 = %d
 )
 
 func init() {
@@ -510,15 +607,26 @@ func nextID() string {
 	return fmt.Sprintf("msg-%%d", ipcCounter)
 }
 
-// Query sends a query to the host LLM and returns the response.
-func Query(prompt string) string {
+func buildPromptWithContext(prompt string) string {
+	return buildPromptWithProvidedContext(context, prompt)
+}
+
+func buildPromptWithProvidedContext(contextStr, prompt string) string {
+	if contextStr == "" {
+		return prompt
+	}
+	return fmt.Sprintf("Context data:\n%%s\n\nTask: %%s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextStr, prompt)
+}
+
+func queryRaw(prompt string) string {
 	ipcMu.Lock()
 	defer ipcMu.Unlock()
 
 	msg := ipcMessage{
-		Type:   messageQuery,
-		ID:     nextID(),
-		Prompt: prompt,
+		Type:        messageQuery,
+		ID:          nextID(),
+		ExecutionID: ipcExecutionID,
+		Prompt:      prompt,
 	}
 
 	if err := ipcEncoder.Encode(msg); err != nil {
@@ -542,26 +650,28 @@ func Query(prompt string) string {
 	return resp.Response
 }
 
+// Query sends a query with the full context prepended to the host LLM.
+func Query(prompt string) string {
+	return queryRaw(buildPromptWithContext(prompt))
+}
+
 func QueryRaw(prompt string) string {
-	return Query(prompt)
+	return queryRaw(prompt)
 }
 
 func QueryWith(contextSlice, prompt string) string {
-	if contextSlice != "" {
-		prompt = fmt.Sprintf("Context data:\n%%s\n\nTask: %%s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextSlice, prompt)
-	}
-	return Query(prompt)
+	return queryRaw(buildPromptWithProvidedContext(contextSlice, prompt))
 }
 
-// QueryBatched sends multiple queries concurrently and returns the responses.
-func QueryBatched(prompts []string) []string {
+func queryBatchedRaw(prompts []string) []string {
 	ipcMu.Lock()
 	defer ipcMu.Unlock()
 
 	msg := ipcMessage{
-		Type:    messageQueryBatched,
-		ID:      nextID(),
-		Prompts: prompts,
+		Type:        messageQueryBatched,
+		ID:          nextID(),
+		ExecutionID: ipcExecutionID,
+		Prompts:     prompts,
 	}
 
 	if err := ipcEncoder.Encode(msg); err != nil {
@@ -601,23 +711,35 @@ func QueryBatched(prompts []string) []string {
 	return resp.Responses
 }
 
+// QueryBatched sends multiple full-context queries and returns the responses.
+func QueryBatched(prompts []string) []string {
+	fullPrompts := make([]string, len(prompts))
+	for i, prompt := range prompts {
+		fullPrompts[i] = buildPromptWithContext(prompt)
+	}
+	return queryBatchedRaw(fullPrompts)
+}
+
 func QueryBatchedRaw(prompts []string) []string {
-	return QueryBatched(prompts)
+	return queryBatchedRaw(prompts)
 }
 
-func FINAL(value any) string {
-	finalValue := fmt.Sprint(value)
-	fmt.Printf("\nFINAL(%%s)\n", finalValue)
-	return finalValue
-}
+var FINAL = func() func(any) string {
+	finalPrefix := %q
+	finalToken := %q
+	return func(value any) string {
+		finalValue := fmt.Sprint(value)
+		encoded := base64.StdEncoding.EncodeToString([]byte(finalValue))
+		fmt.Printf("\n%%s%%s__%%s\n", finalPrefix, finalToken, encoded)
+		return finalValue
+	}
+}()
 
-func FINAL_VAR(value any) string {
-	finalValue := fmt.Sprint(value)
-	fmt.Printf("\nFINAL(%%s)\n", finalValue)
-	return finalValue
-}
+var FINAL_VAR = FINAL
 `,
 		bt, bt, bt, bt, // tokenUsage (2 fields x 2 backticks)
-		bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, // ipcMessage (9 fields x 2 backticks)
-		ipcAddr)
+		bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, // ipcMessage (10 fields x 2 backticks)
+		ipcAddr, executionID,
+		finalMarkerPrefix, finalToken,
+	)
 }

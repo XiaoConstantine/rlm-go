@@ -2,8 +2,12 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -41,6 +45,110 @@ func (m *MockLLMClient) QueryBatched(ctx context.Context, prompts []string) ([]Q
 	results := make([]QueryResponse, len(prompts))
 	for i, prompt := range prompts {
 		results[i], _ = m.Query(ctx, prompt)
+	}
+	return results, nil
+}
+
+type contextDeadlineLLMClient struct {
+	errCh chan error
+}
+
+func newContextDeadlineLLMClient() *contextDeadlineLLMClient {
+	return &contextDeadlineLLMClient{errCh: make(chan error, 1)}
+}
+
+func (m *contextDeadlineLLMClient) Query(ctx context.Context, prompt string) (QueryResponse, error) {
+	<-ctx.Done()
+	err := ctx.Err()
+	m.errCh <- err
+	return QueryResponse{}, err
+}
+
+func (m *contextDeadlineLLMClient) QueryBatched(ctx context.Context, prompts []string) ([]QueryResponse, error) {
+	<-ctx.Done()
+	err := ctx.Err()
+	m.errCh <- err
+	return nil, err
+}
+
+type delayedLLMClient struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func newDelayedLLMClient() *delayedLLMClient {
+	return &delayedLLMClient{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (m *delayedLLMClient) Query(ctx context.Context, prompt string) (QueryResponse, error) {
+	close(m.started)
+	<-m.release
+	return QueryResponse{Response: "late"}, nil
+}
+
+func (m *delayedLLMClient) QueryBatched(ctx context.Context, prompts []string) ([]QueryResponse, error) {
+	close(m.started)
+	<-m.release
+	results := make([]QueryResponse, len(prompts))
+	for i := range results {
+		results[i] = QueryResponse{Response: "late"}
+	}
+	return results, nil
+}
+
+type promptBlockingLLMClient struct {
+	staleStarted   chan struct{}
+	staleRelease   chan struct{}
+	barrierStarted chan struct{}
+	barrierRelease chan struct{}
+	freshStarted   chan struct{}
+	freshRelease   chan struct{}
+	staleOnce      sync.Once
+	barrierOnce    sync.Once
+	freshOnce      sync.Once
+}
+
+func newPromptBlockingLLMClient() *promptBlockingLLMClient {
+	return &promptBlockingLLMClient{
+		staleStarted:   make(chan struct{}),
+		staleRelease:   make(chan struct{}),
+		barrierStarted: make(chan struct{}),
+		barrierRelease: make(chan struct{}),
+		freshStarted:   make(chan struct{}),
+		freshRelease:   make(chan struct{}),
+	}
+}
+
+func (m *promptBlockingLLMClient) Query(ctx context.Context, prompt string) (QueryResponse, error) {
+	switch {
+	case strings.Contains(prompt, "stale query"):
+		m.staleOnce.Do(func() { close(m.staleStarted) })
+		<-m.staleRelease
+		return QueryResponse{Response: "stale output"}, nil
+	case strings.Contains(prompt, "barrier query"):
+		m.barrierOnce.Do(func() { close(m.barrierStarted) })
+		<-m.barrierRelease
+		return QueryResponse{Response: "barrier output"}, nil
+	case strings.Contains(prompt, "fresh query"):
+		m.freshOnce.Do(func() { close(m.freshStarted) })
+		<-m.freshRelease
+		return QueryResponse{Response: "fresh output"}, nil
+	default:
+		return QueryResponse{Response: "response for " + prompt}, nil
+	}
+}
+
+func (m *promptBlockingLLMClient) QueryBatched(ctx context.Context, prompts []string) ([]QueryResponse, error) {
+	results := make([]QueryResponse, len(prompts))
+	for i, prompt := range prompts {
+		result, err := m.Query(ctx, prompt)
+		if err != nil {
+			return nil, err
+		}
+		results[i] = result
 	}
 	return results, nil
 }
@@ -174,6 +282,89 @@ func TestLocalExecutorWithQuery(t *testing.T) {
 	}
 }
 
+func TestLocalExecutorQueryModes(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	if err := exec.LoadContext("full context"); err != nil {
+		t.Fatalf("LoadContext failed: %v", err)
+	}
+
+	if _, err := exec.Execute(context.Background(), `Query("question")`); err != nil {
+		t.Fatalf("Execute Query failed: %v", err)
+	}
+	if len(client.Calls) != 1 || !strings.Contains(client.Calls[0], "full context") {
+		t.Fatalf("Query should prepend full context, calls=%v", client.Calls)
+	}
+	if calls := exec.GetLLMCalls(); len(calls) != 1 || calls[0].Prompt != client.Calls[0] {
+		t.Fatalf("GetLLMCalls should record expanded Query prompt, calls=%+v clientCalls=%v", calls, client.Calls)
+	}
+
+	client.Calls = nil
+	if _, err := exec.Execute(context.Background(), `context = "mutated context"
+Query("mutated question")`); err != nil {
+		t.Fatalf("Execute mutated Query failed: %v", err)
+	}
+	if len(client.Calls) != 1 || !strings.Contains(client.Calls[0], "mutated context") || strings.Contains(client.Calls[0], "full context") {
+		t.Fatalf("Query should use current mutable context variable, calls=%v", client.Calls)
+	}
+	_ = exec.GetLLMCalls()
+	if _, err := exec.Execute(context.Background(), `context = "full context"`); err != nil {
+		t.Fatalf("Execute restore context failed: %v", err)
+	}
+
+	client.Calls = nil
+	if _, err := exec.Execute(context.Background(), `QueryRaw("raw question")`); err != nil {
+		t.Fatalf("Execute QueryRaw failed: %v", err)
+	}
+	if len(client.Calls) != 1 || client.Calls[0] != "raw question" {
+		t.Fatalf("QueryRaw should send raw prompt, calls=%v", client.Calls)
+	}
+	if calls := exec.GetLLMCalls(); len(calls) != 1 || calls[0].Prompt != "raw question" {
+		t.Fatalf("GetLLMCalls should record raw QueryRaw prompt, calls=%+v", calls)
+	}
+
+	client.Calls = nil
+	if _, err := exec.Execute(context.Background(), `QueryWith("slice context", "slice question")`); err != nil {
+		t.Fatalf("Execute QueryWith failed: %v", err)
+	}
+	if len(client.Calls) != 1 || !strings.Contains(client.Calls[0], "slice context") || strings.Contains(client.Calls[0], "full context") {
+		t.Fatalf("QueryWith should send only selected context, calls=%v", client.Calls)
+	}
+	if calls := exec.GetLLMCalls(); len(calls) != 1 || calls[0].Prompt != client.Calls[0] {
+		t.Fatalf("GetLLMCalls should record expanded QueryWith prompt, calls=%+v clientCalls=%v", calls, client.Calls)
+	}
+
+	client.Calls = nil
+	if _, err := exec.Execute(context.Background(), `QueryBatched([]string{"batch one", "batch two"})`); err != nil {
+		t.Fatalf("Execute QueryBatched failed: %v", err)
+	}
+	if len(client.Calls) != 2 || !strings.Contains(client.Calls[0], "full context") || !strings.Contains(client.Calls[1], "full context") {
+		t.Fatalf("QueryBatched should prepend full context to each prompt, calls=%v", client.Calls)
+	}
+	if calls := exec.GetLLMCalls(); len(calls) != 2 || calls[0].Prompt != client.Calls[0] || calls[1].Prompt != client.Calls[1] {
+		t.Fatalf("GetLLMCalls should record expanded QueryBatched prompts, calls=%+v clientCalls=%v", calls, client.Calls)
+	}
+
+	client.Calls = nil
+	if err := exec.Reset(); err != nil {
+		t.Fatalf("Reset failed: %v", err)
+	}
+	if _, err := exec.Execute(context.Background(), `Query("after reset")`); err != nil {
+		t.Fatalf("Execute Query after reset failed: %v", err)
+	}
+	if len(client.Calls) != 1 || strings.Contains(client.Calls[0], "full context") {
+		t.Fatalf("Query after Reset should not prepend stale context, calls=%v", client.Calls)
+	}
+}
+
 func TestLocalExecutorWithBatchedQuery(t *testing.T) {
 	client := NewMockLLMClient()
 	client.Responses["Q1"] = "A1"
@@ -235,6 +426,591 @@ func TestLocalExecutorTimeout(t *testing.T) {
 
 	if !strings.Contains(result.Stdout, "Quick execution") {
 		t.Errorf("Expected output, got: %s", result.Stdout)
+	}
+}
+
+func TestLocalExecutorTimeoutReturns(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+	cfg.Timeout = 50 * time.Millisecond
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	start := time.Now()
+	result, err := exec.Execute(context.Background(), `ch := make(chan struct{})
+<-ch`)
+	if err != nil {
+		t.Fatalf("Execute timeout should return nil error, got: %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("Execute did not return promptly after timeout")
+	}
+	if !strings.Contains(result.Stderr, "execution timeout exceeded") {
+		t.Fatalf("stderr = %q, want timeout", result.Stderr)
+	}
+
+	result, err = exec.Execute(context.Background(), `FINAL("fresh")`)
+	if err != nil {
+		t.Fatalf("Execute after timeout failed: %v", err)
+	}
+	if final, ok := exec.Final(); !ok || final != "fresh" {
+		t.Fatalf("Final after timeout = %q/%v, want fresh/true; stdout=%q", final, ok, result.Stdout)
+	}
+}
+
+func TestLocalExecutorQueryUsesExecutionTimeout(t *testing.T) {
+	client := newContextDeadlineLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+	cfg.Timeout = 50 * time.Millisecond
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	start := time.Now()
+	_, err = exec.Execute(context.Background(), `fmt.Println(Query("wait for timeout"))`)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("Execute did not return promptly after Query context deadline")
+	}
+
+	select {
+	case err := <-client.errCh:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Query context error = %v, want deadline exceeded", err)
+		}
+	default:
+		t.Fatal("Query did not observe the execution timeout context")
+	}
+}
+
+func TestLocalExecutorStaleQueryDoesNotCallClient(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	staleToken := exec.rotateFinalToken()
+	exec.expireFinalToken(staleToken)
+
+	response := exec.llmQueryRaw(staleToken, context.Background(), "question")
+	if response != "Error: execution expired" {
+		t.Fatalf("stale Query response = %q, want execution expired", response)
+	}
+	if client.CallCount != 0 {
+		t.Fatalf("stale Query should not call client, calls=%d", client.CallCount)
+	}
+}
+
+func TestLocalExecutorTimeoutClearsFinalAfterQueryDeadline(t *testing.T) {
+	client := newContextDeadlineLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+	cfg.Timeout = 25 * time.Millisecond
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	result, err := exec.Execute(context.Background(), `answer := Query("wait for timeout")
+FINAL("should not finalize after " + answer)`)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if !strings.Contains(result.Stderr, "execution timeout exceeded") {
+		t.Fatalf("stderr = %q, want timeout", result.Stderr)
+	}
+	if exec.HasFinal() {
+		t.Fatal("timeout should clear final state even if code calls FINAL after Query returns")
+	}
+}
+
+func TestLocalExecutorTimeoutPreservesLLMCalls(t *testing.T) {
+	client := NewMockLLMClient()
+	client.Responses["before timeout"] = "ok"
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+	cfg.Timeout = 50 * time.Millisecond
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	result, err := exec.Execute(context.Background(), `Query("before timeout")
+ch := make(chan struct{})
+<-ch`)
+	if err != nil {
+		t.Fatalf("Execute timeout should return nil error, got: %v", err)
+	}
+	if !strings.Contains(result.Stderr, "execution timeout exceeded") {
+		t.Fatalf("stderr = %q, want timeout", result.Stderr)
+	}
+	calls := exec.GetLLMCalls()
+	if len(calls) != 1 {
+		t.Fatalf("LLM calls after timeout = %d, want 1", len(calls))
+	}
+	if calls[0].Prompt != "before timeout" || calls[0].Response != "ok" {
+		t.Fatalf("LLM call = %+v, want prompt/response before timeout/ok", calls[0])
+	}
+}
+
+func TestLocalExecutorCanceledContextDoesNotRun(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := exec.Execute(ctx, `fmt.Println("should not run")
+FINAL("should not finalize")`)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Execute error = %v, want context canceled", err)
+	}
+	if strings.Contains(result.Stdout, "should not run") {
+		t.Fatalf("canceled execution ran code, stdout=%q", result.Stdout)
+	}
+	if exec.HasFinal() {
+		t.Fatal("canceled execution should not set final state")
+	}
+}
+
+func TestLocalExecutorCanceledContextPreservesState(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	if _, err := exec.Execute(context.Background(), `var keep = "state"`); err != nil {
+		t.Fatalf("Execute setup failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = exec.Execute(ctx, `var shouldNotRun = true`)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Execute error = %v, want context canceled", err)
+	}
+
+	got, err := exec.GetVariable("keep")
+	if err != nil {
+		t.Fatalf("state variable missing after canceled Execute: %v", err)
+	}
+	if got != "state" {
+		t.Fatalf("keep = %q, want state", got)
+	}
+}
+
+func TestLocalExecutorExpiredParentDeadlinePreservesState(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	if _, err := exec.Execute(context.Background(), `var keepDeadline = "state"`); err != nil {
+		t.Fatalf("Execute setup failed: %v", err)
+	}
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	_, err = exec.Execute(ctx, `var shouldNotRunDeadline = true`)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Execute error = %v, want deadline exceeded", err)
+	}
+
+	got, err := exec.GetVariable("keepDeadline")
+	if err != nil {
+		t.Fatalf("state variable missing after expired parent deadline: %v", err)
+	}
+	if got != "state" {
+		t.Fatalf("keepDeadline = %q, want state", got)
+	}
+}
+
+func TestLocalExecutorFinalTokenRefresh(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	result, err := exec.Execute(context.Background(), `FINAL("first")`)
+	if err != nil {
+		t.Fatalf("Execute first FINAL failed: %v", err)
+	}
+	if result.Stderr != "" {
+		t.Fatalf("Execute first FINAL stderr: %s", result.Stderr)
+	}
+	if final, ok := exec.Final(); !ok || final != "first" {
+		t.Fatalf("First final = %q/%v, want first/true", final, ok)
+	}
+
+	result, err = exec.Execute(context.Background(), `FINAL("second")`)
+	if err != nil {
+		t.Fatalf("Execute second FINAL failed: %v", err)
+	}
+	if result.Stderr != "" {
+		t.Fatalf("Execute second FINAL stderr: %s", result.Stderr)
+	}
+	if final, ok := exec.Final(); !ok || final != "second" {
+		t.Fatalf("Second final = %q/%v, want second/true", final, ok)
+	}
+	if strings.Contains(result.Stdout, finalMarkerPrefix) {
+		t.Fatalf("local stdout leaked final marker: %q", result.Stdout)
+	}
+}
+
+func TestLocalExecutorStaleFinalIgnored(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	staleToken := exec.rotateFinalToken()
+	exec.expireFinalToken(staleToken)
+	currentToken := exec.rotateFinalToken()
+	exec.stdout.Begin(1)
+
+	exec.finalAnswer(staleToken, exec.stdout, 1, "stale")
+	if final, ok := exec.Final(); ok {
+		t.Fatalf("Stale token set final = %q", final)
+	}
+	if out := exec.stdout.String(); out != "" {
+		t.Fatalf("Stale token wrote stdout marker: %q", out)
+	}
+
+	exec.finalAnswer(currentToken, exec.stdout, 1, "fresh")
+	if final, ok := exec.Final(); !ok || final != "fresh" {
+		t.Fatalf("Current token final = %q/%v, want fresh/true", final, ok)
+	}
+}
+
+func TestLocalOutputRejectsNonEvalGoroutine(t *testing.T) {
+	out := new(localOutput)
+	out.Begin(1)
+	out.AllowCurrent(1)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = out.Write([]byte("same-run"))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("write goroutine did not finish")
+	}
+
+	if got := out.End(1); got != "same-run" {
+		t.Fatalf("allowed child goroutine write = %q, want same-run", got)
+	}
+
+	out.Begin(2)
+	done = make(chan struct{})
+	go func() {
+		_, _ = out.Write([]byte("stale"))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stale write goroutine did not finish")
+	}
+
+	if got := out.String(); got != "" {
+		t.Fatalf("unowned goroutine write = %q, want empty", got)
+	}
+	_, _ = out.WriteForRun(1, []byte("fresh"))
+	if got := out.String(); got != "" {
+		t.Fatalf("stale WriteForRun output = %q, want empty", got)
+	}
+	_, _ = out.WriteForRun(2, []byte("fresh"))
+	if got := out.End(2); got != "fresh" {
+		t.Fatalf("current WriteForRun output = %q, want fresh", got)
+	}
+}
+
+func TestLocalOutputRejectsOlderYaegiGoroutine(t *testing.T) {
+	out := new(localOutput)
+	out.Begin(1)
+	out.rootGID = 100
+	out.allowed[100] = struct{}{}
+
+	if !out.allowWrite(101, 100, true, true) {
+		t.Fatal("current-run yaegi goroutine should be allowed")
+	}
+	if out.allowWrite(99, 0, false, true) {
+		t.Fatal("older yaegi goroutine should be rejected")
+	}
+
+	out.Begin(2)
+	out.rootGID = 200
+	out.allowed[200] = struct{}{}
+	if out.allowWrite(250, 100, true, true) {
+		t.Fatal("previous-run yaegi goroutine should not be allowed in later run")
+	}
+}
+
+func TestLocalExecutorDropsStaleGoroutineOutputDuringNextRun(t *testing.T) {
+	client := newPromptBlockingLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	type outcome struct {
+		stdout string
+		stderr string
+		err    error
+	}
+	firstDone := make(chan outcome, 1)
+	go func() {
+		result, err := exec.Execute(context.Background(), `go func() {
+	fmt.Println(QueryRaw("stale query"))
+}()
+fmt.Println(QueryRaw("barrier query"))`)
+		out := outcome{err: err}
+		if result != nil {
+			out.stdout = result.Stdout
+			out.stderr = result.Stderr
+		}
+		firstDone <- out
+	}()
+
+	select {
+	case <-client.staleStarted:
+	case <-time.After(time.Second):
+		t.Fatal("stale query did not start")
+	}
+	select {
+	case <-client.barrierStarted:
+	case <-time.After(time.Second):
+		t.Fatal("barrier query did not start")
+	}
+	close(client.barrierRelease)
+	select {
+	case out := <-firstDone:
+		if out.err != nil {
+			t.Fatalf("Execute stale goroutine setup failed: %v", out.err)
+		}
+		if out.stderr != "" {
+			t.Fatalf("setup stderr = %q", out.stderr)
+		}
+		if strings.Contains(out.stdout, "stale output") {
+			t.Fatalf("setup stdout leaked stale output: %q", out.stdout)
+		}
+		if !strings.Contains(out.stdout, "barrier output") {
+			t.Fatalf("setup stdout = %q, want barrier output", out.stdout)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale goroutine setup did not finish")
+	}
+
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := exec.Execute(context.Background(), `fmt.Println(QueryRaw("fresh query"))`)
+		out := outcome{err: err}
+		if result != nil {
+			out.stdout = result.Stdout
+			out.stderr = result.Stderr
+		}
+		done <- out
+	}()
+
+	select {
+	case <-client.freshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("fresh query did not start")
+	}
+	close(client.staleRelease)
+	time.Sleep(25 * time.Millisecond)
+	close(client.freshRelease)
+
+	select {
+	case out := <-done:
+		if out.err != nil {
+			t.Fatalf("Execute second run failed: %v", out.err)
+		}
+		if out.stderr != "" {
+			t.Fatalf("second run stderr = %q", out.stderr)
+		}
+		if strings.Contains(out.stdout, "stale output") {
+			t.Fatalf("stdout leaked stale goroutine output: %q", out.stdout)
+		}
+		if !strings.Contains(out.stdout, "fresh output") {
+			t.Fatalf("stdout = %q, want fresh output", out.stdout)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second run did not finish")
+	}
+}
+
+func TestLocalExecutorContextQueryFromGoroutineDuringActiveRun(t *testing.T) {
+	client := newPromptBlockingLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	if err := exec.LoadContext("active context"); err != nil {
+		t.Fatalf("LoadContext failed: %v", err)
+	}
+
+	type outcome struct {
+		stdout string
+		stderr string
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := exec.Execute(context.Background(), `done := make(chan struct{})
+go func() {
+	fmt.Println(Query("fresh query"))
+	close(done)
+}()
+<-done`)
+		out := outcome{err: err}
+		if result != nil {
+			out.stdout = result.Stdout
+			out.stderr = result.Stderr
+		}
+		done <- out
+	}()
+
+	select {
+	case <-client.freshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("fresh query did not start")
+	}
+	close(client.freshRelease)
+
+	select {
+	case out := <-done:
+		if out.err != nil {
+			t.Fatalf("Execute failed: %v", out.err)
+		}
+		if out.stderr != "" {
+			t.Fatalf("stderr = %q", out.stderr)
+		}
+		if !strings.Contains(out.stdout, "fresh output") {
+			t.Fatalf("stdout = %q, want fresh output", out.stdout)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Execute did not finish")
+	}
+}
+
+func TestLocalExecutorCapturesAwaitedGoroutineOutput(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	result, err := exec.Execute(context.Background(), `done := make(chan struct{})
+go func() {
+	fmt.Println("from goroutine")
+	close(done)
+}()
+<-done`)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if result.Stderr != "" {
+		t.Fatalf("stderr = %q", result.Stderr)
+	}
+	if !strings.Contains(result.Stdout, "from goroutine") {
+		t.Fatalf("stdout = %q, want awaited goroutine output", result.Stdout)
+	}
+}
+
+func TestLocalExecutorCapturesNestedAwaitedGoroutineOutput(t *testing.T) {
+	client := NewMockLLMClient()
+	cfg := DefaultConfig()
+	cfg.Backend = BackendLocal
+
+	exec, err := NewLocalExecutor(client, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create local executor: %v", err)
+	}
+	defer func() { _ = exec.Close() }()
+
+	result, err := exec.Execute(context.Background(), `done := make(chan struct{})
+innerDone := make(chan struct{})
+go func() {
+	go func() {
+		fmt.Println("from nested goroutine")
+		close(innerDone)
+	}()
+	<-innerDone
+	close(done)
+}()
+<-done`)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if result.Stderr != "" {
+		t.Fatalf("stderr = %q", result.Stderr)
+	}
+	if !strings.Contains(result.Stdout, "from nested goroutine") {
+		t.Fatalf("stdout = %q, want nested awaited goroutine output", result.Stdout)
 	}
 }
 
@@ -602,6 +1378,278 @@ func TestIPCServerBatched(t *testing.T) {
 	}
 }
 
+func TestIPCServerQueryUsesExecutionContext(t *testing.T) {
+	client := newContextDeadlineLLMClient()
+	server, err := NewIPCServer(client, 0)
+	if err != nil {
+		t.Fatalf("Failed to create IPC server: %v", err)
+	}
+	defer func() { _ = server.Stop() }()
+
+	execCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	execID := server.beginExecution(execCtx)
+	defer server.endExecution(execID)
+
+	start := time.Now()
+	resp := server.handleQuery(IPCMessage{Type: MessageQuery, ID: "q1", ExecutionID: execID, Prompt: "wait"})
+	if time.Since(start) > time.Second {
+		t.Fatal("IPC query did not return promptly after execution timeout")
+	}
+	if resp.Type != MessageError {
+		t.Fatalf("response type = %s, want error", resp.Type)
+	}
+
+	select {
+	case err := <-client.errCh:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("query context error = %v, want deadline exceeded", err)
+		}
+	default:
+		t.Fatal("LLM client did not observe execution context deadline")
+	}
+}
+
+func TestIPCServerDropsCallsAfterExecutionEnds(t *testing.T) {
+	client := newDelayedLLMClient()
+	server, err := NewIPCServer(client, 0)
+	if err != nil {
+		t.Fatalf("Failed to create IPC server: %v", err)
+	}
+	defer func() { _ = server.Stop() }()
+
+	execID := server.beginExecution(context.Background())
+	done := make(chan IPCMessage, 1)
+	go func() {
+		done <- server.handleQuery(IPCMessage{Type: MessageQuery, ID: "q1", ExecutionID: execID, Prompt: "late"})
+	}()
+
+	select {
+	case <-client.started:
+	case <-time.After(time.Second):
+		t.Fatal("LLM query did not start")
+	}
+
+	server.endExecution(execID)
+	close(client.release)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("LLM query did not finish")
+	}
+
+	if calls := server.GetCalls(); len(calls) != 0 {
+		t.Fatalf("late query should not be recorded after execution ended, calls=%+v", calls)
+	}
+}
+
+func TestIPCServerRejectsQueryAfterExecutionEnds(t *testing.T) {
+	client := NewMockLLMClient()
+	server, err := NewIPCServer(client, 0)
+	if err != nil {
+		t.Fatalf("Failed to create IPC server: %v", err)
+	}
+	defer func() { _ = server.Stop() }()
+
+	execID := server.beginExecution(context.Background())
+	server.endExecution(execID)
+
+	resp := server.handleQuery(IPCMessage{Type: MessageQuery, ID: "q1", Prompt: "late"})
+	if resp.Type != MessageError {
+		t.Fatalf("response type = %s, want error", resp.Type)
+	}
+	if !strings.Contains(resp.Error, "execution expired") {
+		t.Fatalf("error = %q, want execution expired", resp.Error)
+	}
+	if client.CallCount != 0 {
+		t.Fatalf("late query should not call client, calls=%d", client.CallCount)
+	}
+	if calls := server.GetCalls(); len(calls) != 0 {
+		t.Fatalf("late query should not be recorded, calls=%+v", calls)
+	}
+}
+
+func TestIPCServerRejectsQueryAfterExecutionContextExpires(t *testing.T) {
+	client := NewMockLLMClient()
+	server, err := NewIPCServer(client, 0)
+	if err != nil {
+		t.Fatalf("Failed to create IPC server: %v", err)
+	}
+	defer func() { _ = server.Stop() }()
+
+	execCtx, cancel := context.WithCancel(context.Background())
+	execID := server.beginExecution(execCtx)
+	cancel()
+
+	resp := server.handleQuery(IPCMessage{Type: MessageQuery, ID: "q1", ExecutionID: execID, Prompt: "late"})
+	if resp.Type != MessageError {
+		t.Fatalf("response type = %s, want error", resp.Type)
+	}
+	if !strings.Contains(resp.Error, "execution expired") {
+		t.Fatalf("error = %q, want execution expired", resp.Error)
+	}
+	if client.CallCount != 0 {
+		t.Fatalf("expired query should not call client, calls=%d", client.CallCount)
+	}
+	if calls := server.GetCalls(); len(calls) != 0 {
+		t.Fatalf("expired query should not be recorded, calls=%+v", calls)
+	}
+}
+
+func TestIPCServerRejectsOldExecutionIDDuringNewExecution(t *testing.T) {
+	client := NewMockLLMClient()
+	server, err := NewIPCServer(client, 0)
+	if err != nil {
+		t.Fatalf("Failed to create IPC server: %v", err)
+	}
+	defer func() { _ = server.Stop() }()
+
+	oldExecID := server.beginExecution(context.Background())
+	server.endExecution(oldExecID)
+	newExecID := server.beginExecution(context.Background())
+	defer server.endExecution(newExecID)
+
+	resp := server.handleQuery(IPCMessage{Type: MessageQuery, ID: "q1", ExecutionID: oldExecID, Prompt: "stale"})
+	if resp.Type != MessageError {
+		t.Fatalf("response type = %s, want error", resp.Type)
+	}
+	if !strings.Contains(resp.Error, "execution expired") {
+		t.Fatalf("error = %q, want execution expired", resp.Error)
+	}
+	if client.CallCount != 0 {
+		t.Fatalf("stale execution query should not call client, calls=%d", client.CallCount)
+	}
+	if calls := server.GetCalls(); len(calls) != 0 {
+		t.Fatalf("stale execution query should not be recorded, calls=%+v", calls)
+	}
+}
+
+func TestContainerExecutorFinalMarker(t *testing.T) {
+	exec := &ContainerExecutor{
+		variables: make(map[string]any),
+		finalTok:  "token",
+	}
+
+	exec.extractFinal("FINAL(fake)"+formatFinalMarker("token", "real"), "token")
+
+	final, ok := exec.Final()
+	if !ok {
+		t.Fatal("expected final state")
+	}
+	if final != "real" {
+		t.Fatalf("Final = %q, want real", final)
+	}
+
+	exec.ClearFinal()
+	exec.extractFinal("FINAL(fake)", "token")
+	if exec.HasFinal() {
+		t.Fatal("fake stdout FINAL should not set final state")
+	}
+}
+
+func TestContainerExecutorFinalMarkerStrippedAndRotated(t *testing.T) {
+	exec := &ContainerExecutor{
+		variables: make(map[string]any),
+		finalTok:  "old-token",
+	}
+
+	stripped := stripFinalMarkers("before"+formatFinalMarker("old-token", "real")+"after\n", "old-token")
+	if strings.Contains(stripped, finalMarkerPrefix) {
+		t.Fatalf("stripFinalMarkers left marker in stdout: %q", stripped)
+	}
+
+	_, _ = exec.Execute(context.Background(), "")
+	if exec.finalTok == "old-token" {
+		t.Fatal("Execute should rotate container final token")
+	}
+
+	exec.extractFinal(formatFinalMarker("old-token", "forged"), exec.finalTok)
+	if exec.HasFinal() {
+		t.Fatal("old leaked final marker should not set final state after token rotation")
+	}
+}
+
+func TestContainerExecutorTimeoutDoesNotSetFinal(t *testing.T) {
+	tmpDir := t.TempDir()
+	runtimePath := filepath.Join(tmpDir, "fake-runtime")
+	script := `#!/bin/sh
+mount_arg=""
+for arg in "$@"; do
+	case "$arg" in
+		*:/workspace:ro)
+			mount_arg="$arg"
+			;;
+	esac
+done
+workspace="${mount_arg%%:/workspace:ro}"
+token="$(sed -n 's/.*finalToken := "\([^"]*\)".*/\1/p' "$workspace/main.go" | head -n 1)"
+printf '\n__RLM_FINAL__%s__dGltZWQgb3V0\n' "$token"
+sleep 2
+`
+	if err := os.WriteFile(runtimePath, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake runtime: %v", err)
+	}
+
+	exec := &ContainerExecutor{
+		config: Config{
+			Timeout:   25 * time.Millisecond,
+			EnableIPC: false,
+		},
+		runtime:   runtimePath,
+		variables: make(map[string]any),
+	}
+
+	result, err := exec.Execute(context.Background(), `FINAL("timed out")`)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if !strings.Contains(result.Stderr, "execution timeout exceeded") {
+		t.Fatalf("stderr = %q, want timeout", result.Stderr)
+	}
+	if exec.HasFinal() {
+		t.Fatal("timeout/canceled container execution should not set final state")
+	}
+	if strings.Contains(result.Stdout, finalMarkerPrefix) {
+		t.Fatalf("timeout stdout leaked final marker: %q", result.Stdout)
+	}
+}
+
+func TestContainerExecutorExecuteClearsFinal(t *testing.T) {
+	exec := &ContainerExecutor{
+		variables: make(map[string]any),
+		finalTok:  "token",
+		finalSet:  true,
+		finalVal:  "stale",
+	}
+
+	_, _ = exec.Execute(context.Background(), "")
+	if exec.HasFinal() {
+		t.Fatal("Execute should clear stale final state before running")
+	}
+}
+
+func TestContainerExecutorStringContextIsRaw(t *testing.T) {
+	exec := &ContainerExecutor{
+		variables: make(map[string]any),
+		finalTok:  "token",
+	}
+	if err := exec.LoadContext("container context data"); err != nil {
+		t.Fatalf("LoadContext failed: %v", err)
+	}
+
+	code, err := exec.generateProgram("", 0)
+	if err != nil {
+		t.Fatalf("generateProgram failed: %v", err)
+	}
+	if !strings.Contains(code, `var context = "container context data"`) {
+		t.Fatalf("generated string context should be raw, code=%s", code)
+	}
+	if strings.Contains(code, `var context = "\"container context data\""`) {
+		t.Fatal("generated string context should not be JSON-quoted")
+	}
+}
+
 func TestGenerateContainerRLMCode(t *testing.T) {
 	code := GenerateContainerRLMCode("host.containers.internal:12345")
 
@@ -616,6 +1664,18 @@ func TestGenerateContainerRLMCode(t *testing.T) {
 
 	if !strings.Contains(code, "func QueryBatched(prompts []string) []string") {
 		t.Error("Expected QueryBatched function in generated code")
+	}
+
+	if !strings.Contains(code, "func QueryRaw(prompt string) string") {
+		t.Error("Expected QueryRaw function in generated code")
+	}
+
+	if !strings.Contains(code, finalMarkerPrefix) {
+		t.Error("Expected private FINAL marker in generated code")
+	}
+
+	if strings.Contains(code, "const finalToken") {
+		t.Error("generated code should not expose final token as package-level constant")
 	}
 
 	if !strings.Contains(code, "host.containers.internal:12345") {
