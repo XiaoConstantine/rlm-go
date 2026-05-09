@@ -21,6 +21,9 @@ const (
 	// MessageQueryBatched is a QueryBatched() call from the sandbox.
 	MessageQueryBatched MessageType = "query_batched"
 
+	// MessageQueryBlocked records a sandbox-side query guardrail result.
+	MessageQueryBlocked MessageType = "query_blocked"
+
 	// MessageResponse is a response from the host to the sandbox.
 	MessageResponse MessageType = "response"
 
@@ -226,6 +229,8 @@ func (s *IPCServer) handleMessage(msg IPCMessage) IPCMessage {
 		return s.handleQuery(msg)
 	case MessageQueryBatched:
 		return s.handleQueryBatched(msg)
+	case MessageQueryBlocked:
+		return s.handleQueryBlocked(msg)
 	case MessageReady:
 		return IPCMessage{Type: MessageResponse, ID: msg.ID}
 	case MessageExit:
@@ -236,6 +241,40 @@ func (s *IPCServer) handleMessage(msg IPCMessage) IPCMessage {
 			ID:    msg.ID,
 			Error: fmt.Sprintf("unknown message type: %s", msg.Type),
 		}
+	}
+}
+
+func (s *IPCServer) handleQueryBlocked(msg IPCMessage) IPCMessage {
+	_, cleanup, execID, activeExecution, ok := s.queryContext(msg.ExecutionID)
+	defer cleanup()
+	if !ok {
+		return IPCMessage{
+			Type:  MessageError,
+			ID:    msg.ID,
+			Error: "execution expired",
+		}
+	}
+
+	if len(msg.Prompts) > 0 {
+		for i, prompt := range msg.Prompts {
+			response := msg.Response
+			if i < len(msg.Responses) {
+				response = msg.Responses[i]
+			}
+			s.recordCallForExecution(execID, activeExecution, prompt, response, 0, 0, 0)
+		}
+		return IPCMessage{
+			Type:      MessageResponse,
+			ID:        msg.ID,
+			Responses: msg.Responses,
+		}
+	}
+
+	s.recordCallForExecution(execID, activeExecution, msg.Prompt, msg.Response, 0, 0, 0)
+	return IPCMessage{
+		Type:     MessageResponse,
+		ID:       msg.ID,
+		Response: msg.Response,
 	}
 }
 
@@ -566,6 +605,7 @@ type messageType string
 const (
 	messageQuery        messageType = "query"
 	messageQueryBatched messageType = "query_batched"
+	messageQueryBlocked messageType = "query_blocked"
 	messageResponse     messageType = "response"
 	messageError        messageType = "error"
 )
@@ -791,10 +831,39 @@ func queryRaw(prompt string) string {
 	return resp.Response
 }
 
+func recordBlockedQuery(prompt, response string) {
+	recordBlockedQueries([]string{prompt}, []string{response})
+}
+
+func recordBlockedQueries(prompts, responses []string) {
+	ipcMu.Lock()
+	defer ipcMu.Unlock()
+
+	msg := ipcMessage{
+		Type:        messageQueryBlocked,
+		ID:          nextID(),
+		ExecutionID: ipcExecutionID,
+		Prompts:     prompts,
+		Responses:   responses,
+	}
+
+	if len(prompts) == 1 && len(responses) == 1 {
+		msg.Prompt = prompts[0]
+		msg.Response = responses[0]
+	}
+
+	if err := ipcEncoder.Encode(msg); err != nil {
+		return
+	}
+	_, _ = ipcReader.ReadBytes('\n')
+}
+
 // Query sends a query with the full context prepended to the host LLM.
 func Query(prompt string) string {
 	if err := fullContextQueryBlocked("Query"); err != "" {
-		return "Error: " + err
+		response := "Error: " + err
+		recordBlockedQuery(prompt, response)
+		return response
 	}
 	return queryRaw(buildPromptWithContext(prompt))
 }
@@ -862,6 +931,7 @@ func QueryBatched(prompts []string) []string {
 		for i := range results {
 			results[i] = "Error: " + err
 		}
+		recordBlockedQueries(prompts, results)
 		return results
 	}
 	fullPrompts := make([]string, len(prompts))

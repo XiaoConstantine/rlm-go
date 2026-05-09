@@ -336,6 +336,7 @@ func (e *LocalExecutor) useBuiltins(token string, runCtx context.Context, stdout
 		"rlm/rlm": {
 			"QueryRaw":              reflect.ValueOf(func(prompt string) string { return e.llmQueryRaw(token, runCtx, prompt) }),
 			"QueryBatchedRaw":       reflect.ValueOf(func(prompts []string) []string { return e.llmQueryBatchedRaw(token, runCtx, prompts) }),
+			"RecordBlockedQuery":    reflect.ValueOf(func(prompt, response string) { e.recordBlockedQuery(token, prompt, response) }),
 			"FindRelevantInContext": reflect.ValueOf(contextindex.FindRelevant),
 			"GetChunkInContext":     reflect.ValueOf(contextindex.GetChunk),
 			"GetContextInContext":   reflect.ValueOf(contextindex.GetContext),
@@ -401,7 +402,9 @@ func fullContextQueryBlocked(name string) string {
 const localRLMWrapperCode = `
 Query = func(prompt string) string {
 	if err := fullContextQueryBlocked("Query"); err != "" {
-		return "Error: " + err
+		response := "Error: " + err
+		RecordBlockedQuery(prompt, response)
+		return response
 	}
 	return QueryRaw(buildPromptWithProvidedContext(context, prompt))
 }
@@ -415,6 +418,7 @@ QueryBatched = func(prompts []string) []string {
 		results := make([]string, len(prompts))
 		for i := range results {
 			results[i] = "Error: " + err
+			RecordBlockedQuery(prompts[i], results[i])
 		}
 		return results
 	}
@@ -462,6 +466,18 @@ func (e *LocalExecutor) refreshLocalRLMWrappers() error {
 
 func (e *LocalExecutor) llmQueryRaw(token string, ctx context.Context, prompt string) string {
 	return e.query(token, ctx, prompt, prompt)
+}
+
+func (e *LocalExecutor) recordBlockedQuery(token, prompt, response string) {
+	if !e.tokenActive(token) {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.llmCalls = append(e.llmCalls, LLMCall{
+		Prompt:   prompt,
+		Response: response,
+	})
 }
 
 func (e *LocalExecutor) query(token string, ctx context.Context, fullPrompt, recordedPrompt string) string {

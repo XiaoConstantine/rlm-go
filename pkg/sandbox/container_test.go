@@ -520,6 +520,16 @@ fmt.Println(QueryWith("slice", "allowed"))
 	if !strings.Contains(client.Calls[1], "slice") || strings.Contains(client.Calls[1], "large context") {
 		t.Fatalf("QueryWith call should use selected context only, calls=%v", client.Calls)
 	}
+
+	calls := exec.GetLLMCalls()
+	if len(calls) != 5 {
+		t.Fatalf("GetLLMCalls() returned %d calls, want blocked and allowed calls: %+v", len(calls), calls)
+	}
+	for i, wantPrompt := range []string{"blocked", "one", "two"} {
+		if calls[i].Prompt != wantPrompt || !strings.Contains(calls[i].Response, "exceeding the limit") {
+			t.Fatalf("call %d = %+v, want blocked prompt %q", i, calls[i], wantPrompt)
+		}
+	}
 }
 
 func TestLocalExecutorWithBatchedQuery(t *testing.T) {
@@ -1535,6 +1545,38 @@ func TestIPCServerBatched(t *testing.T) {
 	}
 }
 
+func TestIPCServerRecordsBlockedQuery(t *testing.T) {
+	client := NewMockLLMClient()
+	server, err := NewIPCServer(client, 0)
+	if err != nil {
+		t.Fatalf("Failed to create IPC server: %v", err)
+	}
+	defer func() { _ = server.Stop() }()
+
+	execID := server.beginExecution(context.Background())
+	defer server.endExecution(execID)
+	resp := server.handleQueryBlocked(IPCMessage{
+		Type:        MessageQueryBlocked,
+		ID:          "blocked",
+		ExecutionID: execID,
+		Prompts:     []string{"one", "two"},
+		Responses:   []string{"Error: one", "Error: two"},
+	})
+	if resp.Type != MessageResponse {
+		t.Fatalf("handleQueryBlocked type = %s, want %s", resp.Type, MessageResponse)
+	}
+	if client.CallCount != 0 {
+		t.Fatalf("client CallCount = %d, want no LLM calls", client.CallCount)
+	}
+	calls := server.GetCalls()
+	if len(calls) != 2 {
+		t.Fatalf("GetCalls() = %+v, want 2 blocked calls", calls)
+	}
+	if calls[0].Prompt != "one" || calls[0].Response != "Error: one" || calls[1].Prompt != "two" || calls[1].Response != "Error: two" {
+		t.Fatalf("blocked calls = %+v", calls)
+	}
+}
+
 func TestIPCServerQueryUsesExecutionContext(t *testing.T) {
 	client := newContextDeadlineLLMClient()
 	server, err := NewIPCServer(client, 0)
@@ -1855,6 +1897,10 @@ func TestGenerateContainerRLMCode(t *testing.T) {
 
 	if !strings.Contains(code, `fullContextQueryBlocked("Query")`) || !strings.Contains(code, `fullContextQueryBlocked("QueryBatched")`) {
 		t.Error("Expected generated Query/QueryBatched guardrails")
+	}
+
+	if !strings.Contains(code, "messageQueryBlocked") || !strings.Contains(code, "recordBlockedQueries") {
+		t.Error("Expected generated blocked-query recording")
 	}
 
 	if !strings.Contains(code, "func FindRelevant(query string, topK int) []string") {

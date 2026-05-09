@@ -2153,6 +2153,13 @@ func TestCreateExecutionEnvironmentWithSandboxMaxFullContextQueryChars(t *testin
 	if len(prompts) != 0 {
 		t.Fatalf("prompts = %v, want no sandbox LLM calls", prompts)
 	}
+	calls := env.GetLLMCalls()
+	if len(calls) != 1 {
+		t.Fatalf("GetLLMCalls() = %+v, want blocked call record", calls)
+	}
+	if calls[0].Prompt != "blocked" || !strings.Contains(calls[0].Response, "exceeding the limit") {
+		t.Fatalf("blocked call = %+v", calls[0])
+	}
 }
 
 func TestCreateExecutionEnvironmentWithoutSandbox(t *testing.T) {
