@@ -5,11 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/XiaoConstantine/rlm-go/pkg/contextindex"
 )
 
 // MockLLMClient is a mock implementation of LLMClient for testing.
@@ -1855,6 +1859,95 @@ func TestContainerExecutorStringContextIsRaw(t *testing.T) {
 	}
 	if !strings.Contains(code, "if startLine > len(lines)") {
 		t.Error("no-IPC generated GetContext should clamp startLine past EOF")
+	}
+}
+
+func TestContainerGeneratedContextChunksMatchContextIndex(t *testing.T) {
+	raw := generatedChunkingFixture()
+	containerExec := &ContainerExecutor{
+		variables: make(map[string]any),
+		finalTok:  "token",
+	}
+	if err := containerExec.LoadContext(raw); err != nil {
+		t.Fatalf("LoadContext failed: %v", err)
+	}
+
+	code, err := containerExec.generateProgram(generatedChunkDumpCode(), 0)
+	if err != nil {
+		t.Fatalf("generateProgram failed: %v", err)
+	}
+	output := runGeneratedProgram(t, code)
+	assertGeneratedChunksMatchContextIndex(t, output, raw)
+}
+
+func TestIPCGeneratedContextChunksMatchContextIndex(t *testing.T) {
+	raw := generatedChunkingFixture()
+	server, err := NewIPCServer(NewMockLLMClient(), 0)
+	if err != nil {
+		t.Fatalf("Failed to create IPC server: %v", err)
+	}
+	defer func() { _ = server.Stop() }()
+	server.Start()
+
+	code := GenerateContainerRLMCode(server.Address(), "token", "1", "0")
+	code += "\nvar context = " + strconv.Quote(raw) + "\n"
+	code += "func main() {\n" + generatedChunkDumpCode() + "\n}\n"
+
+	output := runGeneratedProgram(t, code)
+	assertGeneratedChunksMatchContextIndex(t, output, raw)
+}
+
+func generatedChunkingFixture() string {
+	return strings.Repeat("a", 3999) + "🙂" + string([]byte{0xff}) + strings.Repeat("b", 201)
+}
+
+func generatedChunkDumpCode() string {
+	return `
+fmt.Printf("count=%d\n", ChunkCount())
+for i := 0; i < ChunkCount(); i++ {
+	fmt.Printf("chunk%d=%x\n", i, []byte(GetChunk(i)))
+}
+`
+}
+
+func runGeneratedProgram(t *testing.T, code string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(code), 0644); err != nil {
+		t.Fatalf("write generated main.go: %v", err)
+	}
+	goMod := "module generated\n\ngo 1.23\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0644); err != nil {
+		t.Fatalf("write generated go.mod: %v", err)
+	}
+
+	cmd := osexec.Command("go", "run", ".")
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("generated program failed: %v\n%s", err, output)
+	}
+	return string(output)
+}
+
+func assertGeneratedChunksMatchContextIndex(t *testing.T, output, raw string) {
+	t.Helper()
+
+	idx := contextindex.New(raw)
+	countLine := fmt.Sprintf("count=%d", idx.ChunkCount())
+	if !strings.Contains(output, countLine) {
+		t.Fatalf("generated output = %q, want %q", output, countLine)
+	}
+	for i := 0; i < idx.ChunkCount(); i++ {
+		chunk, ok := idx.GetChunk(i)
+		if !ok {
+			t.Fatalf("contextindex missing chunk %d", i)
+		}
+		chunkLine := fmt.Sprintf("chunk%d=%x", i, []byte(chunk))
+		if !strings.Contains(output, chunkLine) {
+			t.Fatalf("generated output = %q, want %q", output, chunkLine)
+		}
 	}
 }
 
