@@ -864,6 +864,7 @@ func (r *REPL) Execute(ctx context.Context, code string) (*core.ExecutionResult,
 	// Reset buffers
 	r.stdout.Reset()
 	r.stderr.Reset()
+	r.clearFinalLocked()
 
 	// Track execution count for interpreter health
 	r.execCount++

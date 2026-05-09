@@ -191,6 +191,32 @@ FINAL(answer)`)
 	}
 }
 
+func TestFinalStateClearedBeforeEachExecution(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+
+	if _, err := repl.Execute(context.Background(), `FINAL("old")`); err != nil {
+		t.Fatalf("Execute() old error: %v", err)
+	}
+	if final, ok := repl.Final(); !ok || final != "old" {
+		t.Fatalf("Final() after old = %q/%v, want old/true", final, ok)
+	}
+
+	if _, err := repl.Execute(context.Background(), `fmt.Println("no final")`); err != nil {
+		t.Fatalf("Execute() no final error: %v", err)
+	}
+	if final, ok := repl.Final(); ok {
+		t.Fatalf("Final() after no-final execution = %q/%v, want empty/false", final, ok)
+	}
+
+	if _, err := repl.Execute(context.Background(), `FINAL("new")`); err != nil {
+		t.Fatalf("Execute() new error: %v", err)
+	}
+	if final, ok := repl.Final(); !ok || final != "new" {
+		t.Fatalf("Final() after new = %q/%v, want new/true", final, ok)
+	}
+}
+
 func TestFinalStateNonStringValue(t *testing.T) {
 	client := newMockClient()
 	repl := New(client)

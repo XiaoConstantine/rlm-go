@@ -467,6 +467,7 @@ func (r *RecursiveREPL) Execute(ctx context.Context, code string) (*core.Executi
 	r.ctx = ctx
 	r.stdout.Reset()
 	r.stderr.Reset()
+	r.clearFinalLocked()
 	r.mu.Unlock()
 
 	start := time.Now()
