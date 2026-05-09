@@ -589,6 +589,18 @@ func QueryBatched(prompts []string) []string {
 
 	return resp.Responses
 }
+
+func FINAL(value any) string {
+	finalValue := fmt.Sprint(value)
+	fmt.Printf("\nFINAL(%%s)\n", finalValue)
+	return finalValue
+}
+
+func FINAL_VAR(value any) string {
+	finalValue := fmt.Sprint(value)
+	fmt.Printf("\nFINAL(%%s)\n", finalValue)
+	return finalValue
+}
 `,
 		bt, bt, bt, bt, // tokenUsage (2 fields x 2 backticks)
 		bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, // ipcMessage (9 fields x 2 backticks)

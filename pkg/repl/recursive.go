@@ -44,6 +44,9 @@ type RecursiveREPL struct {
 	recursiveCalls   []RecursiveCall // Track recursive RLM calls
 	asyncQueries     map[string]*AsyncQueryHandle
 	asyncMu          sync.RWMutex
+	finalMu          sync.RWMutex
+	finalSet         bool
+	finalValue       string
 	recursionContext *core.RecursionContext
 }
 
@@ -108,6 +111,9 @@ func (r *RecursiveREPL) injectBuiltins() error {
 			"CurrentDepth":        reflect.ValueOf(r.currentDepth),
 			"MaxDepth":            reflect.ValueOf(r.maxDepth),
 			"CanRecurse":          reflect.ValueOf(r.canRecurse),
+			// FINAL and FINAL_VAR allow recursive RLM code to signal completion.
+			"FINAL":     reflect.ValueOf(r.finalAnswer),
+			"FINAL_VAR": reflect.ValueOf(r.finalVarAnswer),
 		},
 	}
 
@@ -254,6 +260,59 @@ func (r *RecursiveREPL) maxDepth() int {
 // canRecurse returns true if another level of recursion is allowed.
 func (r *RecursiveREPL) canRecurse() bool {
 	return r.client.CurrentDepth() < r.client.MaxDepth()
+}
+
+func (r *RecursiveREPL) finalAnswer(value any) string {
+	finalValue := fmt.Sprint(value)
+	r.setFinal(finalValue)
+	fmt.Fprintf(r.stdout, "\nFINAL(%s)\n", finalValue)
+	return finalValue
+}
+
+func (r *RecursiveREPL) finalVarAnswer(value any) string {
+	finalValue := fmt.Sprint(value)
+	r.setFinal(finalValue)
+	fmt.Fprintf(r.stdout, "\nFINAL(%s)\n", finalValue)
+	return finalValue
+}
+
+func (r *RecursiveREPL) setFinal(value string) {
+	r.finalMu.Lock()
+	defer r.finalMu.Unlock()
+	if r.finalSet {
+		return
+	}
+	r.finalSet = true
+	r.finalValue = value
+}
+
+func (r *RecursiveREPL) clearFinalLocked() {
+	r.finalMu.Lock()
+	defer r.finalMu.Unlock()
+	r.finalSet = false
+	r.finalValue = ""
+}
+
+// HasFinal reports whether executed code called FINAL or FINAL_VAR.
+func (r *RecursiveREPL) HasFinal() bool {
+	r.finalMu.RLock()
+	defer r.finalMu.RUnlock()
+	return r.finalSet
+}
+
+// Final returns the value provided to FINAL or FINAL_VAR.
+func (r *RecursiveREPL) Final() (string, bool) {
+	r.finalMu.RLock()
+	defer r.finalMu.RUnlock()
+	if !r.finalSet {
+		return "", false
+	}
+	return r.finalValue, true
+}
+
+// ClearFinal clears any previous FINAL/FINAL_VAR signal.
+func (r *RecursiveREPL) ClearFinal() {
+	r.clearFinalLocked()
 }
 
 // Async query methods (same as regular REPL)
@@ -441,6 +500,7 @@ func (r *RecursiveREPL) Close() {
 	r.stderr.Reset()
 	r.llmCalls = nil
 	r.recursiveCalls = nil
+	r.clearFinalLocked()
 
 	r.asyncMu.Lock()
 	r.asyncQueries = make(map[string]*AsyncQueryHandle)
@@ -456,6 +516,7 @@ func (r *RecursiveREPL) Reset() error {
 	r.stderr.Reset()
 	r.llmCalls = nil
 	r.recursiveCalls = nil
+	r.clearFinalLocked()
 
 	i := interp.New(interp.Options{
 		Stdout: r.stdout,

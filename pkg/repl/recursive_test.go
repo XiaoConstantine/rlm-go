@@ -156,6 +156,58 @@ func TestRecursiveREPL_ExecuteBasic(t *testing.T) {
 	}
 }
 
+func TestRecursiveREPL_FinalState(t *testing.T) {
+	client := newMockRecursiveClient()
+	recursionCtx := core.NewRecursionContext(2)
+	repl := NewRecursiveREPL(client, recursionCtx)
+
+	if repl.HasFinal() {
+		t.Fatal("new RecursiveREPL should not have final state")
+	}
+
+	result, err := repl.Execute(context.Background(), `answer := "recursive final"
+FINAL(answer)`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "FINAL(recursive final)") {
+		t.Fatalf("stdout = %q, want FINAL marker", result.Stdout)
+	}
+
+	final, ok := repl.Final()
+	if !ok {
+		t.Fatal("expected final state")
+	}
+	if final != "recursive final" {
+		t.Fatalf("Final() = %q, want %q", final, "recursive final")
+	}
+
+	repl.ClearFinal()
+	if repl.HasFinal() {
+		t.Fatal("ClearFinal() did not clear final state")
+	}
+}
+
+func TestRecursiveREPL_FinalStateNonStringValue(t *testing.T) {
+	client := newMockRecursiveClient()
+	recursionCtx := core.NewRecursionContext(2)
+	repl := NewRecursiveREPL(client, recursionCtx)
+
+	_, err := repl.Execute(context.Background(), `answer := 42
+FINAL(answer)`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	final, ok := repl.Final()
+	if !ok {
+		t.Fatal("expected final state")
+	}
+	if final != "42" {
+		t.Fatalf("Final() = %q, want %q", final, "42")
+	}
+}
+
 func TestRecursiveREPL_CurrentDepth(t *testing.T) {
 	client := newMockRecursiveClient()
 	client.currentDepthValue = 1

@@ -206,6 +206,82 @@ func TestCompleteWithFinalVar(t *testing.T) {
 	}
 }
 
+func TestCompleteWithCodeFinalState(t *testing.T) {
+	callCount := 0
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			callCount++
+			return core.LLMResponse{
+				Content:          "```go\nanswer := \"code final\"\nFINAL(answer)\n```",
+				PromptTokens:     10,
+				CompletionTokens: 20,
+			}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithMaxIterations(5))
+
+	result, err := rlm.Complete(context.Background(), "test context", "What is the answer?")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+
+	if result.Response != "code final" {
+		t.Errorf("Response = %q, want %q", result.Response, "code final")
+	}
+	if result.Iterations != 1 {
+		t.Errorf("Iterations = %d, want 1", result.Iterations)
+	}
+	if callCount != 1 {
+		t.Errorf("LLM called %d times, want 1", callCount)
+	}
+}
+
+func TestCompleteWithCodeFinalNonStringValue(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{
+				Content: "```go\nanswer := 42\nFINAL(answer)\n```",
+			}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithMaxIterations(2))
+
+	result, err := rlm.Complete(context.Background(), "test context", "What is the answer?")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+
+	if result.Response != "42" {
+		t.Errorf("Response = %q, want %q", result.Response, "42")
+	}
+}
+
+func TestCompleteStopsAfterFirstCodeFinal(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{
+				Content: "```go\nFINAL(\"first\")\n```\n```go\nFINAL(\"second\")\n```",
+			}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithMaxIterations(2))
+
+	result, err := rlm.Complete(context.Background(), "test context", "What is the answer?")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+
+	if result.Response != "first" {
+		t.Errorf("Response = %q, want %q", result.Response, "first")
+	}
+}
+
 func TestCompleteMultipleIterations(t *testing.T) {
 	callCount := 0
 	client := &mockLLMClient{
@@ -1996,6 +2072,31 @@ func TestCompleteWithSandboxAndCodeExecution(t *testing.T) {
 	}
 	if result.Iterations != 2 {
 		t.Errorf("Iterations = %d, want 2", result.Iterations)
+	}
+}
+
+func TestCompleteWithSandboxLocalCodeFinal(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{
+				Content: "```go\nfmt.Println(\"FINAL(fake)\")\nanswer := 42\nFINAL(answer)\n```",
+			}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithSandboxBackend(sandbox.BackendLocal))
+
+	result, err := rlm.Complete(context.Background(), "test context", "What is the answer?")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+
+	if result.Response != "42" {
+		t.Errorf("Response = %q, want %q", result.Response, "42")
+	}
+	if result.Iterations != 1 {
+		t.Errorf("Iterations = %d, want 1", result.Iterations)
 	}
 }
 

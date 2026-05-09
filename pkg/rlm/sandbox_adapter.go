@@ -97,6 +97,26 @@ func (a *REPLAdapter) ContextInfo() string {
 	return a.repl.ContextInfo()
 }
 
+// HasFinal reports whether executed code called FINAL or FINAL_VAR.
+func (a *REPLAdapter) HasFinal() bool {
+	return a.repl.HasFinal()
+}
+
+// Final returns the value supplied to FINAL or FINAL_VAR.
+func (a *REPLAdapter) Final() (string, bool) {
+	return a.repl.Final()
+}
+
+// ClearFinal clears any previous FINAL/FINAL_VAR signal.
+func (a *REPLAdapter) ClearFinal() {
+	a.repl.ClearFinal()
+}
+
+// SupportsFinalState reports whether this adapter provides out-of-band FINAL state.
+func (a *REPLAdapter) SupportsFinalState() bool {
+	return true
+}
+
 // Close releases resources.
 func (a *REPLAdapter) Close() {
 	a.repl.Close()
@@ -157,6 +177,37 @@ func (a *SandboxAdapter) GetLocals() map[string]any {
 // ContextInfo returns metadata about the loaded context.
 func (a *SandboxAdapter) ContextInfo() string {
 	return a.executor.ContextInfo()
+}
+
+// HasFinal reports whether the sandbox backend recorded a FINAL/FINAL_VAR call.
+func (a *SandboxAdapter) HasFinal() bool {
+	finalEnv, ok := a.executor.(interface{ HasFinal() bool })
+	return ok && finalEnv.HasFinal()
+}
+
+// Final returns the value supplied to FINAL or FINAL_VAR when the backend supports it.
+func (a *SandboxAdapter) Final() (string, bool) {
+	finalEnv, ok := a.executor.(interface{ Final() (string, bool) })
+	if !ok {
+		return "", false
+	}
+	return finalEnv.Final()
+}
+
+// ClearFinal clears any previous FINAL/FINAL_VAR signal when the backend supports it.
+func (a *SandboxAdapter) ClearFinal() {
+	if finalEnv, ok := a.executor.(interface{ ClearFinal() }); ok {
+		finalEnv.ClearFinal()
+	}
+}
+
+// SupportsFinalState reports whether the selected sandbox backend provides
+// out-of-band FINAL state instead of relying on stdout markers.
+func (a *SandboxAdapter) SupportsFinalState() bool {
+	_, hasFinal := a.executor.(interface{ HasFinal() bool })
+	_, hasValue := a.executor.(interface{ Final() (string, bool) })
+	_, hasClear := a.executor.(interface{ ClearFinal() })
+	return hasFinal && hasValue && hasClear
 }
 
 // Close releases resources.

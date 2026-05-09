@@ -160,6 +160,56 @@ func TestExecuteWithSyntaxError(t *testing.T) {
 	}
 }
 
+func TestFinalState(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+
+	if repl.HasFinal() {
+		t.Fatal("new REPL should not have final state")
+	}
+
+	result, err := repl.Execute(context.Background(), `answer := "code final"
+FINAL(answer)`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "FINAL(code final)") {
+		t.Fatalf("stdout = %q, want FINAL marker", result.Stdout)
+	}
+
+	final, ok := repl.Final()
+	if !ok {
+		t.Fatal("expected final state")
+	}
+	if final != "code final" {
+		t.Fatalf("Final() = %q, want %q", final, "code final")
+	}
+
+	repl.ClearFinal()
+	if repl.HasFinal() {
+		t.Fatal("ClearFinal() did not clear final state")
+	}
+}
+
+func TestFinalStateNonStringValue(t *testing.T) {
+	client := newMockClient()
+	repl := New(client)
+
+	_, err := repl.Execute(context.Background(), `answer := 42
+FINAL(answer)`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	final, ok := repl.Final()
+	if !ok {
+		t.Fatal("expected final state")
+	}
+	if final != "42" {
+		t.Fatalf("Final() = %q, want %q", final, "42")
+	}
+}
+
 func TestLoadContextString(t *testing.T) {
 	client := newMockClient()
 	repl := New(client)

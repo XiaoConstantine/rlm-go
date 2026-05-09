@@ -88,6 +88,19 @@ func TestLocalExecutorBasic(t *testing.T) {
 	if exec.Backend() != BackendLocal {
 		t.Errorf("Expected BackendLocal, got %s", exec.Backend())
 	}
+
+	type finalState interface {
+		HasFinal() bool
+		Final() (string, bool)
+		ClearFinal()
+	}
+	finalEnv, ok := any(exec).(finalState)
+	if !ok {
+		t.Fatal("LocalExecutor should expose FINAL state")
+	}
+	if finalEnv.HasFinal() {
+		t.Fatal("new LocalExecutor should not have final state")
+	}
 }
 
 func TestLocalExecutorWithContext(t *testing.T) {

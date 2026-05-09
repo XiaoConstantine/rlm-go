@@ -121,6 +121,9 @@ type REPL struct {
 	llmCalls      []LLMCall // Track LLM calls made during execution
 	asyncQueries  map[string]*AsyncQueryHandle
 	asyncMu       sync.RWMutex
+	finalMu       sync.RWMutex
+	finalSet      bool
+	finalValue    string
 	execCount     int  // Track number of executions for health monitoring
 	needsReset    bool // Flag indicating interpreter corruption detected
 	injectedNames map[string]struct{}
@@ -184,6 +187,7 @@ func (r *REPL) Close() {
 	r.stdout.Reset()
 	r.stderr.Reset()
 	r.llmCalls = nil
+	r.clearFinalLocked()
 
 	// Clean up async queries
 	r.asyncMu.Lock()
@@ -204,6 +208,7 @@ func (r *REPL) resetState() {
 	r.stdout.Reset()
 	r.stderr.Reset()
 	r.llmCalls = nil
+	r.clearFinalLocked()
 
 	// Clean up async queries during reset
 	r.asyncMu.Lock()
@@ -495,20 +500,63 @@ func (r *REPL) asyncResult(handleID string) string {
 // finalAnswer handles FINAL(value) calls from within code blocks.
 // It prints a special marker that the RLM parser can detect.
 // This allows LLMs to signal completion from inside code, which is more natural.
-func (r *REPL) finalAnswer(value string) string {
+func (r *REPL) finalAnswer(value any) string {
+	finalValue := fmt.Sprint(value)
+	r.setFinal(finalValue)
 	// Print to stdout so it appears in the output and can be parsed
-	fmt.Fprintf(r.stdout, "\nFINAL(%s)\n", value)
-	return value
+	fmt.Fprintf(r.stdout, "\nFINAL(%s)\n", finalValue)
+	return finalValue
 }
 
 // finalVarAnswer handles FINAL_VAR(varName) calls from within code blocks.
 // The varName is treated as the value directly (the variable was already evaluated by Go).
 // This is called when LLM writes FINAL_VAR(answer) where answer is a Go variable.
-func (r *REPL) finalVarAnswer(value string) string {
+func (r *REPL) finalVarAnswer(value any) string {
+	finalValue := fmt.Sprint(value)
+	r.setFinal(finalValue)
 	// The value parameter IS the resolved variable value (Go already evaluated it)
 	// Print to stdout so it appears in the output and can be parsed
-	fmt.Fprintf(r.stdout, "\nFINAL(%s)\n", value)
-	return value
+	fmt.Fprintf(r.stdout, "\nFINAL(%s)\n", finalValue)
+	return finalValue
+}
+
+func (r *REPL) setFinal(value string) {
+	r.finalMu.Lock()
+	defer r.finalMu.Unlock()
+	if r.finalSet {
+		return
+	}
+	r.finalSet = true
+	r.finalValue = value
+}
+
+func (r *REPL) clearFinalLocked() {
+	r.finalMu.Lock()
+	defer r.finalMu.Unlock()
+	r.finalSet = false
+	r.finalValue = ""
+}
+
+// HasFinal reports whether executed code called FINAL or FINAL_VAR.
+func (r *REPL) HasFinal() bool {
+	r.finalMu.RLock()
+	defer r.finalMu.RUnlock()
+	return r.finalSet
+}
+
+// Final returns the value provided to FINAL or FINAL_VAR.
+func (r *REPL) Final() (string, bool) {
+	r.finalMu.RLock()
+	defer r.finalMu.RUnlock()
+	if !r.finalSet {
+		return "", false
+	}
+	return r.finalValue, true
+}
+
+// ClearFinal clears any previous FINAL/FINAL_VAR signal.
+func (r *REPL) ClearFinal() {
+	r.clearFinalLocked()
 }
 
 // QueryAsync starts an async query and returns a handle.
@@ -749,6 +797,7 @@ func (r *REPL) Reset() error {
 	r.llmCalls = nil
 	r.execCount = 0
 	r.needsReset = false
+	r.clearFinalLocked()
 
 	// Create a fresh interpreter
 	i := interp.New(interp.Options{

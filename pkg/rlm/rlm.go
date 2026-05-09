@@ -759,6 +759,38 @@ func (r *RLM) shouldTerminateEarly(confidenceSignals, pendingCodeBlocks int) boo
 	return confidenceSignals >= r.config.AdaptiveIteration.ConfidenceThreshold
 }
 
+type finalStateEnvironment interface {
+	HasFinal() bool
+	Final() (string, bool)
+	ClearFinal()
+}
+
+type finalStateSupporter interface {
+	SupportsFinalState() bool
+}
+
+func clearFinalState(execEnv any) {
+	if finalEnv, ok := execEnv.(finalStateEnvironment); ok {
+		finalEnv.ClearFinal()
+	}
+}
+
+func getFinalState(execEnv any) (string, bool) {
+	finalEnv, ok := execEnv.(finalStateEnvironment)
+	if !ok || !finalEnv.HasFinal() {
+		return "", false
+	}
+	return finalEnv.Final()
+}
+
+func supportsFinalState(execEnv any) bool {
+	if supporter, ok := execEnv.(finalStateSupporter); ok {
+		return supporter.SupportsFinalState()
+	}
+	_, ok := execEnv.(finalStateEnvironment)
+	return ok
+}
+
 // Complete runs an RLM completion.
 // contextPayload is the context data (string, map, or slice).
 // query is the user's question.
@@ -847,6 +879,7 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 
 		// Extract and execute code blocks
 		codeBlocks := parsing.FindCodeBlocks(response)
+		clearFinalState(execEnv)
 		execResult := r.executeCodeBlocks(ctx, execEnv, codeBlocks, contextPayload)
 
 		// Get LLM calls made during code execution and aggregate tokens
@@ -865,6 +898,29 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 		if detectConfidence(response) {
 			state.confidenceSignals++
 			r.logf("Confidence signal detected (total: %d)", state.confidenceSignals)
+		}
+
+		// Prefer explicit REPL completion state set by FINAL/FINAL_VAR calls in code.
+		if finalValue, ok := getFinalState(execEnv); ok {
+			r.logf("Found FINAL state: %s", truncate(finalValue, truncateLenPreview))
+
+			if r.config.Logger != nil {
+				_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResult.execResults, rlmCalls, locals, finalValue, time.Since(iterStart))
+			}
+			return state.buildResult(finalValue, i+1), nil
+		}
+
+		// Fall back to output parsing only for environments without out-of-band final state.
+		if !supportsFinalState(execEnv) {
+			if final := parsing.FindFinalAnswer(execResult.allOutput.String()); final != nil {
+				resultResponse := final.Content
+				r.logf("Found FINAL in execution output: %s", truncate(resultResponse, truncateLenPreview))
+
+				if r.config.Logger != nil {
+					_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResult.execResults, rlmCalls, locals, resultResponse, time.Since(iterStart))
+				}
+				return state.buildResult(resultResponse, i+1), nil
+			}
 		}
 
 		// Check for final answer - BUT only if there were NO code blocks in this response.
@@ -1301,6 +1357,7 @@ func (r *RLM) CompleteWithRecursion(
 
 		codeBlocks := parsing.FindCodeBlocks(response)
 		var execResults []core.CodeBlock
+		clearFinalState(replEnv)
 		for _, code := range codeBlocks {
 			r.logf("Executing code:\n%s", truncate(code, 200))
 			result, _ := replEnv.Execute(ctx, code)
@@ -1313,6 +1370,12 @@ func (r *RLM) CompleteWithRecursion(
 			}
 			if result.Stderr != "" {
 				r.logf("Stderr: %s", truncate(result.Stderr, 200))
+			}
+			if _, ok := getFinalState(replEnv); ok {
+				break
+			}
+			if !supportsFinalState(replEnv) && parsing.FindFinalAnswer(sandbox.FormatExecutionResult(result)) != nil {
+				break
 			}
 		}
 
@@ -1335,14 +1398,38 @@ func (r *RLM) CompleteWithRecursion(
 			return nil, err
 		}
 
-		if r.config.Logger != nil {
-			locals := replEnv.GetLocals()
-			_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, locals, nil, time.Since(iterStart))
-		}
+		locals := map[string]any(nil)
 
 		if detectConfidence(response) {
 			state.confidenceSignals++
 			r.logf("Confidence signal detected (total: %d)", state.confidenceSignals)
+		}
+
+		if finalValue, ok := getFinalState(replEnv); ok {
+			r.logf("Found FINAL state: %s", truncate(finalValue, truncateLenPreview))
+			if r.config.Logger != nil {
+				if locals == nil {
+					locals = replEnv.GetLocals()
+				}
+				_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, locals, finalValue, time.Since(iterStart))
+			}
+			return state.buildResult(finalValue, i+1), nil
+		}
+
+		if !supportsFinalState(replEnv) {
+			for _, block := range execResults {
+				if final := parsing.FindFinalAnswer(sandbox.FormatExecutionResult(&block.Result)); final != nil {
+					resultResponse := final.Content
+					r.logf("Found FINAL in execution output: %s", truncate(resultResponse, truncateLenPreview))
+					if r.config.Logger != nil {
+						if locals == nil {
+							locals = replEnv.GetLocals()
+						}
+						_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, locals, resultResponse, time.Since(iterStart))
+					}
+					return state.buildResult(resultResponse, i+1), nil
+				}
+			}
 		}
 
 		if len(codeBlocks) == 0 && parsing.FindFinalAnswer(response) != nil {
@@ -1357,7 +1444,20 @@ func (r *RLM) CompleteWithRecursion(
 					varValue = resolved
 				}
 			}
+			if r.config.Logger != nil {
+				if locals == nil {
+					locals = replEnv.GetLocals()
+				}
+				_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, locals, varValue, time.Since(iterStart))
+			}
 			return state.buildResult(varValue, i+1), nil
+		}
+
+		if r.config.Logger != nil {
+			if locals == nil {
+				locals = replEnv.GetLocals()
+			}
+			_ = r.config.Logger.LogIteration(i+1, currentMessages, response, execResults, rlmCalls, locals, nil, time.Since(iterStart))
 		}
 
 		if r.shouldTerminateEarly(state.confidenceSignals, len(codeBlocks)) {
@@ -1561,6 +1661,12 @@ func (r *RLM) executeCodeBlocks(ctx context.Context, execEnv ExecutionEnvironmen
 			result.allOutput.WriteString("Error: ")
 			result.allOutput.WriteString(execResult.Stderr)
 			r.logf("Stderr: %s", truncate(execResult.Stderr, truncateLenShort))
+		}
+		if _, ok := getFinalState(execEnv); ok {
+			break
+		}
+		if !supportsFinalState(execEnv) && parsing.FindFinalAnswer(sandbox.FormatExecutionResult(execResult)) != nil {
+			break
 		}
 	}
 
@@ -1786,6 +1892,7 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 
 		// Extract and execute code blocks
 		codeBlocks := parsing.FindCodeBlocks(response)
+		clearFinalState(execEnv)
 		execResult := r.executeCodeBlocks(ctx, execEnv, codeBlocks, contextPayload)
 
 		// Get LLM calls made during code execution and aggregate tokens
@@ -1820,15 +1927,27 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 		// Check for final answer in BOTH the LLM response AND the execution output.
 		outputStr := execResult.allOutput.String()
 
-		// First check execution output for FINAL (from code-called FINAL/FINAL_VAR functions)
-		if final := parsing.FindFinalAnswer(outputStr); final != nil {
-			resultResponse := final.Content
-			r.logf("Found FINAL in execution output: %s", truncate(resultResponse, truncateLenPreview))
+		// First check explicit REPL completion state from code-called FINAL/FINAL_VAR functions.
+		if finalValue, ok := getFinalState(execEnv); ok {
+			r.logf("Found FINAL state: %s", truncate(finalValue, truncateLenPreview))
 
 			if r.config.Logger != nil {
-				_ = r.config.Logger.LogIteration(i+1, messages, response, execResult.execResults, rlmCalls, locals, resultResponse, time.Since(iterStart))
+				_ = r.config.Logger.LogIteration(i+1, messages, response, execResult.execResults, rlmCalls, locals, finalValue, time.Since(iterStart))
 			}
-			return state.buildResult(resultResponse, i+1), nil
+			return state.buildResult(finalValue, i+1), nil
+		}
+
+		// Then check execution output for FINAL as a sandbox/legacy fallback.
+		if !supportsFinalState(execEnv) {
+			if final := parsing.FindFinalAnswer(outputStr); final != nil {
+				resultResponse := final.Content
+				r.logf("Found FINAL in execution output: %s", truncate(resultResponse, truncateLenPreview))
+
+				if r.config.Logger != nil {
+					_ = r.config.Logger.LogIteration(i+1, messages, response, execResult.execResults, rlmCalls, locals, resultResponse, time.Since(iterStart))
+				}
+				return state.buildResult(resultResponse, i+1), nil
+			}
 		}
 
 		// Then check LLM response (only if no code blocks)

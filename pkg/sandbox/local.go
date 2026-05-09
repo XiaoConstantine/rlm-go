@@ -19,14 +19,17 @@ import (
 // LocalExecutor provides in-process code execution using Yaegi.
 // This is the fastest option but has the least isolation.
 type LocalExecutor struct {
-	interp    *interp.Interpreter
-	stdout    *bytes.Buffer
-	stderr    *bytes.Buffer
-	client    LLMClient
-	ctx       context.Context
-	mu        sync.Mutex
-	llmCalls  []LLMCall
-	config    Config
+	interp   *interp.Interpreter
+	stdout   *bytes.Buffer
+	stderr   *bytes.Buffer
+	client   LLMClient
+	ctx      context.Context
+	mu       sync.Mutex
+	llmCalls []LLMCall
+	finalMu  sync.RWMutex
+	finalSet bool
+	finalVal string
+	config   Config
 }
 
 // NewLocalExecutor creates a new local executor using Yaegi.
@@ -45,12 +48,12 @@ func NewLocalExecutor(client LLMClient, cfg Config) (*LocalExecutor, error) {
 	}
 
 	exec := &LocalExecutor{
-		interp:   i,
-		stdout:   stdout,
-		stderr:   stderr,
-		client:   client,
-		ctx:      context.Background(),
-		config:   cfg,
+		interp: i,
+		stdout: stdout,
+		stderr: stderr,
+		client: client,
+		ctx:    context.Background(),
+		config: cfg,
 	}
 
 	// Inject RLM functions
@@ -67,6 +70,8 @@ func (e *LocalExecutor) injectBuiltins() error {
 		"rlm/rlm": {
 			"Query":        reflect.ValueOf(e.llmQuery),
 			"QueryBatched": reflect.ValueOf(e.llmQueryBatched),
+			"FINAL":        reflect.ValueOf(e.finalAnswer),
+			"FINAL_VAR":    reflect.ValueOf(e.finalVarAnswer),
 		},
 	}
 
@@ -142,6 +147,55 @@ func (e *LocalExecutor) llmQueryBatched(prompts []string) []string {
 	return responses
 }
 
+func (e *LocalExecutor) finalAnswer(value any) string {
+	finalValue := fmt.Sprint(value)
+	e.setFinal(finalValue)
+	fmt.Fprintf(e.stdout, "\nFINAL(%s)\n", finalValue)
+	return finalValue
+}
+
+func (e *LocalExecutor) finalVarAnswer(value any) string {
+	finalValue := fmt.Sprint(value)
+	e.setFinal(finalValue)
+	fmt.Fprintf(e.stdout, "\nFINAL(%s)\n", finalValue)
+	return finalValue
+}
+
+func (e *LocalExecutor) setFinal(value string) {
+	e.finalMu.Lock()
+	defer e.finalMu.Unlock()
+	if e.finalSet {
+		return
+	}
+	e.finalSet = true
+	e.finalVal = value
+}
+
+// HasFinal reports whether executed code called FINAL or FINAL_VAR.
+func (e *LocalExecutor) HasFinal() bool {
+	e.finalMu.RLock()
+	defer e.finalMu.RUnlock()
+	return e.finalSet
+}
+
+// Final returns the value supplied to FINAL or FINAL_VAR.
+func (e *LocalExecutor) Final() (string, bool) {
+	e.finalMu.RLock()
+	defer e.finalMu.RUnlock()
+	if !e.finalSet {
+		return "", false
+	}
+	return e.finalVal, true
+}
+
+// ClearFinal clears any previous FINAL/FINAL_VAR signal.
+func (e *LocalExecutor) ClearFinal() {
+	e.finalMu.Lock()
+	defer e.finalMu.Unlock()
+	e.finalSet = false
+	e.finalVal = ""
+}
+
 // Execute runs Go code and returns the result.
 func (e *LocalExecutor) Execute(ctx context.Context, code string) (*core.ExecutionResult, error) {
 	e.mu.Lock()
@@ -149,37 +203,25 @@ func (e *LocalExecutor) Execute(ctx context.Context, code string) (*core.Executi
 	e.stdout.Reset()
 	e.stderr.Reset()
 	e.mu.Unlock()
+	e.ClearFinal()
 
 	start := time.Now()
 
-	// Create a channel for the result
-	done := make(chan struct{})
-	var evalErr error
-
-	go func() {
-		_, evalErr = e.interp.Eval(code)
-		close(done)
-	}()
-
-	// Wait for completion or timeout
-	timeout := e.config.Timeout
-	if timeout == 0 {
-		timeout = 60 * time.Second
-	}
-
 	select {
-	case <-done:
-		// Execution completed
-	case <-time.After(timeout):
-		return &core.ExecutionResult{
-			Stderr:   "execution timeout exceeded",
-			Duration: time.Since(start),
-		}, nil
 	case <-ctx.Done():
 		return &core.ExecutionResult{
 			Stderr:   "execution cancelled",
 			Duration: time.Since(start),
 		}, ctx.Err()
+	default:
+	}
+
+	var evalErr error
+	_, evalErr = e.interp.Eval(code)
+
+	timeout := e.config.Timeout
+	if timeout == 0 {
+		timeout = 60 * time.Second
 	}
 
 	e.mu.Lock()
@@ -195,6 +237,19 @@ func (e *LocalExecutor) Execute(ctx context.Context, code string) (*core.Executi
 			result.Stderr += "\n"
 		}
 		result.Stderr += evalErr.Error()
+	}
+	if timeout > 0 && result.Duration > timeout {
+		if result.Stderr != "" {
+			result.Stderr += "\n"
+		}
+		result.Stderr += "execution timeout exceeded"
+	}
+	if ctx.Err() != nil {
+		if result.Stderr != "" {
+			result.Stderr += "\n"
+		}
+		result.Stderr += "execution cancelled"
+		return result, ctx.Err()
 	}
 
 	return result, nil
@@ -313,6 +368,7 @@ func (e *LocalExecutor) Reset() error {
 	e.stdout.Reset()
 	e.stderr.Reset()
 	e.llmCalls = nil
+	e.ClearFinal()
 
 	// Create a fresh interpreter
 	i := interp.New(interp.Options{
@@ -337,6 +393,7 @@ func (e *LocalExecutor) Close() error {
 	e.stdout.Reset()
 	e.stderr.Reset()
 	e.llmCalls = nil
+	e.ClearFinal()
 
 	return nil
 }
