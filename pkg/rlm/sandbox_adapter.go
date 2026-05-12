@@ -252,7 +252,7 @@ func (r *RLM) createExecutionEnvironment() (ExecutionEnvironment, error) {
 			cfg = *r.config.Sandbox.Config
 		}
 		cfg.Verbose = r.config.Verbose
-		if r.config.MaxFullContextQueryChars > 0 {
+		if r.config.maxFullContextQueryCharsSet || !r.config.Sandbox.configFromUser {
 			cfg.MaxFullContextQueryChars = r.config.MaxFullContextQueryChars
 		}
 

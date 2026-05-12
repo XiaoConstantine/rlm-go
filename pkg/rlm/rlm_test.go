@@ -134,6 +134,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.MaxIterations != 30 {
 		t.Errorf("MaxIterations = %d, want 30", cfg.MaxIterations)
 	}
+	if cfg.MaxFullContextQueryChars != DefaultMaxFullContextQueryChars {
+		t.Errorf("MaxFullContextQueryChars = %d, want %d", cfg.MaxFullContextQueryChars, DefaultMaxFullContextQueryChars)
+	}
 	if cfg.SystemPrompt != SystemPrompt {
 		t.Error("SystemPrompt should equal SystemPrompt constant")
 	}
@@ -2005,6 +2008,98 @@ func TestWithSandboxConfig(t *testing.T) {
 	}
 }
 
+
+func TestWithSandboxConfigPreservesUserMaxFullContextQueryChars(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	cfg := sandbox.DefaultConfig()
+	cfg.Backend = sandbox.BackendLocal
+	cfg.MaxFullContextQueryChars = 5
+
+	rlm := New(client, replClient, WithSandboxConfig(cfg))
+	env, err := rlm.createExecutionEnvironment()
+	if err != nil {
+		t.Fatalf("createExecutionEnvironment() error: %v", err)
+	}
+	defer env.Close()
+
+	if err := env.LoadContext("large context"); err != nil {
+		t.Fatalf("LoadContext() error: %v", err)
+	}
+	result, err := env.Execute(context.Background(), `fmt.Println(Query("blocked"))`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "exceeding the limit of 5 chars") {
+		t.Fatalf("stdout = %q, want user sandbox guard limit", result.Stdout)
+	}
+}
+
+func TestWithSandboxConfigPreservesDisabledFullContextQueryGuard(t *testing.T) {
+	client := &mockLLMClient{}
+	var prompts []string
+	replClient := &mockREPLClient{
+		queryFunc: func(ctx context.Context, prompt string) (repl.QueryResponse, error) {
+			prompts = append(prompts, prompt)
+			return repl.QueryResponse{Response: "ok"}, nil
+		},
+	}
+
+	cfg := sandbox.DefaultConfig()
+	cfg.Backend = sandbox.BackendLocal
+	cfg.MaxFullContextQueryChars = 0
+
+	rlm := New(client, replClient, WithSandboxConfig(cfg))
+	env, err := rlm.createExecutionEnvironment()
+	if err != nil {
+		t.Fatalf("createExecutionEnvironment() error: %v", err)
+	}
+	defer env.Close()
+
+	largeContext := strings.Repeat("x", DefaultMaxFullContextQueryChars+1)
+	if err := env.LoadContext(largeContext); err != nil {
+		t.Fatalf("LoadContext() error: %v", err)
+	}
+	result, err := env.Execute(context.Background(), `fmt.Println(Query("allowed"))`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if strings.Contains(result.Stdout, "exceeding the limit") {
+		t.Fatalf("stdout = %q, did not want guardrail error", result.Stdout)
+	}
+	if len(prompts) != 1 {
+		t.Fatalf("prompts = %v, want 1 LLM call", prompts)
+	}
+}
+
+func TestWithMaxFullContextQueryCharsOverridesSandboxConfig(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	cfg := sandbox.DefaultConfig()
+	cfg.Backend = sandbox.BackendLocal
+	cfg.MaxFullContextQueryChars = 0
+
+	rlm := New(client, replClient, WithSandboxConfig(cfg), WithMaxFullContextQueryChars(5))
+	env, err := rlm.createExecutionEnvironment()
+	if err != nil {
+		t.Fatalf("createExecutionEnvironment() error: %v", err)
+	}
+	defer env.Close()
+
+	if err := env.LoadContext("large context"); err != nil {
+		t.Fatalf("LoadContext() error: %v", err)
+	}
+	result, err := env.Execute(context.Background(), `fmt.Println(Query("blocked"))`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "exceeding the limit of 5 chars") {
+		t.Fatalf("stdout = %q, want explicit RLM guard override", result.Stdout)
+	}
+}
+
 func TestWithSandboxBackend(t *testing.T) {
 	client := &mockLLMClient{}
 	replClient := &mockREPLClient{}
@@ -2159,6 +2254,76 @@ func TestCreateExecutionEnvironmentWithSandboxMaxFullContextQueryChars(t *testin
 	}
 	if calls[0].Prompt != "blocked" || !strings.Contains(calls[0].Response, "exceeding the limit") {
 		t.Fatalf("blocked call = %+v", calls[0])
+	}
+}
+
+
+func TestCreateExecutionEnvironmentDefaultsBlockLargeFullContextQuery(t *testing.T) {
+	client := &mockLLMClient{}
+	var prompts []string
+	replClient := &mockREPLClient{
+		queryFunc: func(ctx context.Context, prompt string) (repl.QueryResponse, error) {
+			prompts = append(prompts, prompt)
+			return repl.QueryResponse{Response: "ok"}, nil
+		},
+	}
+
+	rlm := New(client, replClient)
+	env, err := rlm.createExecutionEnvironment()
+	if err != nil {
+		t.Fatalf("createExecutionEnvironment() error: %v", err)
+	}
+	defer env.Close()
+
+	largeContext := strings.Repeat("x", DefaultMaxFullContextQueryChars+1)
+	if err := env.LoadContext(largeContext); err != nil {
+		t.Fatalf("LoadContext() error: %v", err)
+	}
+	result, err := env.Execute(context.Background(), `fmt.Println(Query("blocked"))`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "exceeding the limit") {
+		t.Fatalf("stdout = %q, want guardrail error", result.Stdout)
+	}
+	if len(prompts) != 0 {
+		t.Fatalf("prompts = %v, want no LLM calls", prompts)
+	}
+}
+
+func TestCreateExecutionEnvironmentCanDisableFullContextQueryGuard(t *testing.T) {
+	client := &mockLLMClient{}
+	var prompts []string
+	replClient := &mockREPLClient{
+		queryFunc: func(ctx context.Context, prompt string) (repl.QueryResponse, error) {
+			prompts = append(prompts, prompt)
+			return repl.QueryResponse{Response: "ok"}, nil
+		},
+	}
+
+	rlm := New(client, replClient, WithMaxFullContextQueryChars(0))
+	env, err := rlm.createExecutionEnvironment()
+	if err != nil {
+		t.Fatalf("createExecutionEnvironment() error: %v", err)
+	}
+	defer env.Close()
+
+	largeContext := strings.Repeat("x", DefaultMaxFullContextQueryChars+1)
+	if err := env.LoadContext(largeContext); err != nil {
+		t.Fatalf("LoadContext() error: %v", err)
+	}
+	result, err := env.Execute(context.Background(), `fmt.Println(Query("allowed"))`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if strings.Contains(result.Stdout, "exceeding the limit") {
+		t.Fatalf("stdout = %q, did not want guardrail error", result.Stdout)
+	}
+	if len(prompts) != 1 {
+		t.Fatalf("prompts = %v, want 1 LLM call", prompts)
+	}
+	if !strings.Contains(prompts[0], largeContext[:100]) {
+		t.Fatalf("prompt does not include loaded context")
 	}
 }
 

@@ -220,8 +220,10 @@ See [examples/basic](examples/basic/main.go) for a complete Anthropic client imp
 fmt, strings, regexp
 
 // RLM functions
-Query(prompt string) string              // Single sub-LLM call
-QueryBatched(prompts []string) []string  // Concurrent sub-LLM calls
+Query(prompt string) string              // Single sub-LLM call; prepends full context only below guardrail
+QueryWith(contextSlice, prompt string) string
+QueryRaw(prompt string) string
+QueryBatched(prompts []string) []string  // Concurrent sub-LLM calls; same full-context guardrail
 
 // Multi-depth recursion (when enabled)
 QueryWithRLM(prompt string, depth int) string                          // Spawn nested RLM over current context
@@ -267,6 +269,7 @@ rlm.New(client, replClient,
     rlm.WithSystemPrompt(custom),   // Override system prompt
     rlm.WithVerbose(true),          // Enable console logging
     rlm.WithLogger(logger),         // Attach JSONL logger for session recording
+    rlm.WithMaxFullContextQueryChars(200000), // Guard full-context Query() calls; use 0 to disable
 )
 ```
 

@@ -141,7 +141,7 @@ IMPORTANT: PREFER Query() OVER MANUAL PARSING. Do NOT write complex string parsi
 
 The REPL environment is initialized with:
 1. A "context" variable (string) containing the data to analyze. ALWAYS explore this first.
-2. A "Query(prompt string) string" function to query a sub-LLM with the full context automatically prepended.
+2. A "Query(prompt string) string" function to query a sub-LLM with the full context automatically prepended only when the loaded context is below the full-context guardrail.
 3. A "QueryRaw(prompt string) string" function to query a sub-LLM with exactly the prompt you provide.
 4. A "QueryWith(contextSlice, prompt string) string" function to query a sub-LLM with only a selected context slice.
 5. "QueryBatched" and "QueryBatchedRaw" functions for concurrent queries.
@@ -163,9 +163,9 @@ Sub-LLM Capacity & Efficiency:
 - BATCH ~200K characters per Query call for optimal efficiency
 - MINIMIZE the number of Query() calls by batching information together
 - Do NOT make separate Query() calls for each line/item - batch them!
-- Query() and QueryBatched() automatically include the full context. If you manually include a context slice in the prompt, use QueryRaw() or QueryBatchedRaw(), or use QueryWith(slice, prompt).
+- Query() and QueryBatched() automatically include the full context only for contexts below the guardrail. For large contexts, use QueryWith(slice, prompt), QueryRaw(), or QueryBatchedRaw().
 
-IMPORTANT: REPL outputs are truncated. Use Query() to analyze full content rather than printing large outputs.
+IMPORTANT: REPL outputs are truncated. Use selected context slices and QueryWith() to analyze full content rather than printing large outputs.
 Make sure to explicitly look through the entire context before answering.
 
 Write Go code in markdown blocks with the "go" language tag.
@@ -249,7 +249,7 @@ RULES:
 // UserPromptTemplate is the template for user prompts in each iteration.
 // The first %s is context metadata (type, size), second %s is the query.
 const UserPromptTemplate = `Context: %s
-(The context is available in the 'context' variable. Use Query() to analyze it - do NOT try to parse it manually.)
+(The context is available in the 'context' variable. For large contexts, select slices and use QueryWith(slice, prompt) or QueryBatchedRaw; do NOT dump the full context into prompts.)
 
 Query: %s`
 
@@ -259,7 +259,7 @@ const FirstIterationSuffix = `
 You have not explored the context yet. Your first action should be to write Go code to:
 1. Check the context size: fmt.Println(len(context))
 2. Preview the content: fmt.Println(context[:min(1000, len(context))])
-3. Use Query() to analyze it
+3. Use QueryWith() over a selected slice, or QueryRaw() with a prompt that already includes the selected data
 
 Write your code now in a go code block:`
 
@@ -292,7 +292,7 @@ IMPORTANT: PREFER Query() OVER MANUAL PARSING. Do NOT write complex string parsi
 
 The REPL environment is initialized with:
 1. A "context" variable (string) containing the data to analyze. ALWAYS explore this first.
-2. A "Query(prompt string) string" function to query a sub-LLM.
+2. A "Query(prompt string) string" function to query a sub-LLM with the full context automatically prepended only when the loaded context is below the full-context guardrail.
 3. A "QueryRaw(prompt string) string" function to query a sub-LLM with exactly the prompt you provide.
 4. A "QueryWith(contextSlice, prompt string) string" function to query a sub-LLM with only a selected context slice.
 5. "QueryBatched" and "QueryBatchedRaw" functions for concurrent queries.
@@ -317,7 +317,7 @@ Sub-LLM Capacity & Efficiency:
 - BATCH ~200K characters per Query call for optimal efficiency
 - MINIMIZE the number of Query() calls by batching information together
 - Do NOT make separate Query() calls for each line/item - batch them!
-- In the standard REPL, Query() and QueryBatched() automatically include the full context. If you manually include a context slice in the prompt, use QueryRaw(), QueryBatchedRaw(), or QueryWith(slice, prompt).
+- In the standard REPL, Query() and QueryBatched() automatically include the full context only for contexts below the guardrail. If you manually include a context slice in the prompt, use QueryRaw(), QueryBatchedRaw(), or QueryWith(slice, prompt).
 
 RECURSIVE RLM CAPABILITIES:
 - QueryWithRLM spawns a nested RLM that can execute code and query sub-LLMs over the current context

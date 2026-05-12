@@ -103,6 +103,8 @@ type Config struct {
 	// Disabled when <= 0. Use QueryWith or QueryRaw for large contexts.
 	MaxFullContextQueryChars int
 
+	maxFullContextQueryCharsSet bool
+
 	// Recursion configures multi-depth recursion behavior.
 	// When enabled, sub-LLMs can spawn their own sub-LLMs.
 	Recursion *RecursionConfig
@@ -125,6 +127,8 @@ type SandboxConfig struct {
 	// Config contains the detailed sandbox configuration.
 	// If nil when Enabled is true, DefaultConfig() is used.
 	Config *sandbox.Config
+
+	configFromUser bool
 }
 
 // HistoryCompressionConfig configures how message history is compressed.
@@ -221,11 +225,18 @@ type IterationProgress struct {
 	RootPromptTokens int
 }
 
+const (
+	// DefaultMaxFullContextQueryChars is the default guardrail for Query and
+	// QueryBatched calls that would prepend the entire loaded context.
+	DefaultMaxFullContextQueryChars = 200000
+)
+
 // DefaultConfig returns the default RLM configuration.
 func DefaultConfig() Config {
 	return Config{
-		MaxIterations: 30,
-		SystemPrompt:  SystemPrompt,
+		MaxIterations:            30,
+		MaxFullContextQueryChars: DefaultMaxFullContextQueryChars,
+		SystemPrompt:             SystemPrompt,
 	}
 }
 
@@ -602,6 +613,7 @@ func WithMaxFullContextQueryChars(max int) Option {
 			max = 0
 		}
 		c.MaxFullContextQueryChars = max
+		c.maxFullContextQueryCharsSet = true
 	}
 }
 
@@ -656,8 +668,9 @@ func WithSandbox() Option {
 func WithSandboxConfig(cfg sandbox.Config) Option {
 	return func(c *Config) {
 		c.Sandbox = &SandboxConfig{
-			Enabled: true,
-			Config:  &cfg,
+			Enabled:        true,
+			Config:         &cfg,
+			configFromUser: true,
 		}
 	}
 }
