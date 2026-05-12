@@ -13,20 +13,28 @@ import (
 
 // mockRecursiveLLMClient implements RecursiveLLMClient for testing
 type mockRecursiveLLMClient struct {
-	mu                sync.Mutex
-	queryFunc         func(ctx context.Context, prompt string) (QueryResponse, error)
-	batchFunc         func(ctx context.Context, prompts []string) ([]QueryResponse, error)
-	queryWithRLMFunc  func(ctx context.Context, prompt string, depth int) (QueryResponse, error)
-	currentDepthValue int
-	maxDepthValue     int
-	queryCalls        []string
-	batchCalls        [][]string
-	recursiveCalls    []recursiveCallRecord
+	mu                    sync.Mutex
+	queryFunc             func(ctx context.Context, prompt string) (QueryResponse, error)
+	batchFunc             func(ctx context.Context, prompts []string) ([]QueryResponse, error)
+	queryWithRLMFunc      func(ctx context.Context, prompt string, depth int) (QueryResponse, error)
+	queryWithContextFunc  func(ctx context.Context, contextSlice, query string, depth int) (QueryResponse, error)
+	currentDepthValue     int
+	maxDepthValue         int
+	queryCalls            []string
+	batchCalls            [][]string
+	recursiveCalls        []recursiveCallRecord
+	recursiveContextCalls []recursiveContextCallRecord
 }
 
 type recursiveCallRecord struct {
 	prompt string
 	depth  int
+}
+
+type recursiveContextCallRecord struct {
+	contextSlice string
+	query        string
+	depth        int
 }
 
 func newMockRecursiveClient() *mockRecursiveLLMClient {
@@ -48,6 +56,13 @@ func newMockRecursiveClient() *mockRecursiveLLMClient {
 				Response:         fmt.Sprintf("recursive response at depth %d: %s", depth, prompt),
 				PromptTokens:     20,
 				CompletionTokens: 10,
+			}, nil
+		},
+		queryWithContextFunc: func(ctx context.Context, contextSlice, query string, depth int) (QueryResponse, error) {
+			return QueryResponse{
+				Response:         fmt.Sprintf("recursive response at depth %d over %s: %s", depth, contextSlice, query),
+				PromptTokens:     22,
+				CompletionTokens: 11,
 			}, nil
 		},
 	}
@@ -72,6 +87,17 @@ func (m *mockRecursiveLLMClient) QueryWithRLM(ctx context.Context, prompt string
 	m.recursiveCalls = append(m.recursiveCalls, recursiveCallRecord{prompt: prompt, depth: depth})
 	m.mu.Unlock()
 	return m.queryWithRLMFunc(ctx, prompt, depth)
+}
+
+func (m *mockRecursiveLLMClient) QueryWithRLMContext(ctx context.Context, contextSlice, query string, depth int) (QueryResponse, error) {
+	m.mu.Lock()
+	m.recursiveContextCalls = append(m.recursiveContextCalls, recursiveContextCallRecord{
+		contextSlice: contextSlice,
+		query:        query,
+		depth:        depth,
+	})
+	m.mu.Unlock()
+	return m.queryWithContextFunc(ctx, contextSlice, query, depth)
 }
 
 func (m *mockRecursiveLLMClient) CurrentDepth() int {
@@ -403,6 +429,93 @@ fmt.Println(response)
 	}
 }
 
+func TestRecursiveREPL_QueryWithRLMContext(t *testing.T) {
+	client := newMockRecursiveClient()
+	client.currentDepthValue = 0
+	client.maxDepthValue = 3
+	recursionCtx := core.NewRecursionContext(3)
+	repl := NewRecursiveREPL(client, recursionCtx)
+
+	result, err := repl.Execute(context.Background(), `
+response := QueryWithRLMContext("section A", "summarize the section", 1)
+fmt.Println(response)
+`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if !strings.Contains(result.Stdout, "recursive response at depth 1 over section A: summarize the section") {
+		t.Fatalf("unexpected stdout: %q", result.Stdout)
+	}
+	if len(client.recursiveContextCalls) != 1 {
+		t.Fatalf("expected 1 context recursive call, got %d", len(client.recursiveContextCalls))
+	}
+	call := client.recursiveContextCalls[0]
+	if call.contextSlice != "section A" {
+		t.Fatalf("contextSlice = %q, want section A", call.contextSlice)
+	}
+	if call.query != "summarize the section" {
+		t.Fatalf("query = %q, want summarize the section", call.query)
+	}
+	if call.depth != 1 {
+		t.Fatalf("depth = %d, want 1", call.depth)
+	}
+
+	recursiveCalls := repl.GetRecursiveCalls()
+	if len(recursiveCalls) != 1 {
+		t.Fatalf("expected 1 tracked recursive call, got %d", len(recursiveCalls))
+	}
+	if recursiveCalls[0].Prompt != "summarize the section" {
+		t.Fatalf("tracked prompt = %q, want summarize the section", recursiveCalls[0].Prompt)
+	}
+	if recursiveCalls[0].PromptTokens != 22 {
+		t.Fatalf("tracked PromptTokens = %d, want 22", recursiveCalls[0].PromptTokens)
+	}
+}
+
+func TestRecursiveREPL_QueryWithRLMContextUsesExplicitEmptyContext(t *testing.T) {
+	client := newMockRecursiveClient()
+	recursionCtx := core.NewRecursionContext(3)
+	repl := NewRecursiveREPL(client, recursionCtx)
+
+	result, err := repl.Execute(context.Background(), `
+response := QueryWithRLMContext("", "summarize empty context", 1)
+fmt.Println(response)
+`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "recursive response at depth 1 over : summarize empty context") {
+		t.Fatalf("unexpected stdout: %q", result.Stdout)
+	}
+	if len(client.recursiveContextCalls) != 1 {
+		t.Fatalf("expected 1 context recursive call, got %d", len(client.recursiveContextCalls))
+	}
+	if client.recursiveContextCalls[0].contextSlice != "" {
+		t.Fatalf("contextSlice = %q, want empty string", client.recursiveContextCalls[0].contextSlice)
+	}
+}
+
+func TestRecursiveREPL_QueryWithRLMContextUnsupported(t *testing.T) {
+	client := &legacyRecursiveClient{maxDepthValue: 3}
+	recursionCtx := core.NewRecursionContext(3)
+	repl := NewRecursiveREPL(client, recursionCtx)
+
+	result, err := repl.Execute(context.Background(), `
+response := QueryWithRLMContext("section", "summarize", 1)
+fmt.Println(response)
+`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "QueryWithRLMContext is not supported") {
+		t.Fatalf("stdout = %q, want unsupported error", result.Stdout)
+	}
+	if client.recursiveCallCount != 0 {
+		t.Fatalf("recursiveCallCount = %d, want 0", client.recursiveCallCount)
+	}
+}
+
 func TestRecursiveREPL_QueryBatchedWithRLM(t *testing.T) {
 	client := newMockRecursiveClient()
 	client.currentDepthValue = 0
@@ -442,6 +555,89 @@ for i, r := range responses {
 	if len(recursiveCalls) != 3 {
 		t.Errorf("expected 3 tracked recursive calls, got %d", len(recursiveCalls))
 	}
+}
+
+func TestRecursiveREPL_QueryBatchedWithRLMContext(t *testing.T) {
+	client := newMockRecursiveClient()
+	client.currentDepthValue = 0
+	client.maxDepthValue = 3
+	recursionCtx := core.NewRecursionContext(3)
+	repl := NewRecursiveREPL(client, recursionCtx)
+
+	result, err := repl.Execute(context.Background(), `
+contexts := []string{"section A", "section B"}
+queries := []string{"summarize A", "summarize B"}
+responses := QueryBatchedWithRLMContext(contexts, queries, 1)
+for i, r := range responses {
+	fmt.Printf("Response %d: %s\n", i, r)
+}
+`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if !strings.Contains(result.Stdout, "section A: summarize A") {
+		t.Fatalf("missing section A response in stdout: %q", result.Stdout)
+	}
+	if !strings.Contains(result.Stdout, "section B: summarize B") {
+		t.Fatalf("missing section B response in stdout: %q", result.Stdout)
+	}
+	if len(client.recursiveContextCalls) != 2 {
+		t.Fatalf("expected 2 context recursive calls, got %d", len(client.recursiveContextCalls))
+	}
+}
+
+func TestRecursiveREPL_QueryBatchedWithRLMContextRejectsLengthMismatch(t *testing.T) {
+	client := newMockRecursiveClient()
+	recursionCtx := core.NewRecursionContext(3)
+	repl := NewRecursiveREPL(client, recursionCtx)
+
+	result, err := repl.Execute(context.Background(), `
+contexts := []string{"section A"}
+queries := []string{"summarize A", "summarize B"}
+responses := QueryBatchedWithRLMContext(contexts, queries, 1)
+fmt.Println(responses[0])
+`)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "does not match") {
+		t.Fatalf("stdout = %q, want length mismatch error", result.Stdout)
+	}
+	if len(client.recursiveContextCalls) != 0 {
+		t.Fatalf("recursiveContextCalls = %d, want 0", len(client.recursiveContextCalls))
+	}
+}
+
+type legacyRecursiveClient struct {
+	recursiveCallCount int
+	currentDepthValue  int
+	maxDepthValue      int
+}
+
+func (c *legacyRecursiveClient) Query(ctx context.Context, prompt string) (QueryResponse, error) {
+	return QueryResponse{Response: "query response"}, nil
+}
+
+func (c *legacyRecursiveClient) QueryBatched(ctx context.Context, prompts []string) ([]QueryResponse, error) {
+	results := make([]QueryResponse, len(prompts))
+	for i := range results {
+		results[i] = QueryResponse{Response: "query response"}
+	}
+	return results, nil
+}
+
+func (c *legacyRecursiveClient) QueryWithRLM(ctx context.Context, prompt string, depth int) (QueryResponse, error) {
+	c.recursiveCallCount++
+	return QueryResponse{Response: "recursive response"}, nil
+}
+
+func (c *legacyRecursiveClient) CurrentDepth() int {
+	return c.currentDepthValue
+}
+
+func (c *legacyRecursiveClient) MaxDepth() int {
+	return c.maxDepthValue
 }
 
 func TestRecursiveREPL_QueryWithRLMError(t *testing.T) {

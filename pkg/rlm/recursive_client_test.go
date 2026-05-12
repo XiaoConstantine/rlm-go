@@ -301,6 +301,54 @@ func TestRecursiveClientAdapter_QueryWithRLM_DepthExceeded(t *testing.T) {
 	}
 }
 
+func TestRecursiveClientAdapter_QueryWithRLMContextUsesContextSlice(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{
+				Content:          "```go\nFINAL(context)\n```",
+				PromptTokens:     20,
+				CompletionTokens: 10,
+			}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+	rlm := New(client, replClient, WithMaxRecursionDepth(2))
+	recursionCtx := core.NewRecursionContext(2)
+	adapter := NewRecursiveClientAdapter(rlm, recursionCtx, NewRecursiveTokenStats(), "parent context")
+
+	resp, err := adapter.QueryWithRLMContext(context.Background(), "slice context", "return the loaded context", 1)
+	if err != nil {
+		t.Fatalf("QueryWithRLMContext() error: %v", err)
+	}
+	if resp.Response != "slice context" {
+		t.Fatalf("Response = %q, want slice context", resp.Response)
+	}
+}
+
+func TestRecursiveClientAdapter_QueryWithRLMContextAllowsEmptyContext(t *testing.T) {
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			return core.LLMResponse{
+				Content:          "```go\nFINAL(context)\n```",
+				PromptTokens:     20,
+				CompletionTokens: 10,
+			}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+	rlm := New(client, replClient, WithMaxRecursionDepth(2))
+	recursionCtx := core.NewRecursionContext(2)
+	adapter := NewRecursiveClientAdapter(rlm, recursionCtx, NewRecursiveTokenStats(), "parent context")
+
+	resp, err := adapter.QueryWithRLMContext(context.Background(), "", "return the loaded context", 1)
+	if err != nil {
+		t.Fatalf("QueryWithRLMContext() error: %v", err)
+	}
+	if resp.Response != "" {
+		t.Fatalf("Response = %q, want empty string", resp.Response)
+	}
+}
+
 // TestRecursiveClientAdapter_OnRecursiveQueryCallback verifies callback invocation
 func TestRecursiveClientAdapter_OnRecursiveQueryCallback(t *testing.T) {
 	var callbackDepth int
@@ -530,9 +578,9 @@ func TestRecursiveCallInfo_Fields(t *testing.T) {
 // TestRecursiveCallInfo_WithError verifies error tracking
 func TestRecursiveCallInfo_WithError(t *testing.T) {
 	info := RecursiveCallInfo{
-		ID:       "error-call",
-		Success:  false,
-		Error:    "simulated error",
+		ID:      "error-call",
+		Success: false,
+		Error:   "simulated error",
 	}
 
 	if info.Success {

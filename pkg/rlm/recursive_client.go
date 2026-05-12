@@ -100,20 +100,29 @@ func (a *RecursiveClientAdapter) QueryBatched(ctx context.Context, prompts []str
 
 // QueryWithRLM performs a recursive RLM query, spawning a nested RLM execution.
 func (a *RecursiveClientAdapter) QueryWithRLM(ctx context.Context, prompt string, depth int) (repl.QueryResponse, error) {
+	return a.queryWithRLM(ctx, nil, prompt, depth)
+}
+
+// QueryWithRLMContext performs a recursive RLM query over a selected context slice.
+func (a *RecursiveClientAdapter) QueryWithRLMContext(ctx context.Context, contextSlice, query string, depth int) (repl.QueryResponse, error) {
+	return a.queryWithRLM(ctx, &contextSlice, query, depth)
+}
+
+func (a *RecursiveClientAdapter) queryWithRLM(ctx context.Context, contextOverride *string, query string, depth int) (repl.QueryResponse, error) {
 	// Check if we can recurse
 	if !a.recursionContext.CanRecurse() {
 		return repl.QueryResponse{
 			Response: fmt.Sprintf("Error: %v", &core.DepthExceededError{
 				CurrentDepth: a.recursionContext.CurrentDepth,
 				MaxDepth:     a.recursionContext.MaxDepth,
-				Prompt:       prompt,
+				Prompt:       query,
 			}),
 		}, nil
 	}
 
 	// Notify callback if set
 	if a.onRecursiveQuery != nil {
-		a.onRecursiveQuery(a.recursionContext.CurrentDepth+1, prompt)
+		a.onRecursiveQuery(a.recursionContext.CurrentDepth+1, query)
 	}
 
 	// Generate a unique ID for this recursive call
@@ -122,8 +131,13 @@ func (a *RecursiveClientAdapter) QueryWithRLM(ctx context.Context, prompt string
 	// Create child recursion context
 	childCtx := a.recursionContext.Child(callID)
 
+	contextPayload := a.contextPayload
+	if contextOverride != nil {
+		contextPayload = *contextOverride
+	}
+
 	// Perform the recursive RLM call
-	result, err := a.rlm.CompleteWithRecursion(ctx, a.contextPayload, prompt, childCtx, a.tokenStats)
+	result, err := a.rlm.CompleteWithRecursion(ctx, contextPayload, query, childCtx, a.tokenStats)
 	if err != nil {
 		return repl.QueryResponse{
 			Response: fmt.Sprintf("Error: %v", err),

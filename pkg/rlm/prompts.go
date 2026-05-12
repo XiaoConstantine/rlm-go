@@ -296,10 +296,11 @@ The REPL environment is initialized with:
 3. A "QueryRaw(prompt string) string" function to query a sub-LLM with exactly the prompt you provide.
 4. A "QueryWith(contextSlice, prompt string) string" function to query a sub-LLM with only a selected context slice.
 5. "QueryBatched" and "QueryBatchedRaw" functions for concurrent queries.
-6. A "QueryWithRLM(prompt string, depth int) string" function for RECURSIVE RLM queries.
-7. A "QueryBatchedWithRLM(prompts []string, depth int) []string" for concurrent recursive queries.
-8. Helper functions: "CurrentDepth() int", "MaxDepth() int", "CanRecurse() bool", min(a, b int), max(a, b int).
-9. Pre-imported packages: fmt, strings, regexp, strconv, encoding/json, sort.
+6. A "QueryWithRLM(prompt string, depth int) string" function for RECURSIVE RLM queries over the current context.
+7. A "QueryWithRLMContext(contextSlice, query string, depth int) string" function for RECURSIVE RLM queries over a selected context slice.
+8. "QueryBatchedWithRLM" and "QueryBatchedWithRLMContext" for concurrent recursive queries.
+9. Helper functions: "CurrentDepth() int", "MaxDepth() int", "CanRecurse() bool", min(a, b int), max(a, b int).
+10. Pre-imported packages: fmt, strings, regexp, strconv, encoding/json, sort.
 
 CRITICAL CODE RULES (violations cause errors):
 - DO NOT use 'import' statements - packages are already imported
@@ -319,7 +320,8 @@ Sub-LLM Capacity & Efficiency:
 - In the standard REPL, Query() and QueryBatched() automatically include the full context. If you manually include a context slice in the prompt, use QueryRaw(), QueryBatchedRaw(), or QueryWith(slice, prompt).
 
 RECURSIVE RLM CAPABILITIES:
-- QueryWithRLM spawns a nested RLM that can execute code and query sub-LLMs
+- QueryWithRLM spawns a nested RLM that can execute code and query sub-LLMs over the current context
+- QueryWithRLMContext spawns a nested RLM with only the context slice you pass
 - Use this for complex sub-tasks that need their own exploration and reasoning
 - The depth parameter controls how deep the recursion can go (use CurrentDepth()+1)
 - Check CanRecurse() before calling QueryWithRLM to avoid depth exceeded errors
@@ -332,17 +334,15 @@ WHEN TO USE RECURSIVE RLM:
 EXAMPLE - Using recursive RLM for complex sub-tasks:
 if CanRecurse() {
     // Spawn a sub-RLM to deeply analyze a specific section
-    analysis := QueryWithRLM(fmt.Sprintf("Analyze this section thoroughly and find all anomalies: %s", section), CurrentDepth()+1)
+    analysis := QueryWithRLMContext(section, "Analyze this section thoroughly and find all anomalies", CurrentDepth()+1)
     fmt.Println("Sub-analysis result:", analysis)
 }
 
 EXAMPLE - Parallel recursive analysis:
 if CanRecurse() {
-    prompts := []string{
-        fmt.Sprintf("Deeply analyze section 1: %s", sections[0]),
-        fmt.Sprintf("Deeply analyze section 2: %s", sections[1]),
-    }
-    results := QueryBatchedWithRLM(prompts, CurrentDepth()+1)
+    contexts := []string{sections[0], sections[1]}
+    queries := []string{"Deeply analyze section 1", "Deeply analyze section 2"}
+    results := QueryBatchedWithRLMContext(contexts, queries, CurrentDepth()+1)
     for i, r := range results {
         fmt.Printf("Section %d analysis: %s\n", i+1, r)
     }

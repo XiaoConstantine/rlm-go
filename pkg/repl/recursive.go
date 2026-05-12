@@ -33,6 +33,12 @@ type RecursiveLLMClient interface {
 	MaxDepth() int
 }
 
+// RecursiveContextLLMClient extends RecursiveLLMClient with sub-context recursion.
+type RecursiveContextLLMClient interface {
+	// QueryWithRLMContext performs a recursive RLM query over contextSlice.
+	QueryWithRLMContext(ctx context.Context, contextSlice, query string, depth int) (QueryResponse, error)
+}
+
 // RecursiveREPL wraps a standard REPL with recursive RLM capabilities.
 // It injects additional functions for multi-depth recursion.
 type RecursiveREPL struct {
@@ -116,11 +122,13 @@ func (r *RecursiveREPL) injectBuiltins() error {
 			"AsyncReady":        reflect.ValueOf(r.asyncReady),
 			"AsyncResult":       reflect.ValueOf(r.asyncResult),
 			// Recursive RLM functions
-			"QueryWithRLM":        reflect.ValueOf(r.queryWithRLM),
-			"QueryBatchedWithRLM": reflect.ValueOf(r.queryBatchedWithRLM),
-			"CurrentDepth":        reflect.ValueOf(r.currentDepth),
-			"MaxDepth":            reflect.ValueOf(r.maxDepth),
-			"CanRecurse":          reflect.ValueOf(r.canRecurse),
+			"QueryWithRLM":               reflect.ValueOf(r.queryWithRLM),
+			"QueryWithRLMContext":        reflect.ValueOf(r.queryWithRLMContext),
+			"QueryBatchedWithRLM":        reflect.ValueOf(r.queryBatchedWithRLM),
+			"QueryBatchedWithRLMContext": reflect.ValueOf(r.queryBatchedWithRLMContext),
+			"CurrentDepth":               reflect.ValueOf(r.currentDepth),
+			"MaxDepth":                   reflect.ValueOf(r.maxDepth),
+			"CanRecurse":                 reflect.ValueOf(r.canRecurse),
 			// FINAL and FINAL_VAR allow recursive RLM code to signal completion.
 			"FINAL":     reflect.ValueOf(r.finalAnswer),
 			"FINAL_VAR": reflect.ValueOf(r.finalVarAnswer),
@@ -168,9 +176,16 @@ func (r *RecursiveREPL) llmQueryRaw(prompt string) string {
 // llmQueryWith queries with only the provided context slice.
 func (r *RecursiveREPL) llmQueryWith(contextSlice, prompt string) string {
 	if contextSlice != "" {
-		prompt = fmt.Sprintf("Context data:\n%s\n\nTask: %s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextSlice, prompt)
+		prompt = r.buildPromptWithProvidedContext(contextSlice, prompt)
 	}
 	return r.llmQuery(prompt)
+}
+
+func (r *RecursiveREPL) buildPromptWithProvidedContext(contextStr, prompt string) string {
+	if contextStr == "" {
+		return prompt
+	}
+	return fmt.Sprintf("Context data:\n%s\n\nTask: %s\n\nIMPORTANT: Provide a direct, concise answer. Do not explain your reasoning unless specifically asked.", contextStr, prompt)
 }
 
 // llmQueryBatched makes concurrent LLM queries (standard, non-recursive).
@@ -221,6 +236,15 @@ func (r *RecursiveREPL) llmQueryBatchedRaw(prompts []string) []string {
 // queryWithRLM performs a recursive RLM query at the specified depth.
 // This spawns a new sub-LLM that can itself use Query() and QueryWithRLM().
 func (r *RecursiveREPL) queryWithRLM(prompt string, depth int) string {
+	return r.runRecursiveQuery(nil, prompt, depth)
+}
+
+// queryWithRLMContext performs a recursive RLM query over a selected context slice.
+func (r *RecursiveREPL) queryWithRLMContext(contextSlice, query string, depth int) string {
+	return r.runRecursiveQuery(&contextSlice, query, depth)
+}
+
+func (r *RecursiveREPL) runRecursiveQuery(contextOverride *string, query string, depth int) string {
 	start := time.Now()
 
 	// Use the depth from parameter, defaulting to current depth + 1
@@ -229,7 +253,17 @@ func (r *RecursiveREPL) queryWithRLM(prompt string, depth int) string {
 		targetDepth = r.client.CurrentDepth() + 1
 	}
 
-	result, err := r.client.QueryWithRLM(r.ctx, prompt, targetDepth)
+	var result QueryResponse
+	var err error
+	if contextOverride != nil {
+		if contextClient, ok := r.client.(RecursiveContextLLMClient); ok {
+			result, err = contextClient.QueryWithRLMContext(r.ctx, *contextOverride, query, targetDepth)
+		} else {
+			err = fmt.Errorf("QueryWithRLMContext is not supported by this recursive client")
+		}
+	} else {
+		result, err = r.client.QueryWithRLM(r.ctx, query, targetDepth)
+	}
 	duration := time.Since(start)
 
 	response := result.Response
@@ -239,7 +273,7 @@ func (r *RecursiveREPL) queryWithRLM(prompt string, depth int) string {
 
 	r.mu.Lock()
 	r.recursiveCalls = append(r.recursiveCalls, RecursiveCall{
-		Prompt:           prompt,
+		Prompt:           query,
 		Response:         response,
 		Depth:            targetDepth,
 		Duration:         duration,
@@ -253,7 +287,19 @@ func (r *RecursiveREPL) queryWithRLM(prompt string, depth int) string {
 
 // queryBatchedWithRLM performs multiple recursive RLM queries concurrently.
 func (r *RecursiveREPL) queryBatchedWithRLM(prompts []string, depth int) []string {
-	results := make([]string, len(prompts))
+	return r.runBatchedRecursiveQueries(nil, prompts, depth)
+}
+
+// queryBatchedWithRLMContext performs multiple recursive RLM queries over selected context slices.
+func (r *RecursiveREPL) queryBatchedWithRLMContext(contextSlices, queries []string, depth int) []string {
+	if len(contextSlices) != len(queries) {
+		return []string{fmt.Sprintf("Error: contextSlices length %d does not match queries length %d", len(contextSlices), len(queries))}
+	}
+	return r.runBatchedRecursiveQueries(contextSlices, queries, depth)
+}
+
+func (r *RecursiveREPL) runBatchedRecursiveQueries(contextSlices []string, queries []string, depth int) []string {
+	results := make([]string, len(queries))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
@@ -262,19 +308,30 @@ func (r *RecursiveREPL) queryBatchedWithRLM(prompts []string, depth int) []strin
 		targetDepth = r.client.CurrentDepth() + 1
 	}
 
-	for i, prompt := range prompts {
+	for i, query := range queries {
 		wg.Add(1)
-		go func(idx int, p string) {
+		go func(idx int, contextSlice, query string) {
 			defer wg.Done()
-			result := r.queryWithRLM(p, targetDepth)
+			var contextOverride *string
+			if contextSlices != nil {
+				contextOverride = &contextSlice
+			}
+			result := r.runRecursiveQuery(contextOverride, query, targetDepth)
 			mu.Lock()
 			results[idx] = result
 			mu.Unlock()
-		}(i, prompt)
+		}(i, contextSliceAt(contextSlices, i), query)
 	}
 
 	wg.Wait()
 	return results
+}
+
+func contextSliceAt(contextSlices []string, i int) string {
+	if contextSlices == nil {
+		return ""
+	}
+	return contextSlices[i]
 }
 
 // currentDepth returns the current recursion depth.

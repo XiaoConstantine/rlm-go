@@ -224,10 +224,12 @@ Query(prompt string) string              // Single sub-LLM call
 QueryBatched(prompts []string) []string  // Concurrent sub-LLM calls
 
 // Multi-depth recursion (when enabled)
-QueryWithRLM(prompt string, depth int) string  // Spawn nested RLM
-CurrentDepth() int                              // Get current recursion depth
-MaxDepth() int                                  // Get max allowed depth
-CanRecurse() bool                               // Check if more recursion allowed
+QueryWithRLM(prompt string, depth int) string                          // Spawn nested RLM over current context
+QueryWithRLMContext(contextSlice, query string, depth int) string       // Spawn nested RLM over selected context
+QueryBatchedWithRLMContext(contexts, queries []string, depth int) []string
+CurrentDepth() int                                                      // Get current recursion depth
+MaxDepth() int                                                          // Get max allowed depth
+CanRecurse() bool                                                       // Check if more recursion allowed
 
 // Your context
 context  // string variable with your data
@@ -250,6 +252,9 @@ In the REPL, use `QueryWithRLM()` to spawn a nested RLM that can itself use `Que
 ```go
 // Depth 0 (root)
 result := QueryWithRLM("Analyze each section in detail", 1)
+
+// Or pass only the selected sub-context to the nested RLM
+result := QueryWithRLMContext(sectionText, "Analyze this section in detail", 1)
 
 // The sub-RLM (depth 1) can use Query() or QueryWithRLM() up to MaxDepth
 ```
