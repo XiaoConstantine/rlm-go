@@ -18,14 +18,14 @@ import (
 )
 
 var (
-	contextFile   = flag.String("context", "", "Path to context file (or use stdin)")
-	contextStr    = flag.String("context-string", "", "Context string directly")
-	query         = flag.String("query", "", "Query to run against the context")
-	model         = flag.String("model", "claude-sonnet-4-20250514", "Model to use")
-	maxIterations = flag.Int("max-iterations", 30, "Maximum iterations")
-	verbose       = flag.Bool("verbose", false, "Enable verbose output")
-	logDir        = flag.String("log-dir", "", "Directory for JSONL logs (optional)")
-	jsonOutput    = flag.Bool("json", false, "Output result as JSON")
+	contextFile       = flag.String("context", "", "Path to context file (or use stdin)")
+	contextStr        = flag.String("context-string", "", "Context string directly")
+	query             = flag.String("query", "", "Query to run against the context")
+	model             = flag.String("model", "claude-sonnet-4-20250514", "Model to use")
+	maxIterations     = flag.Int("max-iterations", 30, "Maximum iterations")
+	verbose           = flag.Bool("verbose", false, "Enable verbose output")
+	logDir            = flag.String("log-dir", "", "Directory for JSONL logs (optional)")
+	jsonOutput        = flag.Bool("json", false, "Output result as JSON")
 	enablePooling     = flag.Bool("pooling", false, "Enable REPL instance pooling")
 	poolSize          = flag.Int("pool-size", 3, "REPL pool size (requires -pooling)")
 	enableCompression = flag.Bool("compression", false, "Enable history compression")
@@ -173,6 +173,9 @@ Options:
 	}
 	if log != nil {
 		opts = append(opts, rlm.WithLogger(log))
+	}
+	if policy, ok := rlm.PromptPolicyForModel(*model); ok {
+		opts = append(opts, rlm.WithPromptPolicy(policy))
 	}
 	if pool != nil {
 		opts = append(opts, rlm.WithREPLPool(pool))

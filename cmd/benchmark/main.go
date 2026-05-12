@@ -198,6 +198,7 @@ func runBaseline(ctx context.Context, task Task, client providers.Client) Benchm
 
 // RLMOptions holds configuration for RLM runs.
 type RLMOptions struct {
+	Model          string
 	LogDir         string
 	Verbose        bool
 	Streaming      bool
@@ -228,6 +229,13 @@ func runRLM(ctx context.Context, task Task, client providers.Client, opts RLMOpt
 	if mc, ok := client.(ModelClient); ok {
 		modelName = mc.Model()
 	}
+	policyModel := modelName
+	if opts.Model != "" {
+		policyModel = opts.Model
+		if modelName == "" {
+			modelName = opts.Model
+		}
+	}
 
 	if opts.LogDir != "" {
 		log, err = logger.New(opts.LogDir, logger.Config{
@@ -250,6 +258,9 @@ func runRLM(ctx context.Context, task Task, client providers.Client, opts RLMOpt
 		rlm.WithMaxIterations(opts.MaxIters),
 		rlm.WithVerbose(opts.Verbose),
 		rlm.WithLogger(log),
+	}
+	if policy, ok := rlm.PromptPolicyForModel(policyModel); ok {
+		rlmOpts = append(rlmOpts, rlm.WithPromptPolicy(policy))
 	}
 
 	if opts.Streaming {
@@ -512,6 +523,7 @@ func main() {
 
 	// Build RLM options
 	rlmOpts := RLMOptions{
+		Model:          *model,
 		LogDir:         *logDir,
 		Verbose:        *verbose,
 		Streaming:      *enableStreaming,
@@ -617,22 +629,22 @@ func main() {
 	// Save results if output file specified
 	if *outputFile != "" {
 		output := map[string]any{
-			"model":            *model,
-			"prefix_caching":   *enablePrefixCaching,
-			"streaming":        *enableStreaming,
-			"pooling":          *enablePooling,
-			"pool_size":        *poolSize,
-			"compression":      *enableCompression,
-			"verbatim_iters":   *verbatimIters,
-			"adaptive":         *enableAdaptive,
-			"base_iters":       *baseIters,
-			"max_iters":        *maxIters,
+			"model":             *model,
+			"prefix_caching":    *enablePrefixCaching,
+			"streaming":         *enableStreaming,
+			"pooling":           *enablePooling,
+			"pool_size":         *poolSize,
+			"compression":       *enableCompression,
+			"verbatim_iters":    *verbatimIters,
+			"adaptive":          *enableAdaptive,
+			"base_iters":        *baseIters,
+			"max_iters":         *maxIters,
 			"early_termination": *enableEarlyTerm,
-			"recursion_depth":  *recursionDepth,
-			"baseline_results": baselineResults,
-			"rlm_results":      rlmResults,
-			"baseline_summary": baselineSummary,
-			"rlm_summary":      rlmSummary,
+			"recursion_depth":   *recursionDepth,
+			"baseline_results":  baselineResults,
+			"rlm_results":       rlmResults,
+			"baseline_summary":  baselineSummary,
+			"rlm_summary":       rlmSummary,
 		}
 
 		data, err := json.MarshalIndent(output, "", "  ")

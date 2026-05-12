@@ -273,6 +273,14 @@ rlm.New(client, replClient,
 )
 ```
 
+For model-specific root-loop guidance:
+
+```go
+if policy, ok := rlm.PromptPolicyForModel("qwen3-coder"); ok {
+    opts = append(opts, rlm.WithPromptPolicy(policy))
+}
+```
+
 ## Sandbox Execution (Podman/Docker)
 
 By default, rlm-go executes LLM-generated code in-process using Yaegi for maximum performance. For production environments or when running untrusted code, you can enable isolated sandbox execution using Podman (recommended) or Docker.

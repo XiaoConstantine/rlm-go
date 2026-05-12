@@ -639,6 +639,66 @@ func TestBuildInitialMessages(t *testing.T) {
 	}
 }
 
+
+func TestPromptPolicyForModel(t *testing.T) {
+	policy, ok := PromptPolicyForModel("Qwen3-Coder-480B-A35B-Instruct")
+	if !ok {
+		t.Fatal("PromptPolicyForModel() should identify Qwen models")
+	}
+	if policy.Name != "qwen-conservative" {
+		t.Fatalf("policy.Name = %q, want qwen-conservative", policy.Name)
+	}
+	if policy.MaxSubCalls == 0 {
+		t.Fatal("Qwen policy should set a sub-call budget")
+	}
+
+	if _, ok := PromptPolicyForModel("claude-sonnet-4-20250514"); ok {
+		t.Fatal("PromptPolicyForModel() should not override unknown/default models")
+	}
+}
+
+func TestBuildInitialMessagesWithPromptPolicy(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+	policy, ok := PromptPolicyForModel("qwen3-coder")
+	if !ok {
+		t.Fatal("PromptPolicyForModel() should identify qwen3-coder")
+	}
+
+	rlm := New(client, replClient,
+		WithSystemPrompt("test system prompt"),
+		WithPromptPolicy(policy),
+	)
+	replEnv := repl.New(replClient)
+	_ = replEnv.LoadContext("test context")
+
+	messages := rlm.buildInitialMessages(replEnv, "test query")
+	if !strings.Contains(messages[0].Content, "test system prompt") {
+		t.Fatalf("system prompt = %q, want base prompt", messages[0].Content)
+	}
+	if !strings.Contains(messages[0].Content, "MODEL-SPECIFIC RLM POLICY") {
+		t.Fatalf("system prompt = %q, want policy section", messages[0].Content)
+	}
+	if !strings.Contains(messages[0].Content, "qwen-conservative") {
+		t.Fatalf("system prompt = %q, want qwen policy name", messages[0].Content)
+	}
+}
+
+func TestRecursiveSystemPromptWithPromptPolicy(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+	policy := PromptPolicy{Name: "test-profile", MaxSubCalls: 4}
+	rlm := New(client, replClient, WithPromptPolicy(policy))
+
+	prompt := rlm.systemPromptFor(core.NewRecursionContext(2))
+	if !strings.Contains(prompt, "QueryWithRLM") {
+		t.Fatalf("system prompt = %q, want recursive prompt content", prompt)
+	}
+	if !strings.Contains(prompt, "test-profile") {
+		t.Fatalf("system prompt = %q, want policy content", prompt)
+	}
+}
+
 func TestAppendIterationPrompt(t *testing.T) {
 	client := &mockLLMClient{}
 	replClient := &mockREPLClient{}

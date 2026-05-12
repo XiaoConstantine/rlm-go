@@ -64,6 +64,10 @@ type Config struct {
 	// SystemPrompt overrides the default system prompt.
 	SystemPrompt string
 
+	// PromptPolicy optionally appends model-specific operating guidance to the
+	// root prompt without replacing the base RLM protocol.
+	PromptPolicy *PromptPolicy
+
 	// Verbose enables verbose logging.
 	Verbose bool
 
@@ -225,6 +229,24 @@ type IterationProgress struct {
 	RootPromptTokens int
 }
 
+// PromptPolicy contains model-specific RLM operating guidance.
+type PromptPolicy struct {
+	// Name identifies the policy in the root prompt.
+	Name string
+
+	// SubLLMContextChars is the recommended maximum context size for one sub-call.
+	SubLLMContextChars int
+
+	// BatchChars is the recommended target size for batched sub-call chunks.
+	BatchChars int
+
+	// MaxSubCalls is an optional soft budget for generated plans.
+	MaxSubCalls int
+
+	// ExtraInstructions contains additional model-specific guidance.
+	ExtraInstructions []string
+}
+
 const (
 	// DefaultMaxFullContextQueryChars is the default guardrail for Query and
 	// QueryBatched calls that would prepend the entire loaded context.
@@ -237,6 +259,38 @@ func DefaultConfig() Config {
 		MaxIterations:            30,
 		MaxFullContextQueryChars: DefaultMaxFullContextQueryChars,
 		SystemPrompt:             SystemPrompt,
+	}
+}
+
+// PromptPolicyForModel returns model-specific RLM guidance for known model families.
+func PromptPolicyForModel(model string) (PromptPolicy, bool) {
+	lower := strings.ToLower(model)
+	switch {
+	case strings.Contains(lower, "qwen"):
+		return PromptPolicy{
+			Name:               "qwen-conservative",
+			SubLLMContextChars: 200000,
+			BatchChars:         100000,
+			MaxSubCalls:        100,
+			ExtraInstructions: []string{
+				"Use QueryWith or QueryBatchedRaw over selected slices; avoid full-context Query on large inputs.",
+				"Batch examples before sub-calling; do not recurse per row unless pairwise or multi-step analysis requires it.",
+				"Keep Go code short and verify syntax before launching many recursive calls.",
+			},
+		}, true
+	case strings.Contains(lower, "mini") || strings.Contains(lower, "flash") || strings.Contains(lower, "8b"):
+		return PromptPolicy{
+			Name:               "small-model-conservative",
+			SubLLMContextChars: 200000,
+			BatchChars:         100000,
+			MaxSubCalls:        64,
+			ExtraInstructions: []string{
+				"Prefer deterministic slicing plus batched sub-calls over deep recursion.",
+				"Keep code and FINAL outputs short to preserve output budget.",
+			},
+		}, true
+	default:
+		return PromptPolicy{}, false
 	}
 }
 
@@ -494,6 +548,13 @@ func WithCostEstimator(estimator CostEstimator) Option {
 func WithSystemPrompt(prompt string) Option {
 	return func(c *Config) {
 		c.SystemPrompt = prompt
+	}
+}
+
+// WithPromptPolicy appends model-specific RLM operating guidance to the system prompt.
+func WithPromptPolicy(policy PromptPolicy) Option {
+	return func(c *Config) {
+		c.PromptPolicy = &policy
 	}
 }
 
@@ -990,13 +1051,52 @@ func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*
 	return r.forceDefaultAnswer(ctx, messages, state, maxIterations)
 }
 
+func (r *RLM) systemPromptFor(recursionCtx *core.RecursionContext) string {
+	systemPrompt := r.config.SystemPrompt
+	if recursionCtx != nil && recursionCtx.MaxDepth > 0 && recursionCtx.CanRecurse() {
+		systemPrompt = RecursiveSystemPrompt
+	}
+	return appendPromptPolicy(systemPrompt, r.config.PromptPolicy)
+}
+
+func appendPromptPolicy(systemPrompt string, policy *PromptPolicy) string {
+	if policy == nil || policy.Name == "" {
+		return systemPrompt
+	}
+
+	var b strings.Builder
+	b.WriteString(systemPrompt)
+	b.WriteString("\n\nMODEL-SPECIFIC RLM POLICY:\n")
+	b.WriteString("- Profile: ")
+	b.WriteString(policy.Name)
+	b.WriteByte('\n')
+	if policy.SubLLMContextChars > 0 {
+		fmt.Fprintf(&b, "- Recommended sub-LLM context cap: %d characters per call.\n", policy.SubLLMContextChars)
+	}
+	if policy.BatchChars > 0 {
+		fmt.Fprintf(&b, "- Recommended batch chunk target: %d characters.\n", policy.BatchChars)
+	}
+	if policy.MaxSubCalls > 0 {
+		fmt.Fprintf(&b, "- Soft sub-call budget: at most %d sub-calls unless the task explicitly requires more.\n", policy.MaxSubCalls)
+	}
+	for _, instruction := range policy.ExtraInstructions {
+		if strings.TrimSpace(instruction) == "" {
+			continue
+		}
+		b.WriteString("- ")
+		b.WriteString(instruction)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 // buildInitialMessages creates the initial message history.
 func (r *RLM) buildInitialMessages(replEnv *repl.REPL, query string) []core.Message {
 	contextInfo := replEnv.ContextInfo()
 	userPrompt := fmt.Sprintf(UserPromptTemplate, contextInfo, query) + FirstIterationSuffix
 
 	return []core.Message{
-		{Role: "system", Content: r.config.SystemPrompt},
+		{Role: "system", Content: r.systemPromptFor(nil)},
 		{Role: "user", Content: userPrompt},
 	}
 }
@@ -1007,7 +1107,7 @@ func (r *RLM) buildInitialMessagesFromEnv(execEnv ExecutionEnvironment, query st
 	userPrompt := fmt.Sprintf(UserPromptTemplate, contextInfo, query) + FirstIterationSuffix
 
 	return []core.Message{
-		{Role: "system", Content: r.config.SystemPrompt},
+		{Role: "system", Content: r.systemPromptFor(nil)},
 		{Role: "user", Content: userPrompt},
 	}
 }
@@ -1275,12 +1375,6 @@ func (r *RLM) CompleteWithRecursion(
 	recursionCtx *core.RecursionContext,
 	tokenStats *RecursiveTokenStats,
 ) (*core.CompletionResult, error) {
-	// Select system prompt based on recursion capability
-	systemPrompt := r.config.SystemPrompt
-	if recursionCtx != nil && recursionCtx.MaxDepth > 0 && recursionCtx.CanRecurse() {
-		systemPrompt = RecursiveSystemPrompt
-	}
-
 	// Create recursive client adapter for nested calls
 	var replEnv interface {
 		LoadContext(any) error
@@ -1320,7 +1414,7 @@ func (r *RLM) CompleteWithRecursion(
 	contextInfo := replEnv.ContextInfo()
 	userPrompt := fmt.Sprintf(UserPromptTemplate, contextInfo, query) + FirstIterationSuffix
 	messages := []core.Message{
-		{Role: "system", Content: systemPrompt},
+		{Role: "system", Content: r.systemPromptFor(recursionCtx)},
 		{Role: "user", Content: userPrompt},
 	}
 
@@ -1880,7 +1974,7 @@ func (r *RLM) CompleteWithCompactHistory(ctx context.Context, contextPayload any
 		// Build messages with compact history in user prompt
 		userPrompt := r.buildCompactHistoryPrompt(contextInfo, query, historyStr, i)
 		messages := []core.Message{
-			{Role: "system", Content: r.config.SystemPrompt},
+			{Role: "system", Content: r.systemPromptFor(nil)},
 			{Role: "user", Content: userPrompt},
 		}
 
@@ -2030,7 +2124,7 @@ func determineActionType(codeBlocks []string, response string) string {
 // buildCompactHistoryMessages builds the messages array for compact history mode.
 func (r *RLM) buildCompactHistoryMessages(contextInfo, query, historyStr string, iteration int) []core.Message {
 	return []core.Message{
-		{Role: "system", Content: r.config.SystemPrompt},
+		{Role: "system", Content: r.systemPromptFor(nil)},
 		{Role: "user", Content: r.buildCompactHistoryPrompt(contextInfo, query, historyStr, iteration)},
 	}
 }
