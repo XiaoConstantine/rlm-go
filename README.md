@@ -270,6 +270,7 @@ rlm.New(client, replClient,
     rlm.WithVerbose(true),          // Enable console logging
     rlm.WithLogger(logger),         // Attach JSONL logger for session recording
     rlm.WithMaxFullContextQueryChars(200000), // Guard full-context Query() calls; use 0 to disable
+    rlm.WithAutoCompactHistoryThreshold(200000), // Auto compact history for large contexts; use 0 to disable
 )
 ```
 

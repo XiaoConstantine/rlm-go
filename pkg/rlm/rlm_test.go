@@ -137,6 +137,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.MaxFullContextQueryChars != DefaultMaxFullContextQueryChars {
 		t.Errorf("MaxFullContextQueryChars = %d, want %d", cfg.MaxFullContextQueryChars, DefaultMaxFullContextQueryChars)
 	}
+	if cfg.AutoCompactHistoryThreshold != DefaultAutoCompactHistoryThreshold {
+		t.Errorf("AutoCompactHistoryThreshold = %d, want %d", cfg.AutoCompactHistoryThreshold, DefaultAutoCompactHistoryThreshold)
+	}
 	if cfg.SystemPrompt != SystemPrompt {
 		t.Error("SystemPrompt should equal SystemPrompt constant")
 	}
@@ -639,7 +642,6 @@ func TestBuildInitialMessages(t *testing.T) {
 	}
 }
 
-
 func TestPromptPolicyForModel(t *testing.T) {
 	policy, ok := PromptPolicyForModel("Qwen3-Coder-480B-A35B-Instruct")
 	if !ok {
@@ -775,6 +777,38 @@ func TestAppendIterationToHistory(t *testing.T) {
 	}
 	if !strings.Contains(newMessages[3].Content, "1\n") {
 		t.Error("user message should contain the output")
+	}
+}
+
+func TestAppendIterationToHistoryUsesMetadataForLargeOutput(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+	rlm := New(client, replClient)
+
+	messages := []core.Message{
+		{Role: "system", Content: "system"},
+		{Role: "user", Content: "query"},
+	}
+	largeOutput := strings.Repeat("x", historyOutputMetadataThreshold+1)
+	blocks := []core.CodeBlock{
+		{
+			Code: "fmt.Println(large)",
+			Result: core.ExecutionResult{
+				Stdout: largeOutput,
+			},
+		},
+	}
+
+	newMessages := rlm.appendIterationToHistory(messages, "response", blocks)
+	if len(newMessages) != 4 {
+		t.Fatalf("appendIterationToHistory() messages = %d, want 4", len(newMessages))
+	}
+	history := newMessages[3].Content
+	if !strings.Contains(history, "large REPL output omitted") {
+		t.Fatalf("history = %q, want large-output metadata", history)
+	}
+	if strings.Contains(history, largeOutput) {
+		t.Fatal("history should not contain full large output")
 	}
 }
 
@@ -2068,7 +2102,6 @@ func TestWithSandboxConfig(t *testing.T) {
 	}
 }
 
-
 func TestWithSandboxConfigPreservesUserMaxFullContextQueryChars(t *testing.T) {
 	client := &mockLLMClient{}
 	replClient := &mockREPLClient{}
@@ -2317,7 +2350,6 @@ func TestCreateExecutionEnvironmentWithSandboxMaxFullContextQueryChars(t *testin
 	}
 }
 
-
 func TestCreateExecutionEnvironmentDefaultsBlockLargeFullContextQuery(t *testing.T) {
 	client := &mockLLMClient{}
 	var prompts []string
@@ -2470,6 +2502,21 @@ func TestWithCompactHistoryConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestWithAutoCompactHistoryThreshold(t *testing.T) {
+	client := &mockLLMClient{}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithAutoCompactHistoryThreshold(1234))
+	if rlm.config.AutoCompactHistoryThreshold != 1234 {
+		t.Fatalf("AutoCompactHistoryThreshold = %d, want 1234", rlm.config.AutoCompactHistoryThreshold)
+	}
+
+	rlm = New(client, replClient, WithAutoCompactHistoryThreshold(-1))
+	if rlm.config.AutoCompactHistoryThreshold != 0 {
+		t.Fatalf("AutoCompactHistoryThreshold = %d, want 0", rlm.config.AutoCompactHistoryThreshold)
+	}
+}
+
 func TestCompleteWithCompactHistory(t *testing.T) {
 	client := &mockLLMClient{
 		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
@@ -2493,6 +2540,80 @@ func TestCompleteWithCompactHistory(t *testing.T) {
 	}
 	if result.Iterations != 1 {
 		t.Errorf("Iterations = %d, want 1", result.Iterations)
+	}
+}
+
+func TestCompleteAutoCompactHistoryForLargeContext(t *testing.T) {
+	callCount := 0
+	var secondCallMessages []core.Message
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			callCount++
+			if callCount == 1 {
+				return core.LLMResponse{Content: "```go\nfmt.Println(\"hello\")\n```", PromptTokens: 10, CompletionTokens: 15}, nil
+			}
+			secondCallMessages = append([]core.Message(nil), messages...)
+			return core.LLMResponse{Content: "FINAL(done)", PromptTokens: 10, CompletionTokens: 5}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient, WithMaxIterations(3))
+	largeContext := strings.Repeat("x", DefaultAutoCompactHistoryThreshold)
+	result, err := rlm.Complete(context.Background(), largeContext, "query")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+	if result.Response != "done" {
+		t.Fatalf("Response = %q, want done", result.Response)
+	}
+	if len(secondCallMessages) != 2 {
+		t.Fatalf("second call messages = %d, want compact two-message prompt", len(secondCallMessages))
+	}
+	if !strings.Contains(secondCallMessages[1].Content, "=== PREVIOUS ITERATIONS ===") {
+		t.Fatalf("second user prompt = %q, want compact history", secondCallMessages[1].Content)
+	}
+}
+
+func TestCompleteAutoCompactHistoryCanBeDisabled(t *testing.T) {
+	callCount := 0
+	var secondCallMessages []core.Message
+	client := &mockLLMClient{
+		completeFunc: func(ctx context.Context, messages []core.Message) (core.LLMResponse, error) {
+			callCount++
+			if callCount == 1 {
+				return core.LLMResponse{Content: "```go\nfmt.Println(\"hello\")\n```", PromptTokens: 10, CompletionTokens: 15}, nil
+			}
+			secondCallMessages = append([]core.Message(nil), messages...)
+			return core.LLMResponse{Content: "FINAL(done)", PromptTokens: 10, CompletionTokens: 5}, nil
+		},
+	}
+	replClient := &mockREPLClient{}
+
+	rlm := New(client, replClient,
+		WithMaxIterations(3),
+		WithAutoCompactHistoryThreshold(0),
+	)
+	largeContext := strings.Repeat("x", DefaultAutoCompactHistoryThreshold)
+	result, err := rlm.Complete(context.Background(), largeContext, "query")
+	if err != nil {
+		t.Fatalf("Complete() error: %v", err)
+	}
+	if result.Response != "done" {
+		t.Fatalf("Response = %q, want done", result.Response)
+	}
+	if len(secondCallMessages) <= 2 {
+		t.Fatalf("second call messages = %d, want standard expanded history", len(secondCallMessages))
+	}
+	var foundCodeOutput bool
+	for _, msg := range secondCallMessages {
+		if strings.Contains(msg.Content, "Code executed:") {
+			foundCodeOutput = true
+			break
+		}
+	}
+	if !foundCodeOutput {
+		t.Fatalf("second call messages = %+v, want standard code-output history", secondCallMessages)
 	}
 }
 

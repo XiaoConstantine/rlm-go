@@ -121,6 +121,10 @@ type Config struct {
 	// CompactHistory configures compact string-based history tracking.
 	// When enabled, uses a more token-efficient history format.
 	CompactHistory *CompactHistoryConfig
+
+	// AutoCompactHistoryThreshold enables compact history automatically when
+	// context size is at least this many bytes. Disabled when <= 0.
+	AutoCompactHistoryThreshold int
 }
 
 // SandboxConfig configures sandboxed code execution.
@@ -251,14 +255,19 @@ const (
 	// DefaultMaxFullContextQueryChars is the default guardrail for Query and
 	// QueryBatched calls that would prepend the entire loaded context.
 	DefaultMaxFullContextQueryChars = 200000
+
+	// DefaultAutoCompactHistoryThreshold is the default context size at which
+	// Complete switches to compact history.
+	DefaultAutoCompactHistoryThreshold = 200000
 )
 
 // DefaultConfig returns the default RLM configuration.
 func DefaultConfig() Config {
 	return Config{
-		MaxIterations:            30,
-		MaxFullContextQueryChars: DefaultMaxFullContextQueryChars,
-		SystemPrompt:             SystemPrompt,
+		MaxIterations:               30,
+		MaxFullContextQueryChars:    DefaultMaxFullContextQueryChars,
+		AutoCompactHistoryThreshold: DefaultAutoCompactHistoryThreshold,
+		SystemPrompt:                SystemPrompt,
 	}
 }
 
@@ -773,6 +782,17 @@ func WithCompactHistoryConfig(cfg CompactHistoryConfig) Option {
 	}
 }
 
+// WithAutoCompactHistoryThreshold sets the context size at which Complete uses
+// compact history automatically. Set threshold <= 0 to disable auto compact history.
+func WithAutoCompactHistoryThreshold(threshold int) Option {
+	return func(c *Config) {
+		if threshold < 0 {
+			threshold = 0
+		}
+		c.AutoCompactHistoryThreshold = threshold
+	}
+}
+
 // confidencePhrases are phrases that indicate the model is confident in its answer.
 var confidencePhrases = []string{
 	"i'm confident",
@@ -849,6 +869,23 @@ func (r *RLM) shouldTerminateEarly(confidenceSignals, pendingCodeBlocks int) boo
 	return confidenceSignals >= r.config.AdaptiveIteration.ConfidenceThreshold
 }
 
+func (r *RLM) compactHistoryConfigForContext(contextSize int) *CompactHistoryConfig {
+	if r.config.CompactHistory != nil {
+		if r.config.CompactHistory.Enabled {
+			return r.config.CompactHistory
+		}
+		return nil
+	}
+	if r.config.AutoCompactHistoryThreshold <= 0 || contextSize < r.config.AutoCompactHistoryThreshold {
+		return nil
+	}
+	return &CompactHistoryConfig{
+		Enabled:          true,
+		MaxHistoryLength: defaultMaxHistoryLen,
+		IncludeFewShot:   true,
+	}
+}
+
 type finalStateEnvironment interface {
 	HasFinal() bool
 	Final() (string, bool)
@@ -885,9 +922,12 @@ func supportsFinalState(execEnv any) bool {
 // contextPayload is the context data (string, map, or slice).
 // query is the user's question.
 func (r *RLM) Complete(ctx context.Context, contextPayload any, query string) (*core.CompletionResult, error) {
-	// Use compact history mode if enabled
-	if r.config.CompactHistory != nil && r.config.CompactHistory.Enabled {
-		return r.CompleteWithCompactHistory(ctx, contextPayload, query)
+	// Use compact history mode when explicitly enabled or automatically for
+	// large contexts.
+	if compactCfg := r.compactHistoryConfigForContext(getContextSize(contextPayload)); compactCfg != nil {
+		compactRLM := *r
+		compactRLM.config.CompactHistory = compactCfg
+		return compactRLM.CompleteWithCompactHistory(ctx, contextPayload, query)
 	}
 
 	// Create execution environment (REPL or sandbox based on config)
@@ -1139,7 +1179,7 @@ func (r *RLM) appendIterationToHistory(messages []core.Message, response string,
 		content := fmt.Sprintf(
 			"Code executed:\n```go\n%s\n```\n\nREPL output:\n%s",
 			block.Code,
-			sandbox.FormatExecutionResult(&block.Result),
+			formatExecutionResultForHistory(&block.Result),
 		)
 		messages = append(messages, core.Message{
 			Role:    "user",
@@ -1834,11 +1874,29 @@ const (
 	truncateLenPreview = 100   // For short previews (e.g., FINAL output)
 
 	// History limits
-	defaultMaxHistoryLen = 10000 // Default max length for compact history string
+	defaultMaxHistoryLen           = 10000 // Default max length for compact history string
+	historyOutputMetadataThreshold = 4000  // Above this, keep metadata rather than raw output in root history.
 
 	// Summary output preview limit
 	summaryPreviewLen = 80
 )
+
+func formatExecutionResultForHistory(result *core.ExecutionResult) string {
+	formatted := sandbox.FormatExecutionResult(result)
+	if len(formatted) <= historyOutputMetadataThreshold {
+		return formatted
+	}
+
+	var parts []string
+	if result.Stdout != "" {
+		parts = append(parts, fmt.Sprintf("stdout: %d chars; preview:\n%s", len(result.Stdout), truncate(result.Stdout, truncateLenMedium)))
+	}
+	if result.Stderr != "" {
+		parts = append(parts, fmt.Sprintf("stderr: %d chars; preview:\n%s", len(result.Stderr), truncate(result.Stderr, truncateLenMedium)))
+	}
+	parts = append(parts, "[large REPL output omitted from root history; keep full data in REPL variables and print compact summaries]")
+	return strings.Join(parts, "\n")
+}
 
 // appendIterationHistory appends a formatted iteration entry to the compact history string.
 // This is more token-efficient than using separate messages for each iteration.
@@ -1883,7 +1941,7 @@ func (r *RLM) buildCompactHistoryPrompt(contextInfo, query, history string, iter
 		prompt.WriteString("\nYou have not explored the context yet. Your first action should be to write Go code to:\n")
 		prompt.WriteString("1. Check the context size: fmt.Println(len(context))\n")
 		prompt.WriteString("2. Preview the content: fmt.Println(context[:min(1000, len(context))])\n")
-		prompt.WriteString("3. Use Query() to analyze it\n\n")
+		prompt.WriteString("3. Use QueryWith() over selected slices or QueryBatchedRaw with selected data\n\n")
 		prompt.WriteString("Write your code now in a go code block:")
 	} else {
 		prompt.WriteString("\nBased on your previous exploration, continue working toward the answer.\n\n")
