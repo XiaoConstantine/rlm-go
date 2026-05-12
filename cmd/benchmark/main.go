@@ -283,23 +283,41 @@ func runRLM(ctx context.Context, task Task, client providers.Client, opts RLMOpt
 		rlmOpts = append(rlmOpts, rlm.WithCompactHistory(opts.FewShot))
 	}
 
-	r := rlm.New(client, client, rlmOpts...)
-
 	start := time.Now()
-	result, err := r.Complete(ctx, task.Context, task.Question)
-	duration := time.Since(start)
-
-	if err != nil {
-		return BenchmarkResult{
-			TaskID:        task.TaskID,
-			UseRLM:        true,
-			Expected:      task.Answer,
-			Got:           "",
-			IsCorrect:     false,
-			ExecutionTime: duration.Seconds(),
-			Error:         err.Error(),
+	r := rlm.New(client, client, rlmOpts...)
+	var result *core.CompletionResult
+	if opts.RecursionDepth > 0 {
+		recursiveResult, err := r.RecursiveComplete(ctx, task.Context, task.Question)
+		duration := time.Since(start)
+		if err != nil {
+			return BenchmarkResult{
+				TaskID:        task.TaskID,
+				UseRLM:        true,
+				Expected:      task.Answer,
+				Got:           "",
+				IsCorrect:     false,
+				ExecutionTime: duration.Seconds(),
+				Error:         err.Error(),
+			}
+		}
+		result = &recursiveResult.CompletionResult
+	} else {
+		var err error
+		result, err = r.Complete(ctx, task.Context, task.Question)
+		duration := time.Since(start)
+		if err != nil {
+			return BenchmarkResult{
+				TaskID:        task.TaskID,
+				UseRLM:        true,
+				Expected:      task.Answer,
+				Got:           "",
+				IsCorrect:     false,
+				ExecutionTime: duration.Seconds(),
+				Error:         err.Error(),
+			}
 		}
 	}
+	duration := time.Since(start)
 
 	isCorrect := checkAnswer(task.Answer, result.Response)
 
